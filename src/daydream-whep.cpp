@@ -231,8 +231,8 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 	}
 
 	if (!response->data.empty()) {
-		blog(LOG_INFO, "[Daydream WHEP] Setting remote description");
-		rtcSetRemoteDescription(whep->pc_id, response->data.c_str(), "offer");
+		blog(LOG_INFO, "[Daydream WHEP] Setting remote description (answer)");
+		rtcSetRemoteDescription(whep->pc_id, response->data.c_str(), "answer");
 	}
 
 	delete response;
