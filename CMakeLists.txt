@@ -22,6 +22,8 @@ set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(sctp_werror OFF CACHE BOOL "" FORCE)
 
+find_package(OpenSSL REQUIRED)
+
 FetchContent_Declare(
   libdatachannel
   GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
@@ -72,7 +74,7 @@ find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale)
 
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
+  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale OpenSSL::SSL OpenSSL::Crypto
 )
 
 if(ENABLE_FRONTEND_API)
