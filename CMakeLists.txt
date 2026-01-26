@@ -27,13 +27,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libdatachannel)
 
-if(TARGET usrsctp)
-  target_compile_options(usrsctp PRIVATE
-    $<$<C_COMPILER_ID:GNU>:-Wno-error>
-    $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-error -fno-modules>
-    $<$<C_COMPILER_ID:MSVC>:/WX->
-  )
-endif()
+foreach(_target usrsctp juice-static srtp2)
+  if(TARGET ${_target})
+    get_target_property(_opts ${_target} COMPILE_OPTIONS)
+    if(_opts)
+      list(FILTER _opts EXCLUDE REGEX "-Werror|/WX")
+      set_target_properties(${_target} PROPERTIES COMPILE_OPTIONS "${_opts}")
+    endif()
+    target_compile_options(${_target} PRIVATE
+      $<$<C_COMPILER_ID:GNU>:-Wno-error -Wno-unused-parameter>
+      $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-error -Wno-shorten-64-to-32 -Wno-unused-parameter>
+      $<$<C_COMPILER_ID:MSVC>:/WX- /wd4319 /wd4267>
+    )
+  endif()
+endforeach()
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
