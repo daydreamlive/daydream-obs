@@ -119,19 +119,21 @@ static char *extract_param(const char *query, const char *param)
 
 static void open_browser(const char *url)
 {
+	int ret;
 #ifdef __APPLE__
 	char cmd[1024];
 	snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
-	system(cmd);
+	ret = system(cmd);
 #elif defined(_WIN32)
 	char cmd[1024];
 	snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
-	system(cmd);
+	ret = system(cmd);
 #else
 	char cmd[1024];
 	snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
-	system(cmd);
+	ret = system(cmd);
 #endif
+	(void)ret;
 }
 
 struct auth_response_buffer {

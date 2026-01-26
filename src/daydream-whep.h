@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct daydream_whep;
 
 typedef void (*daydream_whep_frame_callback)(const uint8_t *data, size_t size, uint32_t timestamp, bool is_keyframe,
@@ -25,3 +29,7 @@ void daydream_whep_destroy(struct daydream_whep *whep);
 bool daydream_whep_connect(struct daydream_whep *whep);
 void daydream_whep_disconnect(struct daydream_whep *whep);
 bool daydream_whep_is_connected(struct daydream_whep *whep);
+
+#ifdef __cplusplus
+}
+#endif

@@ -20,7 +20,6 @@ struct daydream_whep {
 	daydream_whep_state_callback on_state;
 	void *userdata;
 
-	rtcPeerConnection *pc;
 	int pc_id;
 	int track_id;
 
@@ -65,7 +64,7 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 	return realsize;
 }
 
-static void on_state_change(int pc, rtcState state, void *ptr)
+static void on_state_change(int, rtcState state, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
@@ -104,7 +103,7 @@ static void on_state_change(int pc, rtcState state, void *ptr)
 	}
 }
 
-static void on_gathering_state_change(int pc, rtcGatheringState state, void *ptr)
+static void on_gathering_state_change(int, rtcGatheringState state, void *)
 {
 	const char *state_str = "unknown";
 	switch (state) {
@@ -121,7 +120,7 @@ static void on_gathering_state_change(int pc, rtcGatheringState state, void *ptr
 	blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
 }
 
-static void on_track(int pc, int tr, void *ptr)
+static void on_track(int, int tr, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
@@ -130,7 +129,7 @@ static void on_track(int pc, int tr, void *ptr)
 	whep->waiting_keyframe = true;
 }
 
-static void on_message(int id, const char *message, int size, void *ptr)
+static void on_message(int, const char *message, int size, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
@@ -141,8 +140,6 @@ static void on_message(int id, const char *message, int size, void *ptr)
 
 	bool is_keyframe = false;
 	if (size > 12) {
-		uint8_t payload_type = data[1] & 0x7F;
-		bool marker = (data[1] & 0x80) != 0;
 		uint32_t timestamp = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
 
 		int header_size = 12;
@@ -231,8 +228,6 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 
 	return true;
 }
-
-extern "C" {
 
 struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *config)
 {
@@ -349,5 +344,4 @@ bool daydream_whep_is_connected(struct daydream_whep *whep)
 	if (!whep)
 		return false;
 	return whep->connected;
-}
 }
