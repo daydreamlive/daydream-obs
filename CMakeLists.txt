@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+set(CMAKE_XCODE_ATTRIBUTE_CLANG_ENABLE_EXPLICIT_MODULES NO)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -25,6 +26,14 @@ FetchContent_Declare(
   GIT_TAG v0.22.3
 )
 FetchContent_MakeAvailable(libdatachannel)
+
+if(TARGET usrsctp)
+  target_compile_options(usrsctp PRIVATE
+    $<$<C_COMPILER_ID:GNU>:-Wno-error>
+    $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-error -fno-modules>
+    $<$<C_COMPILER_ID:MSVC>:/WX->
+  )
+endif()
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
