@@ -24,6 +24,7 @@ FetchContent_Declare(
   libdatachannel
   GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
   GIT_TAG v0.22.3
+  EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(libdatachannel)
 
