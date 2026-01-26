@@ -271,9 +271,6 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 	rtcSetStateChangeCallback(whip->pc_id, on_state_change);
 	rtcSetGatheringStateChangeCallback(whip->pc_id, on_gathering_state_change);
 
-	const char *video_codec = "video H264";
-	const char *video_direction = "sendonly";
-
 	rtcTrackInit track_init = {};
 	track_init.direction = RTC_DIRECTION_SENDONLY;
 	track_init.codec = RTC_CODEC_H264;
