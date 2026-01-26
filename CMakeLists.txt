@@ -14,7 +14,12 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+find_package(CURL REQUIRED)
+
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
+  OBS::libobs
+  CURL::libcurl
+)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
@@ -37,6 +42,8 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/plugin-main.c
   src/daydream-source.c
+  src/daydream-api.c
+  src/daydream-auth.c
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
