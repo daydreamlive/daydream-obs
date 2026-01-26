@@ -125,17 +125,6 @@ static void on_gathering_state_change(int, rtcGatheringState state, void *ptr)
 	blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
 }
 
-static void on_track(int, int tr, void *ptr)
-{
-	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
-
-	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d", tr);
-	whep->track_id = tr;
-	whep->waiting_keyframe = true;
-
-	rtcSetMessageCallback(tr, on_message);
-}
-
 static void on_message(int, const char *message, int size, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
@@ -180,6 +169,17 @@ static void on_message(int, const char *message, int size, void *ptr)
 			}
 		}
 	}
+}
+
+static void on_track(int, int tr, void *ptr)
+{
+	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
+
+	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d", tr);
+	whep->track_id = tr;
+	whep->waiting_keyframe = true;
+
+	rtcSetMessageCallback(tr, on_message);
 }
 
 static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer)
