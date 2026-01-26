@@ -22,6 +22,13 @@ set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(sctp_werror OFF CACHE BOOL "" FORCE)
 
+if(OS_MACOS)
+  list(GET CMAKE_PREFIX_PATH 0 _first_prefix_path)
+  if(_first_prefix_path)
+    set(OPENSSL_ROOT_DIR "${_first_prefix_path}" CACHE PATH "OpenSSL root directory" FORCE)
+  endif()
+endif()
+
 find_package(OpenSSL REQUIRED)
 
 FetchContent_Declare(
