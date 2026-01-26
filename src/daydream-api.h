@@ -17,6 +17,7 @@ struct daydream_stream_params {
 struct daydream_stream_result {
 	char *stream_id;
 	char *whip_url;
+	char *whep_url;
 	char *error;
 	bool success;
 };

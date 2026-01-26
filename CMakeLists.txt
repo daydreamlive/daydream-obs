@@ -66,8 +66,12 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
 find_package(CURL REQUIRED)
+find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale)
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic)
+target_link_libraries(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
+)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
@@ -89,7 +93,15 @@ endif()
 
 target_sources(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE src/plugin-main.c src/daydream-source.c src/daydream-api.c src/daydream-auth.c src/daydream-whep.cpp
+  PRIVATE
+    src/plugin-main.c
+    src/daydream-filter.c
+    src/daydream-api.c
+    src/daydream-auth.c
+    src/daydream-encoder.c
+    src/daydream-decoder.c
+    src/daydream-whip.cpp
+    src/daydream-whep.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
