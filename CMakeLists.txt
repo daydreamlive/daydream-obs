@@ -74,7 +74,15 @@ find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale)
 
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale OpenSSL::SSL OpenSSL::Crypto
+  PRIVATE
+    OBS::libobs
+    CURL::libcurl
+    LibDataChannel::LibDataChannelStatic
+    FFmpeg::avcodec
+    FFmpeg::avutil
+    FFmpeg::swscale
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 if(ENABLE_FRONTEND_API)
