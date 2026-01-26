@@ -151,7 +151,7 @@ static bool send_whip_offer(daydream_whip *whip, const std::string &sdp_offer)
 	if (!curl)
 		return false;
 
-	http_response response;
+	http_response *response = new http_response();
 
 	struct curl_slist *headers = nullptr;
 	headers = curl_slist_append(headers, "Content-Type: application/sdp");
@@ -163,9 +163,9 @@ static bool send_whip_offer(daydream_whip *whip, const std::string &sdp_offer)
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sdp_offer.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
 	CURLcode res = curl_easy_perform(curl);
@@ -178,29 +178,32 @@ static bool send_whip_offer(daydream_whip *whip, const std::string &sdp_offer)
 
 	if (res != CURLE_OK) {
 		blog(LOG_ERROR, "[Daydream WHIP] HTTP request failed: %s", curl_easy_strerror(res));
+		delete response;
 		return false;
 	}
 
 	if (http_code != 200 && http_code != 201) {
 		blog(LOG_ERROR, "[Daydream WHIP] HTTP error: %ld", http_code);
+		delete response;
 		return false;
 	}
 
-	if (!response.location.empty()) {
-		whip->resource_url = response.location;
+	if (!response->location.empty()) {
+		whip->resource_url = response->location;
 		blog(LOG_INFO, "[Daydream WHIP] Resource URL: %s", whip->resource_url.c_str());
 	}
 
-	if (!response.whep_url.empty()) {
-		whip->whep_url = response.whep_url;
+	if (!response->whep_url.empty()) {
+		whip->whep_url = response->whep_url;
 		blog(LOG_INFO, "[Daydream WHIP] WHEP URL: %s", whip->whep_url.c_str());
 	}
 
-	if (!response.data.empty()) {
+	if (!response->data.empty()) {
 		blog(LOG_INFO, "[Daydream WHIP] Setting remote description");
-		rtcSetRemoteDescription(whip->pc_id, response.data.c_str(), "answer");
+		rtcSetRemoteDescription(whip->pc_id, response->data.c_str(), "answer");
 	}
 
+	delete response;
 	return true;
 }
 

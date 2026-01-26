@@ -1,6 +1,7 @@
 #include "daydream-whep.h"
 #include <obs-module.h>
 #include <util/threading.h>
+#include <util/platform.h>
 #include <curl/curl.h>
 
 #include <rtc/rtc.h>
@@ -24,6 +25,7 @@ struct daydream_whep {
 	int track_id;
 
 	std::atomic<bool> connected;
+	std::atomic<bool> gathering_done;
 	std::mutex mutex;
 
 	std::vector<uint8_t> frame_buffer;
@@ -103,8 +105,10 @@ static void on_state_change(int, rtcState state, void *ptr)
 	}
 }
 
-static void on_gathering_state_change(int, rtcGatheringState state, void *)
+static void on_gathering_state_change(int, rtcGatheringState state, void *ptr)
 {
+	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
+
 	const char *state_str = "unknown";
 	switch (state) {
 	case RTC_GATHERING_NEW:
@@ -115,6 +119,7 @@ static void on_gathering_state_change(int, rtcGatheringState state, void *)
 		break;
 	case RTC_GATHERING_COMPLETE:
 		state_str = "complete";
+		whep->gathering_done = true;
 		break;
 	}
 	blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
@@ -124,9 +129,11 @@ static void on_track(int, int tr, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
-	blog(LOG_INFO, "[Daydream WHEP] Track added: %d", tr);
+	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d", tr);
 	whep->track_id = tr;
 	whep->waiting_keyframe = true;
+
+	rtcSetMessageCallback(tr, on_message);
 }
 
 static void on_message(int, const char *message, int size, void *ptr)
@@ -181,7 +188,7 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 	if (!curl)
 		return false;
 
-	http_response response;
+	http_response *response = new http_response();
 
 	struct curl_slist *headers = nullptr;
 	headers = curl_slist_append(headers, "Content-Type: application/sdp");
@@ -193,9 +200,9 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sdp_answer.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
 	CURLcode res = curl_easy_perform(curl);
@@ -208,24 +215,27 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 
 	if (res != CURLE_OK) {
 		blog(LOG_ERROR, "[Daydream WHEP] HTTP request failed: %s", curl_easy_strerror(res));
+		delete response;
 		return false;
 	}
 
 	if (http_code != 200 && http_code != 201) {
 		blog(LOG_ERROR, "[Daydream WHEP] HTTP error: %ld", http_code);
+		delete response;
 		return false;
 	}
 
-	if (!response.location.empty()) {
-		whep->resource_url = response.location;
+	if (!response->location.empty()) {
+		whep->resource_url = response->location;
 		blog(LOG_INFO, "[Daydream WHEP] Resource URL: %s", whep->resource_url.c_str());
 	}
 
-	if (!response.data.empty()) {
+	if (!response->data.empty()) {
 		blog(LOG_INFO, "[Daydream WHEP] Setting remote description");
-		rtcSetRemoteDescription(whep->pc_id, response.data.c_str(), "offer");
+		rtcSetRemoteDescription(whep->pc_id, response->data.c_str(), "offer");
 	}
 
+	delete response;
 	return true;
 }
 
@@ -243,6 +253,7 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->pc_id = -1;
 	whep->track_id = -1;
 	whep->connected = false;
+	whep->gathering_done = false;
 	whep->waiting_keyframe = true;
 
 	return whep;
@@ -279,7 +290,41 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	rtcSetGatheringStateChangeCallback(whep->pc_id, on_gathering_state_change);
 	rtcSetTrackCallback(whep->pc_id, on_track);
 
-	rtcSetLocalDescription(whep->pc_id, "recvonly");
+	rtcTrackInit track_init = {};
+	track_init.direction = RTC_DIRECTION_RECVONLY;
+	track_init.codec = RTC_CODEC_H264;
+	track_init.payloadType = 96;
+	track_init.ssrc = 0;
+	track_init.mid = "0";
+	track_init.name = "video";
+	track_init.msid = "daydream";
+	track_init.trackId = "video";
+
+	int recv_track = rtcAddTrackEx(whep->pc_id, &track_init);
+	if (recv_track < 0) {
+		blog(LOG_ERROR, "[Daydream WHEP] Failed to add video track");
+		rtcDeletePeerConnection(whep->pc_id);
+		whep->pc_id = -1;
+		return false;
+	}
+
+	blog(LOG_INFO, "[Daydream WHEP] Local video track added: %d", recv_track);
+
+	rtcSetLocalDescription(whep->pc_id, "offer");
+
+	whep->gathering_done = false;
+	int timeout = 100;
+	while (!whep->gathering_done && timeout > 0) {
+		os_sleep_ms(100);
+		timeout--;
+	}
+
+	if (!whep->gathering_done) {
+		blog(LOG_ERROR, "[Daydream WHEP] ICE gathering timeout");
+		rtcDeletePeerConnection(whep->pc_id);
+		whep->pc_id = -1;
+		return false;
+	}
 
 	char sdp_buffer[16384];
 	int sdp_size = rtcGetLocalDescription(whep->pc_id, sdp_buffer, sizeof(sdp_buffer));
@@ -292,7 +337,7 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	}
 
 	std::string local_sdp(sdp_buffer, sdp_size);
-	blog(LOG_INFO, "[Daydream WHEP] Local SDP created");
+	blog(LOG_INFO, "[Daydream WHEP] Local SDP created (%d bytes)", sdp_size);
 
 	if (!send_whep_request(whep, local_sdp)) {
 		rtcDeletePeerConnection(whep->pc_id);
@@ -315,6 +360,7 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 
 	whep->track_id = -1;
 	whep->connected = false;
+	whep->gathering_done = false;
 
 	if (!whep->resource_url.empty()) {
 		CURL *curl = curl_easy_init();
