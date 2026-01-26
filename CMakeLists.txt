@@ -23,6 +23,7 @@ set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(sctp_werror OFF CACHE BOOL "" FORCE)
 set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
 set(USE_NICE OFF CACHE BOOL "" FORCE)
+set(PREFER_SYSTEM_LIB OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   libdatachannel
