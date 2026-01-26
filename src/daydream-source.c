@@ -137,9 +137,7 @@ static void daydream_source_video_render(void *data, gs_effect_t *effect)
 			pixels[i * 4 + 3] = 255;
 		}
 
-		ctx->texture = gs_texture_create(ctx->width, ctx->height,
-						 GS_BGRA, 1,
-						 (const uint8_t **)&pixels, 0);
+		ctx->texture = gs_texture_create(ctx->width, ctx->height, GS_BGRA, 1, (const uint8_t **)&pixels, 0);
 		bfree(pixels);
 	}
 
@@ -150,8 +148,7 @@ static void daydream_source_video_render(void *data, gs_effect_t *effect)
 		gs_technique_begin(tech);
 		gs_technique_begin_pass(tech, 0);
 
-		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"),
-				      ctx->texture);
+		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), ctx->texture);
 		gs_draw_sprite(ctx->texture, 0, ctx->width, ctx->height);
 
 		gs_technique_end_pass(tech);
@@ -252,8 +249,7 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 
 		blog(LOG_INFO, "[Daydream] Streaming started!");
 	} else {
-		blog(LOG_ERROR, "[Daydream] Failed to start stream: %s", 
-			result.error ? result.error : "Unknown error");
+		blog(LOG_ERROR, "[Daydream] Failed to start stream: %s", result.error ? result.error : "Unknown error");
 	}
 
 	pthread_mutex_unlock(&ctx->mutex);
@@ -310,8 +306,8 @@ static obs_properties_t *daydream_source_get_properties(void *data)
 		obs_properties_add_button(props, PROP_LOGIN, "Login with Daydream", on_login_clicked);
 	}
 
-	obs_property_t *model = obs_properties_add_list(props, PROP_MODEL, "Model",
-		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_t *model =
+		obs_properties_add_list(props, PROP_MODEL, "Model", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(model, "SDXL Turbo", "stabilityai/sdxl-turbo");
 	obs_property_list_add_string(model, "SD Turbo", "stabilityai/sd-turbo");
 	obs_property_list_add_string(model, "Dreamshaper 8", "Lykon/dreamshaper-8");
@@ -321,7 +317,8 @@ static obs_properties_t *daydream_source_get_properties(void *data)
 	obs_property_t *prompt = obs_properties_add_text(props, PROP_PROMPT, "Prompt", OBS_TEXT_MULTILINE);
 	obs_property_set_enabled(prompt, logged_in);
 
-	obs_property_t *neg_prompt = obs_properties_add_text(props, PROP_NEGATIVE_PROMPT, "Negative Prompt", OBS_TEXT_DEFAULT);
+	obs_property_t *neg_prompt =
+		obs_properties_add_text(props, PROP_NEGATIVE_PROMPT, "Negative Prompt", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(neg_prompt, logged_in);
 
 	obs_property_t *guidance = obs_properties_add_float_slider(props, PROP_GUIDANCE, "Guidance", 0.1, 20.0, 0.1);

@@ -32,31 +32,31 @@ static char *find_json_string(const char *json, const char *key)
 {
 	char search[256];
 	snprintf(search, sizeof(search), "\"%s\"", key);
-	
+
 	const char *pos = strstr(json, search);
 	if (!pos)
 		return NULL;
-	
+
 	pos = strchr(pos + strlen(search), ':');
 	if (!pos)
 		return NULL;
-	
+
 	while (*pos && (*pos == ':' || *pos == ' ' || *pos == '\t'))
 		pos++;
-	
+
 	if (*pos != '"')
 		return NULL;
-	
+
 	pos++;
 	const char *end = strchr(pos, '"');
 	if (!end)
 		return NULL;
-	
+
 	size_t len = end - pos;
 	char *result = malloc(len + 1);
 	if (!result)
 		return NULL;
-	
+
 	memcpy(result, pos, len);
 	result[len] = 0;
 	return result;
@@ -72,9 +72,8 @@ void daydream_api_cleanup(void)
 	curl_global_cleanup();
 }
 
-struct daydream_stream_result daydream_api_create_stream(
-	const char *api_key,
-	const struct daydream_stream_params *params)
+struct daydream_stream_result daydream_api_create_stream(const char *api_key,
+							 const struct daydream_stream_params *params)
 {
 	struct daydream_stream_result result = {0};
 	CURL *curl = NULL;
@@ -103,27 +102,21 @@ struct daydream_stream_result daydream_api_create_stream(
 	}
 
 	snprintf(json_body, json_size,
-		"{"
-		"\"pipeline\":\"streamdiffusion\","
-		"\"params\":{"
-		"\"model_id\":\"%s\","
-		"\"prompt\":\"%s\","
-		"\"negative_prompt\":\"%s\","
-		"\"guidance_scale\":%.2f,"
-		"\"delta\":%.2f,"
-		"\"num_inference_steps\":%d,"
-		"\"width\":%d,"
-		"\"height\":%d"
-		"}"
-		"}",
-		params->model_id,
-		params->prompt,
-		params->negative_prompt,
-		params->guidance,
-		params->delta,
-		params->steps,
-		params->width,
-		params->height);
+		 "{"
+		 "\"pipeline\":\"streamdiffusion\","
+		 "\"params\":{"
+		 "\"model_id\":\"%s\","
+		 "\"prompt\":\"%s\","
+		 "\"negative_prompt\":\"%s\","
+		 "\"guidance_scale\":%.2f,"
+		 "\"delta\":%.2f,"
+		 "\"num_inference_steps\":%d,"
+		 "\"width\":%d,"
+		 "\"height\":%d"
+		 "}"
+		 "}",
+		 params->model_id, params->prompt, params->negative_prompt, params->guidance, params->delta,
+		 params->steps, params->width, params->height);
 
 	char url[256];
 	snprintf(url, sizeof(url), "%s/streams", DAYDREAM_API_BASE);
@@ -150,8 +143,8 @@ struct daydream_stream_result daydream_api_create_stream(
 
 	if (http_code != 200 && http_code != 201) {
 		char error_msg[512];
-		snprintf(error_msg, sizeof(error_msg), "HTTP %ld: %s", 
-			http_code, response.data ? response.data : "No response");
+		snprintf(error_msg, sizeof(error_msg), "HTTP %ld: %s", http_code,
+			 response.data ? response.data : "No response");
 		result.error = strdup(error_msg);
 		blog(LOG_ERROR, "[Daydream] API error: %s", result.error);
 		goto cleanup;

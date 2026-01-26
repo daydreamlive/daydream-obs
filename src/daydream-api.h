@@ -24,8 +24,7 @@ struct daydream_stream_result {
 void daydream_api_init(void);
 void daydream_api_cleanup(void);
 
-struct daydream_stream_result daydream_api_create_stream(
-	const char *api_key,
-	const struct daydream_stream_params *params);
+struct daydream_stream_result daydream_api_create_stream(const char *api_key,
+							 const struct daydream_stream_params *params);
 
 void daydream_api_free_result(struct daydream_stream_result *result);
