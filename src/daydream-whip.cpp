@@ -1,6 +1,7 @@
 #include "daydream-whip.h"
 #include <obs-module.h>
 #include <util/threading.h>
+#include <util/platform.h>
 #include <curl/curl.h>
 
 #include <rtc/rtc.h>
@@ -377,6 +378,8 @@ bool daydream_whip_is_connected(struct daydream_whip *whip)
 bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size, uint32_t timestamp_ms,
 			      bool is_keyframe)
 {
+	UNUSED_PARAMETER(is_keyframe);
+
 	if (!whip || !whip->connected || whip->track_id < 0)
 		return false;
 

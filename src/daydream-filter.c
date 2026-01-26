@@ -66,7 +66,6 @@ struct daydream_filter {
 	bool decoded_frame_ready;
 
 	pthread_mutex_t mutex;
-	pthread_cond_t cond;
 
 	uint64_t frame_count;
 	uint64_t last_encode_time;
@@ -162,14 +161,9 @@ static void *encode_thread_func(void *data)
 		pthread_mutex_lock(&ctx->mutex);
 
 		while (!ctx->pending_frame_ready && ctx->encode_thread_running && !ctx->stopping) {
-			struct timespec ts;
-			clock_gettime(CLOCK_REALTIME, &ts);
-			ts.tv_nsec += 50000000;
-			if (ts.tv_nsec >= 1000000000) {
-				ts.tv_sec += 1;
-				ts.tv_nsec -= 1000000000;
-			}
-			pthread_cond_timedwait(&ctx->cond, &ctx->mutex, &ts);
+			pthread_mutex_unlock(&ctx->mutex);
+			os_sleep_ms(10);
+			pthread_mutex_lock(&ctx->mutex);
 		}
 
 		if (!ctx->encode_thread_running || ctx->stopping) {
@@ -184,8 +178,6 @@ static void *encode_thread_func(void *data)
 
 		uint8_t *frame_copy = bmalloc(ctx->pending_frame_linesize * ctx->pending_frame_height);
 		memcpy(frame_copy, ctx->pending_frame, ctx->pending_frame_linesize * ctx->pending_frame_height);
-		uint32_t frame_width = ctx->pending_frame_width;
-		uint32_t frame_height = ctx->pending_frame_height;
 		uint32_t frame_linesize = ctx->pending_frame_linesize;
 		ctx->pending_frame_ready = false;
 
@@ -224,7 +216,6 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->frame_count = 0;
 
 	pthread_mutex_init(&ctx->mutex, NULL);
-	pthread_cond_init(&ctx->cond, NULL);
 
 	ctx->auth = daydream_auth_create();
 
@@ -239,7 +230,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	if (ctx->encode_thread_running) {
 		ctx->encode_thread_running = false;
-		pthread_cond_signal(&ctx->cond);
 		pthread_join(ctx->encode_thread, NULL);
 	}
 
@@ -295,7 +285,6 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
 
-	pthread_cond_destroy(&ctx->cond);
 	pthread_mutex_destroy(&ctx->mutex);
 
 	bfree(ctx);
@@ -376,7 +365,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			ctx->pending_frame_linesize = video_linesize;
 			ctx->pending_frame_ready = true;
 
-			pthread_cond_signal(&ctx->cond);
 			pthread_mutex_unlock(&ctx->mutex);
 
 			gs_stagesurface_unmap(ctx->stagesurface);
