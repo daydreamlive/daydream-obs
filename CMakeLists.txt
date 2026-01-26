@@ -27,7 +27,7 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libdatachannel)
 
-foreach(_target usrsctp juice-static srtp2)
+foreach(_target usrsctp juice-static srtp2 datachannel-static)
   if(TARGET ${_target})
     get_target_property(_opts ${_target} COMPILE_OPTIONS)
     if(_opts)
@@ -38,6 +38,9 @@ foreach(_target usrsctp juice-static srtp2)
       $<$<C_COMPILER_ID:GNU>:-Wno-error -Wno-unused-parameter>
       $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-error -Wno-shorten-64-to-32 -Wno-unused-parameter -fno-modules>
       $<$<C_COMPILER_ID:MSVC>:/WX- /wd4319 /wd4267>
+      $<$<CXX_COMPILER_ID:GNU>:-Wno-error -Wno-unused-parameter>
+      $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wno-error -Wno-shorten-64-to-32 -Wno-unused-parameter -Wno-unreachable-code -fno-modules>
+      $<$<CXX_COMPILER_ID:MSVC>:/WX- /wd4319 /wd4267>
     )
     set_target_properties(${_target} PROPERTIES
       XCODE_ATTRIBUTE_CLANG_ENABLE_EXPLICIT_MODULES NO
