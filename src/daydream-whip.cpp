@@ -16,6 +16,7 @@ struct daydream_whip {
 	std::string whip_url;
 	std::string api_key;
 	std::string resource_url;
+	std::string whep_url;
 
 	uint32_t width;
 	uint32_t height;
@@ -40,6 +41,7 @@ struct daydream_whip {
 struct http_response {
 	std::string data;
 	std::string location;
+	std::string whep_url;
 };
 
 static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp)
@@ -56,15 +58,29 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 	http_response *resp = static_cast<http_response *>(userdata);
 
 	std::string header(buffer, realsize);
-	if (header.find("Location:") == 0 || header.find("location:") == 0) {
+
+	auto extract_header_value = [&header](size_t colon_pos) -> std::string {
+		std::string value = header.substr(colon_pos + 1);
+		while (!value.empty() && (value[0] == ' ' || value[0] == '\t'))
+			value.erase(0, 1);
+		while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
+			value.pop_back();
+		return value;
+	};
+
+	std::string header_lower = header;
+	for (char &c : header_lower)
+		c = (char)tolower((unsigned char)c);
+
+	if (header_lower.find("location:") == 0) {
+		size_t pos = header.find(':');
+		if (pos != std::string::npos)
+			resp->location = extract_header_value(pos);
+	} else if (header_lower.find("livepeer-playback-url:") == 0) {
 		size_t pos = header.find(':');
 		if (pos != std::string::npos) {
-			std::string value = header.substr(pos + 1);
-			while (!value.empty() && (value[0] == ' ' || value[0] == '\t'))
-				value.erase(0, 1);
-			while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
-				value.pop_back();
-			resp->location = value;
+			resp->whep_url = extract_header_value(pos);
+			blog(LOG_INFO, "[Daydream WHIP] Got WHEP URL from header: %s", resp->whep_url.c_str());
 		}
 	}
 	return realsize;
@@ -173,6 +189,11 @@ static bool send_whip_offer(daydream_whip *whip, const std::string &sdp_offer)
 	if (!response.location.empty()) {
 		whip->resource_url = response.location;
 		blog(LOG_INFO, "[Daydream WHIP] Resource URL: %s", whip->resource_url.c_str());
+	}
+
+	if (!response.whep_url.empty()) {
+		whip->whep_url = response.whep_url;
+		blog(LOG_INFO, "[Daydream WHIP] WHEP URL: %s", whip->whep_url.c_str());
 	}
 
 	if (!response.data.empty()) {
@@ -425,4 +446,11 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 	}
 
 	return true;
+}
+
+const char *daydream_whip_get_whep_url(struct daydream_whip *whip)
+{
+	if (!whip || whip->whep_url.empty())
+		return nullptr;
+	return whip->whep_url.c_str();
 }

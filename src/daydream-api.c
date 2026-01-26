@@ -154,13 +154,11 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 
 	result.stream_id = find_json_string(response.data, "id");
 	result.whip_url = find_json_string(response.data, "whip_url");
-	result.whep_url = find_json_string(response.data, "whep_url");
 
-	if (result.stream_id && result.whip_url && result.whep_url) {
+	if (result.stream_id && result.whip_url) {
 		result.success = true;
 		blog(LOG_INFO, "[Daydream] Stream created: %s", result.stream_id);
 		blog(LOG_INFO, "[Daydream] WHIP URL: %s", result.whip_url);
-		blog(LOG_INFO, "[Daydream] WHEP URL: %s", result.whep_url);
 	} else {
 		result.error = strdup("Failed to parse response");
 		blog(LOG_ERROR, "[Daydream] %s", result.error);

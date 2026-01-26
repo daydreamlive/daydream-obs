@@ -32,6 +32,8 @@ bool daydream_whip_is_connected(struct daydream_whip *whip);
 bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size, uint32_t timestamp_ms,
 			      bool is_keyframe);
 
+const char *daydream_whip_get_whep_url(struct daydream_whip *whip);
+
 #ifdef __cplusplus
 }
 #endif

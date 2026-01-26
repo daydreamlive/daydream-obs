@@ -522,11 +522,10 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 
 	ctx->stream_id = bstrdup(result.stream_id);
 	ctx->whip_url = bstrdup(result.whip_url);
-	ctx->whep_url = bstrdup(result.whep_url);
+	ctx->whep_url = NULL;
 
 	blog(LOG_INFO, "[Daydream] Stream created: %s", ctx->stream_id);
 	blog(LOG_INFO, "[Daydream] WHIP URL: %s", ctx->whip_url);
-	blog(LOG_INFO, "[Daydream] WHEP URL: %s", ctx->whep_url);
 
 	struct daydream_encoder_config enc_config = {
 		.width = width,
@@ -567,21 +566,10 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	};
 	ctx->whip = daydream_whip_create(&whip_config);
 
-	struct daydream_whep_config whep_config = {
-		.whep_url = ctx->whep_url,
-		.api_key = api_key,
-		.on_frame = on_whep_frame,
-		.on_state = on_whep_state,
-		.userdata = ctx,
-	};
-	ctx->whep = daydream_whep_create(&whep_config);
-
 	if (!daydream_whip_connect(ctx->whip)) {
 		blog(LOG_ERROR, "[Daydream] Failed to connect WHIP");
 		daydream_whip_destroy(ctx->whip);
 		ctx->whip = NULL;
-		daydream_whep_destroy(ctx->whep);
-		ctx->whep = NULL;
 		daydream_encoder_destroy(ctx->encoder);
 		ctx->encoder = NULL;
 		daydream_decoder_destroy(ctx->decoder);
@@ -590,6 +578,32 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 		daydream_api_free_result(&result);
 		return false;
 	}
+
+	const char *whep_url = daydream_whip_get_whep_url(ctx->whip);
+	if (!whep_url) {
+		blog(LOG_ERROR, "[Daydream] Failed to get WHEP URL from WHIP response");
+		daydream_whip_disconnect(ctx->whip);
+		daydream_whip_destroy(ctx->whip);
+		ctx->whip = NULL;
+		daydream_encoder_destroy(ctx->encoder);
+		ctx->encoder = NULL;
+		daydream_decoder_destroy(ctx->decoder);
+		ctx->decoder = NULL;
+		pthread_mutex_unlock(&ctx->mutex);
+		daydream_api_free_result(&result);
+		return false;
+	}
+	ctx->whep_url = bstrdup(whep_url);
+	blog(LOG_INFO, "[Daydream] WHEP URL: %s", ctx->whep_url);
+
+	struct daydream_whep_config whep_config = {
+		.whep_url = ctx->whep_url,
+		.api_key = api_key,
+		.on_frame = on_whep_frame,
+		.on_state = on_whep_state,
+		.userdata = ctx,
+	};
+	ctx->whep = daydream_whep_create(&whep_config);
 
 	if (!daydream_whep_connect(ctx->whep)) {
 		blog(LOG_ERROR, "[Daydream] Failed to connect WHEP");
