@@ -27,24 +27,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Hide Homebrew OpenSSL
-      if: runner.os == 'macOS'
-      shell: bash
-      run: |
-        : Hide Homebrew OpenSSL to avoid architecture conflicts with universal builds
-        if [ -d "/opt/homebrew/Cellar/openssl@3" ]; then
-          sudo mv /opt/homebrew/Cellar/openssl@3 /opt/homebrew/Cellar/openssl@3.hidden
-        fi
-        if [ -d "/opt/homebrew/opt/openssl@3" ]; then
-          sudo mv /opt/homebrew/opt/openssl@3 /opt/homebrew/opt/openssl@3.hidden
-        fi
-        if [ -d "/usr/local/Cellar/openssl@3" ]; then
-          sudo mv /usr/local/Cellar/openssl@3 /usr/local/Cellar/openssl@3.hidden
-        fi
-        if [ -d "/usr/local/opt/openssl@3" ]; then
-          sudo mv /usr/local/opt/openssl@3 /usr/local/opt/openssl@3.hidden
-        fi
-
     - name: Run macOS Build
       if: runner.os == 'macOS'
       shell: zsh --no-rcs --errexit --pipefail {0}

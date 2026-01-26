@@ -21,49 +21,8 @@ set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
 set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
 set(NO_TESTS ON CACHE BOOL "" FORCE)
 set(sctp_werror OFF CACHE BOOL "" FORCE)
-
-if(OS_MACOS)
-  set(CMAKE_IGNORE_PATH "/opt/homebrew;/usr/local" CACHE STRING "" FORCE)
-  message(STATUS "CMAKE_PREFIX_PATH: ${CMAKE_PREFIX_PATH}")
-  foreach(_prefix IN LISTS CMAKE_PREFIX_PATH)
-    message(STATUS "Checking for OpenSSL in: ${_prefix}")
-    if(EXISTS "${_prefix}/lib/libssl.a" AND EXISTS "${_prefix}/lib/libcrypto.a")
-      message(STATUS "Found OpenSSL in obs-deps: ${_prefix}")
-      if(NOT TARGET OpenSSL::Crypto)
-        add_library(OpenSSL::Crypto STATIC IMPORTED GLOBAL)
-        set_target_properties(
-          OpenSSL::Crypto
-          PROPERTIES IMPORTED_LOCATION "${_prefix}/lib/libcrypto.a" INTERFACE_INCLUDE_DIRECTORIES "${_prefix}/include"
-        )
-      endif()
-      if(NOT TARGET OpenSSL::SSL)
-        add_library(OpenSSL::SSL STATIC IMPORTED GLOBAL)
-        set_target_properties(
-          OpenSSL::SSL
-          PROPERTIES
-            IMPORTED_LOCATION "${_prefix}/lib/libssl.a"
-            INTERFACE_INCLUDE_DIRECTORIES "${_prefix}/include"
-            INTERFACE_LINK_LIBRARIES OpenSSL::Crypto
-        )
-      endif()
-      set(OPENSSL_FOUND TRUE CACHE BOOL "" FORCE)
-      set(OPENSSL_INCLUDE_DIR "${_prefix}/include" CACHE PATH "" FORCE)
-      set(OPENSSL_SSL_LIBRARY "${_prefix}/lib/libssl.a" CACHE FILEPATH "" FORCE)
-      set(OPENSSL_CRYPTO_LIBRARY "${_prefix}/lib/libcrypto.a" CACHE FILEPATH "" FORCE)
-      set(OPENSSL_ROOT_DIR "${_prefix}" CACHE PATH "" FORCE)
-      set(_openssl_prefix "${_prefix}")
-      break()
-    endif()
-  endforeach()
-endif()
-
-if(NOT TARGET OpenSSL::SSL)
-  find_package(OpenSSL REQUIRED)
-endif()
-message(STATUS "OpenSSL found: ${OPENSSL_FOUND}")
-message(STATUS "OpenSSL include: ${OPENSSL_INCLUDE_DIR}")
-message(STATUS "OpenSSL SSL library: ${OPENSSL_SSL_LIBRARY}")
-message(STATUS "OpenSSL Crypto library: ${OPENSSL_CRYPTO_LIBRARY}")
+set(USE_MBEDTLS ON CACHE BOOL "" FORCE)
+set(USE_NICE OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   libdatachannel
@@ -73,7 +32,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libdatachannel)
 
-foreach(_target usrsctp juice-static srtp2 datachannel-static)
+foreach(
+  _target
+  usrsctp
+  juice-static
+  srtp2
+  datachannel-static
+  mbedtls
+  mbedcrypto
+  mbedx509
+)
   if(TARGET ${_target})
     get_target_property(_opts ${_target} COMPILE_OPTIONS)
     if(_opts)
@@ -115,15 +83,7 @@ find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale)
 
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE
-    OBS::libobs
-    CURL::libcurl
-    LibDataChannel::LibDataChannelStatic
-    FFmpeg::avcodec
-    FFmpeg::avutil
-    FFmpeg::swscale
-    OpenSSL::SSL
-    OpenSSL::Crypto
+  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
 )
 
 if(ENABLE_FRONTEND_API)
