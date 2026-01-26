@@ -486,6 +486,11 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	uint32_t width = parent ? obs_source_get_base_width(parent) : 512;
 	uint32_t height = parent ? obs_source_get_base_height(parent) : 512;
 
+	if (width < 512)
+		width = 512;
+	if (height < 512)
+		height = 512;
+
 	struct daydream_stream_params params = {
 		.model_id = ctx->model,
 		.prompt = ctx->prompt,
