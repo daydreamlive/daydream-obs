@@ -10,6 +10,18 @@ option(ENABLE_QT "Use Qt functionality" OFF)
 include(compilerconfig)
 include(defaults)
 include(helpers)
+include(FetchContent)
+
+set(NO_WEBSOCKET ON CACHE BOOL "" FORCE)
+set(NO_EXAMPLES ON CACHE BOOL "" FORCE)
+set(NO_TESTS ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+  libdatachannel
+  GIT_REPOSITORY https://github.com/paullouisageneau/libdatachannel.git
+  GIT_TAG v0.22.3
+)
+FetchContent_MakeAvailable(libdatachannel)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
@@ -19,6 +31,7 @@ find_package(CURL REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE 
   OBS::libobs
   CURL::libcurl
+  LibDataChannel::LibDataChannelStatic
 )
 
 if(ENABLE_FRONTEND_API)
@@ -44,6 +57,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
   src/daydream-source.c
   src/daydream-api.c
   src/daydream-auth.c
+  src/daydream-whep.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
