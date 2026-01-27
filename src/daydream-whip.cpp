@@ -257,7 +257,7 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 									rtc::H264RtpPacketizer::defaultClockRate);
 
 	auto packetizer =
-		std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::LongStartSequence, whip->rtpConfig);
+		std::make_shared<rtc::H264RtpPacketizer>(rtc::NalUnit::Separator::StartSequence, whip->rtpConfig);
 
 	auto srReporter = std::make_shared<rtc::RtcpSrReporter>(whip->rtpConfig);
 	packetizer->addToChain(srReporter);
@@ -332,8 +332,8 @@ bool daydream_whip_is_connected(struct daydream_whip *whip)
 	return whip->connected;
 }
 
-bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size, uint32_t timestamp_ms,
-			      bool is_keyframe)
+bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size,
+			      uint32_t timestamp_ms, bool is_keyframe)
 {
 	UNUSED_PARAMETER(is_keyframe);
 	UNUSED_PARAMETER(timestamp_ms);
@@ -342,7 +342,8 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		static int log_count = 0;
 		if (log_count++ < 5) {
 			blog(LOG_WARNING, "[Daydream WHIP] send_frame skip: whip=%p connected=%d track=%p",
-			     (void *)whip, whip ? (int)whip->connected.load() : -1, whip ? whip->track.get() : nullptr);
+			     (void *)whip, whip ? (int)whip->connected.load() : -1,
+			     whip ? whip->track.get() : nullptr);
 		}
 		return false;
 	}
@@ -351,11 +352,22 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		return false;
 
 	try {
-		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
-
 		static uint64_t total_sent = 0;
 		static uint64_t last_log_time = 0;
 		total_sent++;
+
+		if (total_sent <= 3) {
+			char hex[64];
+			int hex_len = 0;
+			for (size_t i = 0; i < size && i < 20; i++) {
+				hex_len += snprintf(hex + hex_len, sizeof(hex) - hex_len, "%02x ", h264_data[i]);
+			}
+			blog(LOG_INFO, "[Daydream WHIP] Frame #%llu: size=%zu, first bytes: %s",
+			     (unsigned long long)total_sent, size, hex);
+		}
+
+		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
+
 		uint64_t now = os_gettime_ns();
 		if (now - last_log_time > 1000000000ULL) {
 			blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, total=%llu", size,
