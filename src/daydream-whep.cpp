@@ -242,13 +242,13 @@ static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_o
 
 static bool send_whep_request(daydream_whep *whep, const std::string &sdp_offer)
 {
-	const int max_retries = 30;
-	const int retry_delay_ms = 100;
+	const int max_retries = 60;
+	const int retry_delay_ms = 500;
+	const int rate_limit_delay_ms = 2000;
 
 	for (int retry = 0; retry < max_retries; retry++) {
 		if (retry > 0) {
 			blog(LOG_INFO, "[Daydream WHEP] Retry %d/%d...", retry, max_retries);
-			os_sleep_ms(retry_delay_ms);
 		}
 
 		long http_code = 0;
@@ -256,7 +256,14 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_offer)
 			return true;
 		}
 
+		if (http_code == 429) {
+			blog(LOG_INFO, "[Daydream WHEP] Rate limited, waiting %dms...", rate_limit_delay_ms);
+			os_sleep_ms(rate_limit_delay_ms);
+			continue;
+		}
+
 		if (http_code == 404 || http_code == 503 || http_code == 0) {
+			os_sleep_ms(retry_delay_ms);
 			continue;
 		}
 
