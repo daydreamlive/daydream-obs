@@ -57,6 +57,9 @@ struct daydream_filter {
 	pthread_t whep_thread;
 	bool whep_thread_running;
 
+	pthread_t start_thread;
+	bool start_thread_running;
+
 	uint8_t *pending_frame;
 	uint32_t pending_frame_width;
 	uint32_t pending_frame_height;
@@ -255,6 +258,11 @@ static void stop_streaming(struct daydream_filter *ctx)
 	if (ctx->whep_thread_running) {
 		pthread_join(ctx->whep_thread, NULL);
 		ctx->whep_thread_running = false;
+	}
+
+	if (ctx->start_thread_running) {
+		pthread_join(ctx->start_thread, NULL);
+		ctx->start_thread_running = false;
 	}
 
 	if (ctx->whip) {
@@ -484,27 +492,15 @@ static bool on_logout_clicked(obs_properties_t *props, obs_property_t *property,
 	return true;
 }
 
-static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+static void *start_streaming_thread_func(void *data)
 {
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(property);
-
 	struct daydream_filter *ctx = data;
 
+	blog(LOG_INFO, "[Daydream] Start streaming thread started");
+
 	pthread_mutex_lock(&ctx->mutex);
-
-	if (ctx->streaming) {
-		blog(LOG_WARNING, "[Daydream] Already streaming");
-		pthread_mutex_unlock(&ctx->mutex);
-		return false;
-	}
-
 	const char *api_key = daydream_auth_get_api_key(ctx->auth);
-	if (!api_key || strlen(api_key) == 0) {
-		blog(LOG_ERROR, "[Daydream] Not logged in. Please login first.");
-		pthread_mutex_unlock(&ctx->mutex);
-		return false;
-	}
+	char *api_key_copy = api_key ? bstrdup(api_key) : NULL;
 
 	obs_source_t *parent = obs_filter_get_parent(ctx->source);
 	uint32_t width = parent ? obs_source_get_base_width(parent) : 512;
@@ -516,28 +512,43 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 		height = 512;
 
 	struct daydream_stream_params params = {
-		.model_id = ctx->model,
-		.prompt = ctx->prompt,
-		.negative_prompt = ctx->negative_prompt,
+		.model_id = ctx->model ? bstrdup(ctx->model) : NULL,
+		.prompt = ctx->prompt ? bstrdup(ctx->prompt) : NULL,
+		.negative_prompt = ctx->negative_prompt ? bstrdup(ctx->negative_prompt) : NULL,
 		.guidance = ctx->guidance,
 		.delta = ctx->delta,
 		.steps = ctx->steps,
 		.width = (int)width,
 		.height = (int)height,
 	};
-
+	uint32_t target_fps = ctx->target_fps;
 	pthread_mutex_unlock(&ctx->mutex);
 
-	struct daydream_stream_result result = daydream_api_create_stream(api_key, &params);
+	struct daydream_stream_result result = daydream_api_create_stream(api_key_copy, &params);
+
+	bfree((char *)params.model_id);
+	bfree((char *)params.prompt);
+	bfree((char *)params.negative_prompt);
 
 	pthread_mutex_lock(&ctx->mutex);
+
+	if (ctx->stopping) {
+		blog(LOG_INFO, "[Daydream] Streaming cancelled");
+		bfree(api_key_copy);
+		daydream_api_free_result(&result);
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
+	}
 
 	if (!result.success) {
 		blog(LOG_ERROR, "[Daydream] Failed to create stream: %s",
 		     result.error ? result.error : "Unknown error");
-		pthread_mutex_unlock(&ctx->mutex);
+		bfree(api_key_copy);
 		daydream_api_free_result(&result);
-		return false;
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
 	}
 
 	bfree(ctx->stream_id);
@@ -554,15 +565,17 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	struct daydream_encoder_config enc_config = {
 		.width = width,
 		.height = height,
-		.fps = ctx->target_fps,
+		.fps = target_fps,
 		.bitrate = 2000000,
 	};
 	ctx->encoder = daydream_encoder_create(&enc_config);
 	if (!ctx->encoder) {
 		blog(LOG_ERROR, "[Daydream] Failed to create encoder");
-		pthread_mutex_unlock(&ctx->mutex);
+		bfree(api_key_copy);
 		daydream_api_free_result(&result);
-		return false;
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
 	}
 
 	struct daydream_decoder_config dec_config = {
@@ -574,35 +587,42 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 		blog(LOG_ERROR, "[Daydream] Failed to create decoder");
 		daydream_encoder_destroy(ctx->encoder);
 		ctx->encoder = NULL;
-		pthread_mutex_unlock(&ctx->mutex);
+		bfree(api_key_copy);
 		daydream_api_free_result(&result);
-		return false;
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
 	}
 
 	struct daydream_whip_config whip_config = {
 		.whip_url = ctx->whip_url,
-		.api_key = api_key,
+		.api_key = api_key_copy,
 		.width = width,
 		.height = height,
-		.fps = ctx->target_fps,
+		.fps = target_fps,
 		.on_state = on_whip_state,
 		.userdata = ctx,
 	};
 	ctx->whip = daydream_whip_create(&whip_config);
+	pthread_mutex_unlock(&ctx->mutex);
 
 	if (!daydream_whip_connect(ctx->whip)) {
 		blog(LOG_ERROR, "[Daydream] Failed to connect WHIP");
+		pthread_mutex_lock(&ctx->mutex);
 		daydream_whip_destroy(ctx->whip);
 		ctx->whip = NULL;
 		daydream_encoder_destroy(ctx->encoder);
 		ctx->encoder = NULL;
 		daydream_decoder_destroy(ctx->decoder);
 		ctx->decoder = NULL;
-		pthread_mutex_unlock(&ctx->mutex);
+		bfree(api_key_copy);
 		daydream_api_free_result(&result);
-		return false;
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
 	}
 
+	pthread_mutex_lock(&ctx->mutex);
 	ctx->streaming = true;
 	ctx->stopping = false;
 	ctx->frame_count = 0;
@@ -633,11 +653,45 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 		blog(LOG_WARNING, "[Daydream] No WHEP URL available, output will not be received");
 	}
 
+	bfree(api_key_copy);
+	daydream_api_free_result(&result);
+	ctx->start_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
 
-	daydream_api_free_result(&result);
-
 	blog(LOG_INFO, "[Daydream] Streaming started!");
+
+	return NULL;
+}
+
+static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+
+	struct daydream_filter *ctx = data;
+
+	pthread_mutex_lock(&ctx->mutex);
+
+	if (ctx->streaming || ctx->start_thread_running) {
+		blog(LOG_WARNING, "[Daydream] Already streaming or starting");
+		pthread_mutex_unlock(&ctx->mutex);
+		return false;
+	}
+
+	const char *api_key = daydream_auth_get_api_key(ctx->auth);
+	if (!api_key || strlen(api_key) == 0) {
+		blog(LOG_ERROR, "[Daydream] Not logged in. Please login first.");
+		pthread_mutex_unlock(&ctx->mutex);
+		return false;
+	}
+
+	ctx->start_thread_running = true;
+	ctx->stopping = false;
+	pthread_create(&ctx->start_thread, NULL, start_streaming_thread_func, ctx);
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	blog(LOG_INFO, "[Daydream] Starting stream in background...");
 
 	return false;
 }
