@@ -200,7 +200,7 @@ static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_o
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 	CURLcode res = curl_easy_perform(curl);
