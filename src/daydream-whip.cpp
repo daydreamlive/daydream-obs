@@ -383,8 +383,14 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 {
 	UNUSED_PARAMETER(is_keyframe);
 
-	if (!whip || !whip->connected || whip->track_id < 0)
+	if (!whip || !whip->connected || whip->track_id < 0) {
+		static int log_count = 0;
+		if (log_count++ < 5) {
+			blog(LOG_WARNING, "[Daydream WHIP] send_frame skip: whip=%p connected=%d track_id=%d",
+			     (void *)whip, whip ? (int)whip->connected.load() : -1, whip ? whip->track_id : -1);
+		}
 		return false;
+	}
 
 	if (!h264_data || size == 0)
 		return false;
@@ -421,13 +427,22 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		int result = rtcSendMessage(whip->track_id, reinterpret_cast<const char *>(rtp_packet),
 					    static_cast<int>(rtp_size));
 		if (result < 0) {
-			blog(LOG_WARNING, "[Daydream WHIP] Failed to send RTP packet");
+			blog(LOG_WARNING, "[Daydream WHIP] Failed to send RTP packet: %d", result);
 			return false;
 		}
 
 		whip->seq_num++;
 		data += payload_size;
 		remaining -= payload_size;
+	}
+
+	static uint64_t total_sent = 0;
+	static uint64_t last_log_time = 0;
+	total_sent++;
+	uint64_t now = os_gettime_ns();
+	if (now - last_log_time > 1000000000ULL) {
+		blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, total=%llu", size, (unsigned long long)total_sent);
+		last_log_time = now;
 	}
 
 	return true;

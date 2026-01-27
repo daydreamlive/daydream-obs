@@ -178,12 +178,18 @@ static void *encode_thread_func(void *data)
 	struct daydream_filter *ctx = data;
 
 	uint64_t frame_interval_ns = 1000000000ULL / ctx->target_fps;
+	uint64_t last_debug_time = 0;
+	uint64_t frames_sent = 0;
+	uint64_t frames_waiting = 0;
+
+	blog(LOG_INFO, "[Daydream Encode] Thread started, target_fps=%u", ctx->target_fps);
 
 	while (ctx->encode_thread_running) {
 		pthread_mutex_lock(&ctx->mutex);
 
 		while (!ctx->pending_frame_ready && ctx->encode_thread_running && !ctx->stopping) {
 			pthread_mutex_unlock(&ctx->mutex);
+			frames_waiting++;
 			os_sleep_ms(10);
 			pthread_mutex_lock(&ctx->mutex);
 		}
@@ -198,6 +204,8 @@ static void *encode_thread_func(void *data)
 			continue;
 		}
 
+		uint32_t frame_width = ctx->pending_frame_width;
+		uint32_t frame_height = ctx->pending_frame_height;
 		uint8_t *frame_copy = bmalloc(ctx->pending_frame_linesize * ctx->pending_frame_height);
 		memcpy(frame_copy, ctx->pending_frame, ctx->pending_frame_linesize * ctx->pending_frame_height);
 		uint32_t frame_linesize = ctx->pending_frame_linesize;
@@ -205,25 +213,40 @@ static void *encode_thread_func(void *data)
 
 		pthread_mutex_unlock(&ctx->mutex);
 
-		if (ctx->encoder && ctx->whip && daydream_whip_is_connected(ctx->whip)) {
+		bool has_encoder = ctx->encoder != NULL;
+		bool has_whip = ctx->whip != NULL;
+		bool whip_connected = has_whip && daydream_whip_is_connected(ctx->whip);
+
+		if (has_encoder && whip_connected) {
 			struct daydream_encoded_frame encoded;
 			if (daydream_encoder_encode(ctx->encoder, frame_copy, frame_linesize, &encoded)) {
 				uint32_t timestamp_ms = (uint32_t)(ctx->frame_count * 1000 / ctx->target_fps);
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
 				ctx->frame_count++;
+				frames_sent++;
 			}
+		}
+
+		uint64_t now = os_gettime_ns();
+		if (now - last_debug_time > 1000000000ULL) {
+			blog(LOG_INFO, "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu waiting=%llu",
+			     frame_width, frame_height, has_encoder, has_whip, whip_connected,
+			     (unsigned long long)frames_sent, (unsigned long long)frames_waiting);
+			last_debug_time = now;
+			frames_waiting = 0;
 		}
 
 		bfree(frame_copy);
 
-		uint64_t now = os_gettime_ns();
 		uint64_t elapsed = now - ctx->last_encode_time;
 		if (elapsed < frame_interval_ns) {
 			os_sleepto_ns(ctx->last_encode_time + frame_interval_ns);
 		}
 		ctx->last_encode_time = os_gettime_ns();
 	}
+
+	blog(LOG_INFO, "[Daydream Encode] Thread stopped, total frames sent: %llu", (unsigned long long)frames_sent);
 
 	return NULL;
 }
@@ -391,6 +414,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				ctx->pending_frame = bmalloc(data_size);
 				ctx->pending_frame_width = ctx->width;
 				ctx->pending_frame_height = ctx->height;
+				blog(LOG_INFO, "[Daydream Render] Frame buffer allocated: %ux%u", ctx->width, ctx->height);
 			}
 
 			memcpy(ctx->pending_frame, video_data, data_size);
