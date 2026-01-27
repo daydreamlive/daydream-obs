@@ -336,6 +336,7 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 			      bool is_keyframe)
 {
 	UNUSED_PARAMETER(is_keyframe);
+	UNUSED_PARAMETER(timestamp_ms);
 
 	if (!whip || !whip->connected || !whip->track) {
 		static int log_count = 0;
@@ -350,12 +351,7 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		return false;
 
 	try {
-		uint64_t now_us = os_gettime_ns() / 1000;
-		auto elapsed = std::chrono::microseconds(now_us - whip->startTime);
-		auto elapsed_seconds = std::chrono::duration<double>(elapsed);
-
-		rtc::binary frame(h264_data, h264_data + size);
-		whip->track->send(frame, elapsed_seconds);
+		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
 
 		static uint64_t total_sent = 0;
 		static uint64_t last_log_time = 0;
