@@ -214,13 +214,14 @@ static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_o
 	curl_easy_cleanup(curl);
 
 	if (res != CURLE_OK) {
-		blog(LOG_DEBUG, "[Daydream WHEP] HTTP request failed: %s", curl_easy_strerror(res));
+		blog(LOG_INFO, "[Daydream WHEP] HTTP request failed: %s (url=%s)", curl_easy_strerror(res),
+		     whep->whep_url.c_str());
 		delete response;
 		return false;
 	}
 
 	if (http_code != 200 && http_code != 201) {
-		blog(LOG_DEBUG, "[Daydream WHEP] HTTP error: %ld", http_code);
+		blog(LOG_INFO, "[Daydream WHEP] HTTP error: %ld (url=%s)", http_code, whep->whep_url.c_str());
 		delete response;
 		return false;
 	}
