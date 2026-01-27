@@ -596,6 +596,16 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	ctx->whep_url = bstrdup(whep_url);
 	blog(LOG_INFO, "[Daydream] WHEP URL: %s", ctx->whep_url);
 
+	ctx->streaming = true;
+	ctx->stopping = false;
+	ctx->frame_count = 0;
+	ctx->last_encode_time = os_gettime_ns();
+
+	ctx->encode_thread_running = true;
+	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
+
+	blog(LOG_INFO, "[Daydream] Encode thread started, connecting WHEP...");
+
 	struct daydream_whep_config whep_config = {
 		.whep_url = ctx->whep_url,
 		.api_key = api_key,
@@ -606,28 +616,10 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	ctx->whep = daydream_whep_create(&whep_config);
 
 	if (!daydream_whep_connect(ctx->whep)) {
-		blog(LOG_ERROR, "[Daydream] Failed to connect WHEP");
-		daydream_whip_disconnect(ctx->whip);
-		daydream_whip_destroy(ctx->whip);
-		ctx->whip = NULL;
+		blog(LOG_WARNING, "[Daydream] Failed to connect WHEP, continuing without output");
 		daydream_whep_destroy(ctx->whep);
 		ctx->whep = NULL;
-		daydream_encoder_destroy(ctx->encoder);
-		ctx->encoder = NULL;
-		daydream_decoder_destroy(ctx->decoder);
-		ctx->decoder = NULL;
-		pthread_mutex_unlock(&ctx->mutex);
-		daydream_api_free_result(&result);
-		return false;
 	}
-
-	ctx->streaming = true;
-	ctx->stopping = false;
-	ctx->frame_count = 0;
-	ctx->last_encode_time = os_gettime_ns();
-
-	ctx->encode_thread_running = true;
-	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
 
 	pthread_mutex_unlock(&ctx->mutex);
 
