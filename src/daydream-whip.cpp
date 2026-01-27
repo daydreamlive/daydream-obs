@@ -167,6 +167,7 @@ static bool send_whip_offer(daydream_whip *whip, const std::string &sdp_offer)
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 	CURLcode res = curl_easy_perform(curl);
 
@@ -377,6 +378,7 @@ void daydream_whip_disconnect(struct daydream_whip *whip)
 			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 			curl_easy_perform(curl);
 

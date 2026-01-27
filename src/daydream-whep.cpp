@@ -204,6 +204,7 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 	CURLcode res = curl_easy_perform(curl);
 
@@ -373,6 +374,7 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 			curl_easy_perform(curl);
 
