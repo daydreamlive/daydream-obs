@@ -31,6 +31,9 @@ struct daydream_filter {
 	uint32_t width;
 	uint32_t height;
 
+	gs_texrender_t *crop_texrender;
+	gs_stagesurf_t *crop_stagesurface;
+
 	struct daydream_auth *auth;
 
 	char *prompt;
@@ -230,7 +233,8 @@ static void *encode_thread_func(void *data)
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_debug_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu waiting=%llu",
+			blog(LOG_INFO,
+			     "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu waiting=%llu",
 			     frame_width, frame_height, has_encoder, has_whip, whip_connected,
 			     (unsigned long long)frames_sent, (unsigned long long)frames_waiting);
 			last_debug_time = now;
@@ -327,6 +331,10 @@ static void daydream_filter_destroy(void *data)
 		gs_stagesurface_destroy(ctx->stagesurface);
 	if (ctx->output_texture)
 		gs_texture_destroy(ctx->output_texture);
+	if (ctx->crop_texrender)
+		gs_texrender_destroy(ctx->crop_texrender);
+	if (ctx->crop_stagesurface)
+		gs_stagesurface_destroy(ctx->crop_stagesurface);
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
@@ -349,6 +357,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 {
 	struct daydream_filter *ctx = data;
 	UNUSED_PARAMETER(effect);
+
+	const uint32_t STREAM_SIZE = 512;
 
 	obs_source_t *parent = obs_filter_get_parent(ctx->source);
 	if (!parent)
@@ -399,31 +409,74 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		return;
 
 	if (ctx->streaming && ctx->encode_thread_running) {
-		gs_stage_texture(ctx->stagesurface, tex);
+		if (!ctx->crop_texrender)
+			ctx->crop_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+		if (!ctx->crop_stagesurface)
+			ctx->crop_stagesurface = gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
 
-		uint8_t *video_data = NULL;
-		uint32_t video_linesize = 0;
+		float scale;
+		if (parent_width < parent_height) {
+			scale = (float)STREAM_SIZE / (float)parent_width;
+		} else {
+			scale = (float)STREAM_SIZE / (float)parent_height;
+		}
 
-		if (gs_stagesurface_map(ctx->stagesurface, &video_data, &video_linesize)) {
-			pthread_mutex_lock(&ctx->mutex);
+		float scaled_width = parent_width * scale;
+		float scaled_height = parent_height * scale;
+		float offset_x = (scaled_width - STREAM_SIZE) / 2.0f;
+		float offset_y = (scaled_height - STREAM_SIZE) / 2.0f;
 
-			size_t data_size = ctx->height * video_linesize;
-			if (!ctx->pending_frame || ctx->pending_frame_width != ctx->width ||
-			    ctx->pending_frame_height != ctx->height) {
-				bfree(ctx->pending_frame);
-				ctx->pending_frame = bmalloc(data_size);
-				ctx->pending_frame_width = ctx->width;
-				ctx->pending_frame_height = ctx->height;
-				blog(LOG_INFO, "[Daydream Render] Frame buffer allocated: %ux%u", ctx->width, ctx->height);
+		gs_texrender_reset(ctx->crop_texrender);
+		if (gs_texrender_begin(ctx->crop_texrender, STREAM_SIZE, STREAM_SIZE)) {
+			struct vec4 clear_color;
+			vec4_zero(&clear_color);
+			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+
+			gs_ortho(offset_x / scale, (offset_x + STREAM_SIZE) / scale, offset_y / scale,
+				 (offset_y + STREAM_SIZE) / scale, -100.0f, 100.0f);
+
+			gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
+			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), tex);
+
+			gs_technique_begin(tech);
+			gs_technique_begin_pass(tech, 0);
+			gs_draw_sprite(tex, 0, ctx->width, ctx->height);
+			gs_technique_end_pass(tech);
+			gs_technique_end(tech);
+
+			gs_texrender_end(ctx->crop_texrender);
+		}
+
+		gs_texture_t *crop_tex = gs_texrender_get_texture(ctx->crop_texrender);
+		if (crop_tex) {
+			gs_stage_texture(ctx->crop_stagesurface, crop_tex);
+
+			uint8_t *video_data = NULL;
+			uint32_t video_linesize = 0;
+
+			if (gs_stagesurface_map(ctx->crop_stagesurface, &video_data, &video_linesize)) {
+				pthread_mutex_lock(&ctx->mutex);
+
+				size_t data_size = STREAM_SIZE * video_linesize;
+				if (!ctx->pending_frame || ctx->pending_frame_width != STREAM_SIZE ||
+				    ctx->pending_frame_height != STREAM_SIZE) {
+					bfree(ctx->pending_frame);
+					ctx->pending_frame = bmalloc(data_size);
+					ctx->pending_frame_width = STREAM_SIZE;
+					ctx->pending_frame_height = STREAM_SIZE;
+					blog(LOG_INFO, "[Daydream Render] Frame buffer allocated: %ux%u (from %ux%u)",
+					     STREAM_SIZE, STREAM_SIZE, parent_width, parent_height);
+				}
+
+				memcpy(ctx->pending_frame, video_data, data_size);
+				ctx->pending_frame_linesize = video_linesize;
+				ctx->pending_frame_ready = true;
+
+				pthread_mutex_unlock(&ctx->mutex);
+
+				gs_stagesurface_unmap(ctx->crop_stagesurface);
 			}
-
-			memcpy(ctx->pending_frame, video_data, data_size);
-			ctx->pending_frame_linesize = video_linesize;
-			ctx->pending_frame_ready = true;
-
-			pthread_mutex_unlock(&ctx->mutex);
-
-			gs_stagesurface_unmap(ctx->stagesurface);
 		}
 	}
 
@@ -522,18 +575,11 @@ static void *start_streaming_thread_func(void *data)
 
 	blog(LOG_INFO, "[Daydream] Start streaming thread started");
 
+	const uint32_t STREAM_SIZE = 512;
+
 	pthread_mutex_lock(&ctx->mutex);
 	const char *api_key = daydream_auth_get_api_key(ctx->auth);
 	char *api_key_copy = api_key ? bstrdup(api_key) : NULL;
-
-	obs_source_t *parent = obs_filter_get_parent(ctx->source);
-	uint32_t width = parent ? obs_source_get_base_width(parent) : 512;
-	uint32_t height = parent ? obs_source_get_base_height(parent) : 512;
-
-	if (width < 512)
-		width = 512;
-	if (height < 512)
-		height = 512;
 
 	struct daydream_stream_params params = {
 		.model_id = ctx->model ? bstrdup(ctx->model) : NULL,
@@ -542,8 +588,8 @@ static void *start_streaming_thread_func(void *data)
 		.guidance = ctx->guidance,
 		.delta = ctx->delta,
 		.steps = ctx->steps,
-		.width = (int)width,
-		.height = (int)height,
+		.width = (int)STREAM_SIZE,
+		.height = (int)STREAM_SIZE,
 	};
 	uint32_t target_fps = ctx->target_fps;
 	pthread_mutex_unlock(&ctx->mutex);
@@ -587,8 +633,8 @@ static void *start_streaming_thread_func(void *data)
 	blog(LOG_INFO, "[Daydream] WHIP URL: %s", ctx->whip_url);
 
 	struct daydream_encoder_config enc_config = {
-		.width = width,
-		.height = height,
+		.width = STREAM_SIZE,
+		.height = STREAM_SIZE,
 		.fps = target_fps,
 		.bitrate = 2000000,
 	};
@@ -603,8 +649,8 @@ static void *start_streaming_thread_func(void *data)
 	}
 
 	struct daydream_decoder_config dec_config = {
-		.width = width,
-		.height = height,
+		.width = STREAM_SIZE,
+		.height = STREAM_SIZE,
 	};
 	ctx->decoder = daydream_decoder_create(&dec_config);
 	if (!ctx->decoder) {
@@ -621,8 +667,8 @@ static void *start_streaming_thread_func(void *data)
 	struct daydream_whip_config whip_config = {
 		.whip_url = ctx->whip_url,
 		.api_key = api_key_copy,
-		.width = width,
-		.height = height,
+		.width = STREAM_SIZE,
+		.height = STREAM_SIZE,
 		.fps = target_fps,
 		.on_state = on_whip_state,
 		.userdata = ctx,

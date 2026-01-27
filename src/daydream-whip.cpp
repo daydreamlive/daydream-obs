@@ -441,7 +441,8 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 	total_sent++;
 	uint64_t now = os_gettime_ns();
 	if (now - last_log_time > 1000000000ULL) {
-		blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, total=%llu", size, (unsigned long long)total_sent);
+		blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, total=%llu", size,
+		     (unsigned long long)total_sent);
 		last_log_time = now;
 	}
 
