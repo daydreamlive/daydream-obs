@@ -182,7 +182,7 @@ static void on_track(int, int tr, void *ptr)
 	rtcSetMessageCallback(tr, on_message);
 }
 
-static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer)
+static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_offer, long *out_http_code)
 {
 	CURL *curl = curl_easy_init();
 	if (!curl)
@@ -193,35 +193,34 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 	struct curl_slist *headers = nullptr;
 	headers = curl_slist_append(headers, "Content-Type: application/sdp");
 
-	std::string auth_header = "Authorization: Bearer " + whep->api_key;
-	headers = curl_slist_append(headers, auth_header.c_str());
-
 	curl_easy_setopt(curl, CURLOPT_URL, whep->whep_url.c_str());
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sdp_answer.c_str());
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, sdp_offer.c_str());
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
 	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
 	curl_easy_setopt(curl, CURLOPT_HEADERDATA, response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 	CURLcode res = curl_easy_perform(curl);
 
 	long http_code = 0;
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+	if (out_http_code)
+		*out_http_code = http_code;
 
 	curl_slist_free_all(headers);
 	curl_easy_cleanup(curl);
 
 	if (res != CURLE_OK) {
-		blog(LOG_ERROR, "[Daydream WHEP] HTTP request failed: %s", curl_easy_strerror(res));
+		blog(LOG_DEBUG, "[Daydream WHEP] HTTP request failed: %s", curl_easy_strerror(res));
 		delete response;
 		return false;
 	}
 
 	if (http_code != 200 && http_code != 201) {
-		blog(LOG_ERROR, "[Daydream WHEP] HTTP error: %ld", http_code);
+		blog(LOG_DEBUG, "[Daydream WHEP] HTTP error: %ld", http_code);
 		delete response;
 		return false;
 	}
@@ -238,6 +237,34 @@ static bool send_whep_request(daydream_whep *whep, const std::string &sdp_answer
 
 	delete response;
 	return true;
+}
+
+static bool send_whep_request(daydream_whep *whep, const std::string &sdp_offer)
+{
+	const int max_retries = 30;
+	const int retry_delay_ms = 100;
+
+	for (int retry = 0; retry < max_retries; retry++) {
+		if (retry > 0) {
+			blog(LOG_INFO, "[Daydream WHEP] Retry %d/%d...", retry, max_retries);
+			os_sleep_ms(retry_delay_ms);
+		}
+
+		long http_code = 0;
+		if (send_whep_request_once(whep, sdp_offer, &http_code)) {
+			return true;
+		}
+
+		if (http_code == 404 || http_code == 503 || http_code == 0) {
+			continue;
+		}
+
+		blog(LOG_ERROR, "[Daydream WHEP] HTTP error %ld, not retrying", http_code);
+		return false;
+	}
+
+	blog(LOG_ERROR, "[Daydream WHEP] Failed after %d retries", max_retries);
+	return false;
 }
 
 struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *config)
@@ -362,27 +389,7 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 	whep->track_id = -1;
 	whep->connected = false;
 	whep->gathering_done = false;
-
-	if (!whep->resource_url.empty()) {
-		CURL *curl = curl_easy_init();
-		if (curl) {
-			struct curl_slist *headers = nullptr;
-			std::string auth_header = "Authorization: Bearer " + whep->api_key;
-			headers = curl_slist_append(headers, auth_header.c_str());
-
-			curl_easy_setopt(curl, CURLOPT_URL, whep->resource_url.c_str());
-			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-			curl_easy_perform(curl);
-
-			curl_slist_free_all(headers);
-			curl_easy_cleanup(curl);
-		}
-		whep->resource_url.clear();
-	}
+	whep->resource_url.clear();
 
 	blog(LOG_INFO, "[Daydream WHEP] Disconnected");
 }

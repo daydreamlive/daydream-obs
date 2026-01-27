@@ -366,27 +366,7 @@ void daydream_whip_disconnect(struct daydream_whip *whip)
 	whip->track_id = -1;
 	whip->connected = false;
 	whip->gathering_done = false;
-
-	if (!whip->resource_url.empty()) {
-		CURL *curl = curl_easy_init();
-		if (curl) {
-			struct curl_slist *headers = nullptr;
-			std::string auth_header = "Authorization: Bearer " + whip->api_key;
-			headers = curl_slist_append(headers, auth_header.c_str());
-
-			curl_easy_setopt(curl, CURLOPT_URL, whip->resource_url.c_str());
-			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-			curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-			curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-
-			curl_easy_perform(curl);
-
-			curl_slist_free_all(headers);
-			curl_easy_cleanup(curl);
-		}
-		whip->resource_url.clear();
-	}
+	whip->resource_url.clear();
 
 	blog(LOG_INFO, "[Daydream WHIP] Disconnected");
 }
