@@ -356,7 +356,11 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		return false;
 	}
 
-	blog(LOG_INFO, "[Daydream WHEP] Local video track added: %d", recv_track);
+	whep->track_id = recv_track;
+	whep->waiting_keyframe = true;
+	rtcSetMessageCallback(recv_track, on_message);
+
+	blog(LOG_INFO, "[Daydream WHEP] Local video track added: %d, message callback set", recv_track);
 
 	rtcSetLocalDescription(whep->pc_id, "offer");
 
