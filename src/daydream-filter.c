@@ -126,6 +126,7 @@ struct daydream_filter {
 
 	uint32_t base_rtp_timestamp;
 	uint64_t base_wall_time;
+	uint64_t playout_delay_ns;
 	bool timestamp_initialized;
 
 	pthread_mutex_t mutex;
@@ -265,11 +266,12 @@ static void *decode_thread_func(void *data)
 				struct frame_entry *first = &ctx->frame_queue[ctx->queue_tail];
 				ctx->base_rtp_timestamp = first->rtp_timestamp;
 				ctx->base_wall_time = os_gettime_ns();
+				ctx->playout_delay_ns = 350000000ULL;
 				ctx->timestamp_initialized = true;
 
 				blog(LOG_INFO,
-				     "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d, base_ts=%u)",
-				     ctx->queue_count, ctx->base_rtp_timestamp);
+				     "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d, delay=350ms)",
+				     ctx->queue_count);
 			}
 
 			pthread_mutex_unlock(&ctx->mutex);
@@ -420,6 +422,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->jitter_state = JITTER_BUFFERING;
 	ctx->jitter_min_start = 6;
 	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
+	ctx->playout_delay_ns = 350000000ULL;
 	ctx->timestamp_initialized = false;
 
 	ctx->auth = daydream_auth_create();
@@ -493,6 +496,7 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	ctx->base_rtp_timestamp = 0;
 	ctx->base_wall_time = 0;
+	ctx->playout_delay_ns = 350000000ULL;
 	ctx->timestamp_initialized = false;
 
 	ctx->raw_queue_head = 0;
@@ -697,17 +701,11 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
 			uint32_t ts_diff = entry->rtp_timestamp - ctx->base_rtp_timestamp;
-			uint64_t scheduled_time = ctx->base_wall_time + (uint64_t)ts_diff * 1000000000ULL / 90000ULL;
+			uint64_t scheduled_time =
+				ctx->base_wall_time + ctx->playout_delay_ns + (uint64_t)ts_diff * 1000000000ULL / 90000ULL;
 
 			int64_t early_ms = (int64_t)(scheduled_time - now) / 1000000;
-			if (early_ms > 100) {
-				static uint64_t last_early_log = 0;
-				if (now - last_early_log > 500000000ULL) {
-					blog(LOG_WARNING,
-					     "[Daydream Jitter] Waiting: next frame %lldms early, queue=%d",
-					     (long long)early_ms, ctx->queue_count);
-					last_early_log = now;
-				}
+			if (early_ms > 50) {
 				break;
 			}
 
