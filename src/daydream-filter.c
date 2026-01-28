@@ -266,11 +266,11 @@ static void *decode_thread_func(void *data)
 				struct frame_entry *first = &ctx->frame_queue[ctx->queue_tail];
 				ctx->base_rtp_timestamp = first->rtp_timestamp;
 				ctx->base_wall_time = os_gettime_ns();
-				ctx->playout_delay_ns = 350000000ULL;
+				ctx->playout_delay_ns = 500000000ULL;
 				ctx->timestamp_initialized = true;
 
 				blog(LOG_INFO,
-				     "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d, delay=350ms)",
+				     "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d, delay=500ms)",
 				     ctx->queue_count);
 			}
 
@@ -420,9 +420,9 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_cond_init(&ctx->raw_cond, NULL);
 
 	ctx->jitter_state = JITTER_BUFFERING;
-	ctx->jitter_min_start = 6;
+	ctx->jitter_min_start = 10;
 	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
-	ctx->playout_delay_ns = 350000000ULL;
+	ctx->playout_delay_ns = 500000000ULL;
 	ctx->timestamp_initialized = false;
 
 	ctx->auth = daydream_auth_create();
@@ -489,14 +489,14 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->decoded_frame_ready = false;
 
 	ctx->jitter_state = JITTER_BUFFERING;
-	ctx->jitter_min_start = 6;
+	ctx->jitter_min_start = 10;
 	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
 	ctx->last_output_time = 0;
 	memset(&ctx->jitter_stats, 0, sizeof(ctx->jitter_stats));
 
 	ctx->base_rtp_timestamp = 0;
 	ctx->base_wall_time = 0;
-	ctx->playout_delay_ns = 350000000ULL;
+	ctx->playout_delay_ns = 500000000ULL;
 	ctx->timestamp_initialized = false;
 
 	ctx->raw_queue_head = 0;
