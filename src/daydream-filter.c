@@ -47,6 +47,8 @@ struct daydream_filter {
 	gs_texrender_t *crop_texrender;
 	gs_stagesurf_t *crop_stagesurface;
 
+	gs_texrender_t *blur_texrender;
+
 	struct daydream_auth *auth;
 
 	char *prompt;
@@ -407,6 +409,8 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->crop_texrender);
 	if (ctx->crop_stagesurface)
 		gs_stagesurface_destroy(ctx->crop_stagesurface);
+	if (ctx->blur_texrender)
+		gs_texrender_destroy(ctx->blur_texrender);
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
@@ -626,6 +630,29 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_technique_begin_pass(tech, 0);
 
 	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready) {
+		const uint32_t BLUR_SIZE = 64;
+
+		if (!ctx->blur_texrender)
+			ctx->blur_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+
+		gs_texrender_reset(ctx->blur_texrender);
+		if (gs_texrender_begin(ctx->blur_texrender, BLUR_SIZE, BLUR_SIZE)) {
+			struct vec4 clear_color;
+			vec4_zero(&clear_color);
+			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+			gs_ortho(0.0f, (float)STREAM_SIZE, 0.0f, (float)STREAM_SIZE, -100.0f, 100.0f);
+
+			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
+			gs_draw_sprite(output, 0, STREAM_SIZE, STREAM_SIZE);
+			gs_texrender_end(ctx->blur_texrender);
+		}
+
+		gs_texture_t *blur_tex = gs_texrender_get_texture(ctx->blur_texrender);
+		if (blur_tex) {
+			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), blur_tex);
+			gs_draw_sprite(blur_tex, 0, ctx->width, ctx->height);
+		}
+
 		float scale;
 		if (parent_width < parent_height) {
 			scale = (float)STREAM_SIZE / (float)parent_width;
@@ -636,9 +663,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float render_size = STREAM_SIZE / scale;
 		float render_x = (ctx->width - render_size) / 2.0f;
 		float render_y = (ctx->height - render_size) / 2.0f;
-
-		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
-		gs_draw_sprite(output, 0, ctx->width, ctx->height);
 
 		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
 		gs_matrix_push();
