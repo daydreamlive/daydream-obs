@@ -119,6 +119,15 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	int packets_sent = 0;
 	int frames_received = 0;
 
+	static uint64_t decode_call_count = 0;
+	decode_call_count++;
+	if (decode_call_count <= 5 || decode_call_count % 100 == 0) {
+		blog(LOG_INFO, "[Daydream Decoder] Input #%llu: size=%zu first_bytes=%02x %02x %02x %02x %02x",
+		     (unsigned long long)decode_call_count, size, size > 0 ? h264_data[0] : 0,
+		     size > 1 ? h264_data[1] : 0, size > 2 ? h264_data[2] : 0, size > 3 ? h264_data[3] : 0,
+		     size > 4 ? h264_data[4] : 0);
+	}
+
 	while (data_size > 0) {
 		int parsed = av_parser_parse2(decoder->parser, decoder->codec_ctx, &decoder->packet->data,
 					      &decoder->packet->size, data, (int)data_size, AV_NOPTS_VALUE,
@@ -132,8 +141,12 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 		data += parsed;
 		data_size -= parsed;
 
-		if (decoder->packet->size == 0)
+		if (decoder->packet->size == 0) {
+			if (decode_call_count <= 5) {
+				blog(LOG_INFO, "[Daydream Decoder] Parser consumed %d bytes, no packet yet", parsed);
+			}
 			continue;
+		}
 
 		nal_count++;
 
