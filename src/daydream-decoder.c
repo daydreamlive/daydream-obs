@@ -101,7 +101,8 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	decoder->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	decoder->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
-	decoder->using_hw = init_hw_decoder(decoder, codec);
+	decoder->using_hw = false; // Disabled: HW decoder too sensitive to corrupted data
+	// decoder->using_hw = init_hw_decoder(decoder, codec);
 
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to open codec");
