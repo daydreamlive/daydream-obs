@@ -29,8 +29,11 @@ struct daydream_whep {
 	std::atomic<bool> gathering_done;
 
 	std::vector<uint8_t> frame_buffer;
+	std::vector<uint8_t> fua_buffer;
 	uint32_t current_timestamp;
 	bool waiting_keyframe;
+	bool fua_in_progress;
+	uint8_t fua_nal_header;
 };
 
 struct http_response {
@@ -180,6 +183,8 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->gathering_done = false;
 	whep->current_timestamp = 0;
 	whep->waiting_keyframe = true;
+	whep->fua_in_progress = false;
+	whep->fua_nal_header = 0;
 
 	return whep;
 }
@@ -276,6 +281,7 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 		static uint64_t msg_count = 0;
 		static uint64_t last_log_time = 0;
+		static uint64_t frames_decoded = 0;
 		msg_count++;
 
 		if (size <= 12)
@@ -284,17 +290,10 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		const uint8_t *rtp_data = reinterpret_cast<const uint8_t *>(bin.data());
 
 		uint8_t pt = rtp_data[1] & 0x7F;
+		bool marker = (rtp_data[1] & 0x80) != 0;
 
-		uint64_t now = os_gettime_ns();
-		if (now - last_log_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP] Received %llu packets, last size=%d, pt=%d",
-			     (unsigned long long)msg_count, size, pt);
-			last_log_time = now;
-		}
-
-		if (pt < 96 || pt > 127) {
+		if (pt < 96 || pt > 127)
 			return;
-		}
 
 		uint32_t timestamp = (rtp_data[4] << 24) | (rtp_data[5] << 16) | (rtp_data[6] << 8) | rtp_data[7];
 
@@ -318,17 +317,98 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		if (payload_size <= 0)
 			return;
 
+		if (whep->current_timestamp != timestamp) {
+			whep->frame_buffer.clear();
+			whep->current_timestamp = timestamp;
+		}
+
 		uint8_t nal_type = payload[0] & 0x1F;
-		bool is_keyframe = (nal_type == 5 || nal_type == 7 || nal_type == 8);
+		uint8_t nri = payload[0] & 0x60;
 
-		if (whep->waiting_keyframe && !is_keyframe)
-			return;
+		auto append_nal = [whep](const uint8_t *nal_data, int nal_size) {
+			uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+			whep->frame_buffer.insert(whep->frame_buffer.end(), start_code, start_code + 4);
+			whep->frame_buffer.insert(whep->frame_buffer.end(), nal_data, nal_data + nal_size);
+		};
 
-		if (is_keyframe)
-			whep->waiting_keyframe = false;
+		if (nal_type >= 1 && nal_type <= 23) {
+			append_nal(payload, payload_size);
+		} else if (nal_type == 24) {
+			int offset = 1;
+			while (offset + 2 <= payload_size) {
+				int nal_len = (payload[offset] << 8) | payload[offset + 1];
+				offset += 2;
+				if (offset + nal_len > payload_size)
+					break;
+				append_nal(payload + offset, nal_len);
+				offset += nal_len;
+			}
+		} else if (nal_type == 28) {
+			if (payload_size < 2)
+				return;
 
-		if (whep->on_frame) {
-			whep->on_frame(payload, payload_size, timestamp, is_keyframe, whep->userdata);
+			uint8_t fu_header = payload[1];
+			bool start_bit = (fu_header & 0x80) != 0;
+			bool end_bit = (fu_header & 0x40) != 0;
+			uint8_t fu_nal_type = fu_header & 0x1F;
+
+			if (start_bit) {
+				whep->fua_buffer.clear();
+				whep->fua_nal_header = (nri | fu_nal_type);
+				whep->fua_buffer.push_back(whep->fua_nal_header);
+				whep->fua_in_progress = true;
+			}
+
+			if (whep->fua_in_progress && payload_size > 2) {
+				whep->fua_buffer.insert(whep->fua_buffer.end(), payload + 2, payload + payload_size);
+			}
+
+			if (end_bit && whep->fua_in_progress) {
+				append_nal(whep->fua_buffer.data(), (int)whep->fua_buffer.size());
+				whep->fua_buffer.clear();
+				whep->fua_in_progress = false;
+			}
+		}
+
+		if (marker && !whep->frame_buffer.empty()) {
+			bool has_keyframe = false;
+			const uint8_t *buf = whep->frame_buffer.data();
+			size_t buf_size = whep->frame_buffer.size();
+
+			for (size_t i = 0; i + 4 < buf_size; i++) {
+				if (buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1) {
+					uint8_t nt = buf[i + 4] & 0x1F;
+					if (nt == 5 || nt == 7 || nt == 8) {
+						has_keyframe = true;
+						break;
+					}
+				}
+			}
+
+			if (whep->waiting_keyframe && !has_keyframe) {
+				whep->frame_buffer.clear();
+				return;
+			}
+
+			if (has_keyframe)
+				whep->waiting_keyframe = false;
+
+			frames_decoded++;
+			uint64_t now = os_gettime_ns();
+			if (now - last_log_time > 1000000000ULL) {
+				blog(LOG_INFO,
+				     "[Daydream WHEP] Received %llu pkts, decoded %llu frames, last=%zu bytes",
+				     (unsigned long long)msg_count, (unsigned long long)frames_decoded,
+				     whep->frame_buffer.size());
+				last_log_time = now;
+			}
+
+			if (whep->on_frame) {
+				whep->on_frame(whep->frame_buffer.data(), (int)whep->frame_buffer.size(), timestamp,
+					       has_keyframe, whep->userdata);
+			}
+
+			whep->frame_buffer.clear();
 		}
 	});
 
