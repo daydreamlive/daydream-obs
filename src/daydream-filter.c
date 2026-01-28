@@ -26,8 +26,8 @@
 #define RAW_QUEUE_SIZE 32
 #define FRAME_INTERVAL_NS (1000000000ULL / 30)
 #define JITTER_HISTORY_SIZE 16
-#define MIN_BUFFER_FRAMES 3
-#define MAX_BUFFER_FRAMES 12
+#define MIN_BUFFER_FRAMES 6
+#define MAX_BUFFER_FRAMES 14
 
 struct frame_entry {
 	uint8_t *data;
@@ -685,11 +685,17 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
 	}
 
+	static uint64_t last_low_warn = 0;
+	if (ctx->queue_started && ctx->queue_count <= 2 && now_ns - last_low_warn > 500000000ULL) {
+		blog(LOG_WARNING, "[Daydream] Queue low: %d frames", ctx->queue_count);
+		last_low_warn = now_ns;
+	}
+
 	if (ctx->queue_started) {
 		uint64_t now = os_gettime_ns();
 		bool should_pop = false;
 
-		if (ctx->queue_count >= 6) {
+		if (ctx->queue_count >= 10) {
 			should_pop = true;
 		} else if (ctx->queue_count > 0 && now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
 			should_pop = true;

@@ -275,7 +275,12 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 	packetizer->addToChain(nackResponder);
 
 	auto pliHandler = std::make_shared<rtc::PliHandler>([whip]() {
-		blog(LOG_INFO, "[Daydream WHIP] PLI received, requesting keyframe");
+		static uint64_t last_pli_time = 0;
+		uint64_t now = os_gettime_ns();
+		uint64_t delta = last_pli_time > 0 ? (now - last_pli_time) / 1000000 : 0;
+		blog(LOG_INFO, "[Daydream WHIP] PLI received (delta=%llums), requesting keyframe",
+		     (unsigned long long)delta);
+		last_pli_time = now;
 		if (whip->on_keyframe_request)
 			whip->on_keyframe_request(whip->userdata);
 	});
