@@ -136,19 +136,9 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 		ctx->decoded_frame_width = decoded.width;
 		ctx->decoded_frame_height = decoded.height;
 		ctx->decoded_frame_ready = true;
+		ctx->decode_errors = 0;
 
 		pthread_mutex_unlock(&ctx->mutex);
-	} else {
-		ctx->decode_errors++;
-
-		uint64_t now = os_gettime_ns();
-		uint64_t elapsed = now - ctx->last_keyframe_request;
-
-		if (ctx->decode_errors >= 3 && elapsed > 500000000ULL && ctx->whep) {
-			daydream_whep_request_keyframe(ctx->whep);
-			ctx->last_keyframe_request = now;
-			ctx->decode_errors = 0;
-		}
 	}
 }
 

@@ -1,5 +1,6 @@
 #include "daydream-decoder.h"
 #include <obs-module.h>
+#include <util/platform.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
@@ -114,6 +115,9 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 
 	const uint8_t *data = h264_data;
 	size_t data_size = size;
+	int nal_count = 0;
+	int packets_sent = 0;
+	int frames_received = 0;
 
 	while (data_size > 0) {
 		int parsed = av_parser_parse2(decoder->parser, decoder->codec_ctx, &decoder->packet->data,
@@ -131,21 +135,25 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 		if (decoder->packet->size == 0)
 			continue;
 
+		nal_count++;
+
 		int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
 		if (ret < 0) {
 			if (ret == AVERROR(EAGAIN))
 				continue;
-			blog(LOG_ERROR, "[Daydream Decoder] Error sending packet");
+			blog(LOG_ERROR, "[Daydream Decoder] Error sending packet: %d", ret);
 			return false;
 		}
+		packets_sent++;
 
 		ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
 		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 			continue;
 		} else if (ret < 0) {
-			blog(LOG_ERROR, "[Daydream Decoder] Error receiving frame");
+			blog(LOG_ERROR, "[Daydream Decoder] Error receiving frame: %d", ret);
 			return false;
 		}
+		frames_received++;
 
 		uint32_t frame_width = decoder->frame->width;
 		uint32_t frame_height = decoder->frame->height;
@@ -190,5 +198,14 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 		return true;
 	}
 
+	static uint64_t no_frame_count = 0;
+	static uint64_t last_log = 0;
+	no_frame_count++;
+	uint64_t now = os_gettime_ns();
+	if (now - last_log > 5000000000ULL) {
+		blog(LOG_INFO, "[Daydream Decoder] No frame: nals=%d sent=%d recv=%d (total_noframe=%llu)", nal_count,
+		     packets_sent, frames_received, (unsigned long long)no_frame_count);
+		last_log = now;
+	}
 	return false;
 }

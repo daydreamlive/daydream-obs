@@ -16,7 +16,7 @@
 
 class NackSender : public rtc::MediaHandler {
 public:
-	NackSender() : mSsrc(0), mInitialized(false), mLastSeq(0) {}
+	NackSender() : mSsrc(0), mInitialized(false), mLastSeq(0), mPacketCount(0), mLastLogTime(0) {}
 
 	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override
 	{
@@ -32,6 +32,7 @@ public:
 			auto rtp = reinterpret_cast<const rtc::RtpHeader *>(message->data());
 			uint16_t seq = rtp->seqNumber();
 			mSsrc = rtp->ssrc();
+			mPacketCount++;
 
 			if (!mInitialized) {
 				mInitialized = true;
@@ -59,6 +60,13 @@ public:
 
 		if (!missing.empty() && mSsrc != 0) {
 			sendNack(missing, send);
+		}
+
+		uint64_t now = os_gettime_ns();
+		if (now - mLastLogTime > 5000000000ULL) {
+			blog(LOG_INFO, "[Daydream WHEP NackSender] packets=%llu lastSeq=%u ssrc=0x%x",
+			     (unsigned long long)mPacketCount, mLastSeq, mSsrc);
+			mLastLogTime = now;
 		}
 	}
 
@@ -92,6 +100,8 @@ private:
 	bool mInitialized;
 	uint16_t mLastSeq;
 	std::set<uint16_t> mRequested;
+	uint64_t mPacketCount;
+	uint64_t mLastLogTime;
 };
 
 struct daydream_whep {
@@ -364,15 +374,24 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		static uint64_t last_log = 0;
 		frame_count++;
 
+		int nal_count = 0;
+		int sps_count = 0, pps_count = 0, idr_count = 0, non_idr_count = 0;
 		bool has_idr = false;
+
 		for (int i = 0; i + 4 < size; i++) {
 			if (frame_data[i] == 0 && frame_data[i + 1] == 0 && frame_data[i + 2] == 0 &&
 			    frame_data[i + 3] == 1) {
-				uint8_t t = frame_data[i + 4] & 0x1F;
-				if (t == 5 || t == 7 || t == 8) {
+				nal_count++;
+				uint8_t nal_type = frame_data[i + 4] & 0x1F;
+				if (nal_type == 7)
+					sps_count++;
+				else if (nal_type == 8)
+					pps_count++;
+				else if (nal_type == 5) {
+					idr_count++;
 					has_idr = true;
-					break;
-				}
+				} else if (nal_type == 1)
+					non_idr_count++;
 			}
 		}
 
@@ -383,8 +402,9 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_log > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP] frames=%llu size=%d keyframe=%d ts=%u",
-			     (unsigned long long)frame_count, size, has_idr ? 1 : 0, info.timestamp);
+			blog(LOG_INFO, "[Daydream WHEP] frames=%llu size=%d nals=%d (sps=%d pps=%d idr=%d p=%d) ts=%u",
+			     (unsigned long long)frame_count, size, nal_count, sps_count, pps_count, idr_count,
+			     non_idr_count, info.timestamp);
 			last_log = now;
 		}
 
