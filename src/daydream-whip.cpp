@@ -332,8 +332,8 @@ bool daydream_whip_is_connected(struct daydream_whip *whip)
 	return whip->connected;
 }
 
-bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size,
-			      uint32_t timestamp_ms, bool is_keyframe)
+bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size, uint32_t timestamp_ms,
+			      bool is_keyframe)
 {
 	UNUSED_PARAMETER(is_keyframe);
 	UNUSED_PARAMETER(timestamp_ms);
@@ -342,8 +342,7 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		static int log_count = 0;
 		if (log_count++ < 5) {
 			blog(LOG_WARNING, "[Daydream WHIP] send_frame skip: whip=%p connected=%d track=%p",
-			     (void *)whip, whip ? (int)whip->connected.load() : -1,
-			     whip ? whip->track.get() : nullptr);
+			     (void *)whip, whip ? (int)whip->connected.load() : -1, whip ? whip->track.get() : nullptr);
 		}
 		return false;
 	}

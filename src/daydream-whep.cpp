@@ -129,6 +129,17 @@ static void on_message(int, const char *message, int size, void *ptr)
 {
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
+	static uint64_t msg_count = 0;
+	static uint64_t last_log_time = 0;
+	msg_count++;
+
+	uint64_t now = os_gettime_ns();
+	if (now - last_log_time > 1000000000ULL) {
+		blog(LOG_INFO, "[Daydream WHEP] Received %llu messages, last size=%d", (unsigned long long)msg_count,
+		     size);
+		last_log_time = now;
+	}
+
 	if (size <= 0)
 		return;
 
@@ -171,11 +182,12 @@ static void on_message(int, const char *message, int size, void *ptr)
 	}
 }
 
-static void on_track(int, int tr, void *ptr)
+static void on_track(int pc, int tr, void *ptr)
 {
+	UNUSED_PARAMETER(pc);
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
-	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d", tr);
+	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d, setting message callback", tr);
 	whep->track_id = tr;
 	whep->waiting_keyframe = true;
 
