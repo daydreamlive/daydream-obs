@@ -113,112 +113,68 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	if (!decoder || !h264_data || size == 0 || !out_frame)
 		return false;
 
-	const uint8_t *data = h264_data;
-	size_t data_size = size;
-	int nal_count = 0;
-	int packets_sent = 0;
-	int frames_received = 0;
-
 	static uint64_t decode_call_count = 0;
 	decode_call_count++;
-	if (decode_call_count <= 5 || decode_call_count % 100 == 0) {
-		blog(LOG_INFO, "[Daydream Decoder] Input #%llu: size=%zu first_bytes=%02x %02x %02x %02x %02x",
-		     (unsigned long long)decode_call_count, size, size > 0 ? h264_data[0] : 0,
-		     size > 1 ? h264_data[1] : 0, size > 2 ? h264_data[2] : 0, size > 3 ? h264_data[3] : 0,
-		     size > 4 ? h264_data[4] : 0);
+
+	decoder->packet->data = (uint8_t *)h264_data;
+	decoder->packet->size = (int)size;
+
+	int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
+	if (ret < 0 && ret != AVERROR(EAGAIN)) {
+		if (decode_call_count <= 10) {
+			blog(LOG_ERROR, "[Daydream Decoder] Error sending packet: %d (size=%zu)", ret, size);
+		}
+		return false;
 	}
 
-	while (data_size > 0) {
-		int parsed = av_parser_parse2(decoder->parser, decoder->codec_ctx, &decoder->packet->data,
-					      &decoder->packet->size, data, (int)data_size, AV_NOPTS_VALUE,
-					      AV_NOPTS_VALUE, 0);
-
-		if (parsed < 0) {
-			blog(LOG_ERROR, "[Daydream Decoder] Error parsing data");
-			return false;
-		}
-
-		data += parsed;
-		data_size -= parsed;
-
-		if (decoder->packet->size == 0) {
-			if (decode_call_count <= 5) {
-				blog(LOG_INFO, "[Daydream Decoder] Parser consumed %d bytes, no packet yet", parsed);
-			}
-			continue;
-		}
-
-		nal_count++;
-
-		int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
-		if (ret < 0) {
-			if (ret == AVERROR(EAGAIN))
-				continue;
-			blog(LOG_ERROR, "[Daydream Decoder] Error sending packet: %d", ret);
-			return false;
-		}
-		packets_sent++;
-
-		ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-			continue;
-		} else if (ret < 0) {
+	ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
+	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+		return false;
+	} else if (ret < 0) {
+		if (decode_call_count <= 10) {
 			blog(LOG_ERROR, "[Daydream Decoder] Error receiving frame: %d", ret);
-			return false;
 		}
-		frames_received++;
+		return false;
+	}
 
-		uint32_t frame_width = decoder->frame->width;
-		uint32_t frame_height = decoder->frame->height;
+	uint32_t frame_width = decoder->frame->width;
+	uint32_t frame_height = decoder->frame->height;
 
-		if (decoder->width != frame_width || decoder->height != frame_height) {
-			decoder->width = frame_width;
-			decoder->height = frame_height;
+	if (decoder->width != frame_width || decoder->height != frame_height) {
+		decoder->width = frame_width;
+		decoder->height = frame_height;
 
-			if (decoder->sws_ctx) {
-				sws_freeContext(decoder->sws_ctx);
-				decoder->sws_ctx = NULL;
-			}
+		if (decoder->sws_ctx) {
+			sws_freeContext(decoder->sws_ctx);
+			decoder->sws_ctx = NULL;
 		}
+	}
+
+	if (!decoder->sws_ctx) {
+		decoder->sws_ctx = sws_getContext(frame_width, frame_height, decoder->frame->format, frame_width,
+						  frame_height, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
 		if (!decoder->sws_ctx) {
-			decoder->sws_ctx = sws_getContext(frame_width, frame_height, decoder->frame->format,
-							  frame_width, frame_height, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR,
-							  NULL, NULL, NULL);
-
-			if (!decoder->sws_ctx) {
-				blog(LOG_ERROR, "[Daydream Decoder] Failed to create sws context");
-				return false;
-			}
-
-			decoder->output_linesize = frame_width * 4;
-			decoder->output_buffer_size = decoder->output_linesize * frame_height;
-			decoder->output_buffer = brealloc(decoder->output_buffer, decoder->output_buffer_size);
+			blog(LOG_ERROR, "[Daydream Decoder] Failed to create sws context");
+			return false;
 		}
 
-		uint8_t *dst_data[1] = {decoder->output_buffer};
-		int dst_linesize[1] = {(int)decoder->output_linesize};
-
-		sws_scale(decoder->sws_ctx, (const uint8_t *const *)decoder->frame->data, decoder->frame->linesize, 0,
-			  frame_height, dst_data, dst_linesize);
-
-		out_frame->data = decoder->output_buffer;
-		out_frame->linesize = decoder->output_linesize;
-		out_frame->width = frame_width;
-		out_frame->height = frame_height;
-		out_frame->pts = decoder->frame->pts;
-
-		return true;
+		decoder->output_linesize = frame_width * 4;
+		decoder->output_buffer_size = decoder->output_linesize * frame_height;
+		decoder->output_buffer = brealloc(decoder->output_buffer, decoder->output_buffer_size);
 	}
 
-	static uint64_t no_frame_count = 0;
-	static uint64_t last_log = 0;
-	no_frame_count++;
-	uint64_t now = os_gettime_ns();
-	if (now - last_log > 5000000000ULL) {
-		blog(LOG_INFO, "[Daydream Decoder] No frame: nals=%d sent=%d recv=%d (total_noframe=%llu)", nal_count,
-		     packets_sent, frames_received, (unsigned long long)no_frame_count);
-		last_log = now;
-	}
-	return false;
+	uint8_t *dst_data[1] = {decoder->output_buffer};
+	int dst_linesize[1] = {(int)decoder->output_linesize};
+
+	sws_scale(decoder->sws_ctx, (const uint8_t *const *)decoder->frame->data, decoder->frame->linesize, 0,
+		  frame_height, dst_data, dst_linesize);
+
+	out_frame->data = decoder->output_buffer;
+	out_frame->linesize = decoder->output_linesize;
+	out_frame->width = frame_width;
+	out_frame->height = frame_height;
+	out_frame->pts = decoder->frame->pts;
+
+	return true;
 }
