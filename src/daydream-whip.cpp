@@ -336,7 +336,6 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 			      bool is_keyframe)
 {
 	UNUSED_PARAMETER(is_keyframe);
-	UNUSED_PARAMETER(timestamp_ms);
 
 	if (!whip || !whip->connected || !whip->track) {
 		static int log_count = 0;
@@ -365,11 +364,14 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 			     (unsigned long long)total_sent, size, hex);
 		}
 
+		uint32_t rtp_timestamp = static_cast<uint32_t>((timestamp_ms * 90ULL) % UINT32_MAX);
+		whip->rtpConfig->timestamp = rtp_timestamp;
+
 		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_log_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, total=%llu", size,
+			blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, ts=%u, total=%llu", size, rtp_timestamp,
 			     (unsigned long long)total_sent);
 			last_log_time = now;
 		}
