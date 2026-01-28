@@ -31,11 +31,16 @@ struct daydream_whip {
 	std::shared_ptr<rtc::Track> track;
 	std::shared_ptr<rtc::RtpPacketizationConfig> rtpConfig;
 
+	std::shared_ptr<rtc::Track> audioTrack;
+	std::shared_ptr<rtc::RtpPacketizationConfig> audioRtpConfig;
+
 	std::atomic<bool> connected;
 	std::atomic<bool> gathering_done;
 
 	uint32_t ssrc;
+	uint32_t audioSsrc;
 	uint64_t startTime;
+	uint64_t lastAudioTime;
 };
 
 struct http_response {
@@ -166,7 +171,9 @@ struct daydream_whip *daydream_whip_create(const struct daydream_whip_config *co
 	whip->connected = false;
 	whip->gathering_done = false;
 	whip->ssrc = 12345678;
+	whip->audioSsrc = 87654321;
 	whip->startTime = 0;
+	whip->lastAudioTime = 0;
 
 	return whip;
 }
@@ -247,11 +254,11 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 		blog(LOG_INFO, "[Daydream WHIP] Gathering state: %s", state_str);
 	});
 
-	rtc::Description::Video media("video", rtc::Description::Direction::SendOnly);
-	media.addH264Codec(96);
-	media.addSSRC(whip->ssrc, "daydream");
+	rtc::Description::Video videoMedia("video", rtc::Description::Direction::SendOnly);
+	videoMedia.addH264Codec(96);
+	videoMedia.addSSRC(whip->ssrc, "daydream");
 
-	whip->track = whip->pc->addTrack(media);
+	whip->track = whip->pc->addTrack(videoMedia);
 
 	whip->rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(whip->ssrc, "daydream", 96,
 									rtc::H264RtpPacketizer::defaultClockRate);
@@ -267,9 +274,28 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 
 	whip->track->setMediaHandler(packetizer);
 
-	whip->track->onOpen([whip]() { blog(LOG_INFO, "[Daydream WHIP] Track opened"); });
+	whip->track->onOpen([whip]() { blog(LOG_INFO, "[Daydream WHIP] Video track opened"); });
 
-	blog(LOG_INFO, "[Daydream WHIP] Video track added with H264RtpPacketizer");
+	blog(LOG_INFO, "[Daydream WHIP] Video track added");
+
+	rtc::Description::Audio audioMedia("audio", rtc::Description::Direction::SendOnly);
+	audioMedia.addOpusCodec(111);
+	audioMedia.addSSRC(whip->audioSsrc, "daydream-audio");
+
+	whip->audioTrack = whip->pc->addTrack(audioMedia);
+
+	whip->audioRtpConfig =
+		std::make_shared<rtc::RtpPacketizationConfig>(whip->audioSsrc, "daydream-audio", 111, 48000);
+
+	auto audioPacketizer = std::make_shared<rtc::OpusRtpPacketizer>(whip->audioRtpConfig);
+	auto audioSrReporter = std::make_shared<rtc::RtcpSrReporter>(whip->audioRtpConfig);
+	audioPacketizer->addToChain(audioSrReporter);
+
+	whip->audioTrack->setMediaHandler(audioPacketizer);
+
+	whip->audioTrack->onOpen([whip]() { blog(LOG_INFO, "[Daydream WHIP] Audio track opened"); });
+
+	blog(LOG_INFO, "[Daydream WHIP] Audio track added");
 
 	whip->pc->setLocalDescription();
 
@@ -318,6 +344,8 @@ void daydream_whip_disconnect(struct daydream_whip *whip)
 
 	whip->track.reset();
 	whip->rtpConfig.reset();
+	whip->audioTrack.reset();
+	whip->audioRtpConfig.reset();
 	whip->connected = false;
 	whip->gathering_done = false;
 	whip->resource_url.clear();
@@ -330,6 +358,19 @@ bool daydream_whip_is_connected(struct daydream_whip *whip)
 	if (!whip)
 		return false;
 	return whip->connected;
+}
+
+static void send_silent_audio(struct daydream_whip *whip, uint32_t timestamp_ms)
+{
+	if (!whip->audioTrack || !whip->audioRtpConfig)
+		return;
+
+	static const uint8_t silentOpusFrame[] = {0xF8, 0xFF, 0xFE};
+
+	uint32_t audioTimestamp = static_cast<uint32_t>((timestamp_ms * 48ULL) % UINT32_MAX);
+	whip->audioRtpConfig->timestamp = audioTimestamp;
+
+	whip->audioTrack->send(reinterpret_cast<const std::byte *>(silentOpusFrame), sizeof(silentOpusFrame));
 }
 
 bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_data, size_t size, uint32_t timestamp_ms,
@@ -368,6 +409,8 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		whip->rtpConfig->timestamp = rtp_timestamp;
 
 		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
+
+		send_silent_audio(whip, timestamp_ms);
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_log_time > 1000000000ULL) {
