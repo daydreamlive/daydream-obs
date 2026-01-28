@@ -572,9 +572,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_technique_begin_pass(tech, 0);
 
 	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready) {
-		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), tex);
-		gs_draw_sprite(tex, 0, ctx->width, ctx->height);
-
 		float scale;
 		if (parent_width < parent_height) {
 			scale = (float)STREAM_SIZE / (float)parent_width;
@@ -585,6 +582,9 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float render_size = STREAM_SIZE / scale;
 		float render_x = (ctx->width - render_size) / 2.0f;
 		float render_y = (ctx->height - render_size) / 2.0f;
+
+		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
+		gs_draw_sprite(output, 0, ctx->width, ctx->height);
 
 		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
 		gs_matrix_push();
