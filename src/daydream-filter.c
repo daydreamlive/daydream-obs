@@ -635,7 +635,7 @@ static void *start_streaming_thread_func(void *data)
 		.width = STREAM_SIZE,
 		.height = STREAM_SIZE,
 		.fps = target_fps,
-		.bitrate = 2000000,
+		.bitrate = 500000,
 	};
 	ctx->encoder = daydream_encoder_create(&enc_config);
 	if (!ctx->encoder) {
