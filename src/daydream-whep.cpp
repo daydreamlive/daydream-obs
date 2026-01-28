@@ -130,7 +130,6 @@ static void on_message(int, const char *message, int size, void *ptr)
 	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
 
 	static uint64_t msg_count = 0;
-	static uint64_t video_count = 0;
 	static uint64_t last_log_time = 0;
 	msg_count++;
 
@@ -140,17 +139,16 @@ static void on_message(int, const char *message, int size, void *ptr)
 	const uint8_t *data = reinterpret_cast<const uint8_t *>(message);
 
 	uint8_t pt = data[1] & 0x7F;
-	bool is_rtcp = (pt >= 72 && pt <= 76) || (pt >= 200 && pt <= 206);
-	if (is_rtcp) {
-		return;
-	}
-
-	video_count++;
 
 	uint64_t now = os_gettime_ns();
-	if (now - last_log_time > 1000000000ULL) {
-		blog(LOG_INFO, "[Daydream WHEP] Received %llu total, %llu video, last size=%d, pt=%d",
-		     (unsigned long long)msg_count, (unsigned long long)video_count, size, pt);
+	if (now - last_log_time > 1000000000ULL || msg_count <= 5) {
+		char hex[64] = {0};
+		int hex_len = 0;
+		for (int i = 0; i < size && i < 16; i++) {
+			hex_len += snprintf(hex + hex_len, sizeof(hex) - hex_len, "%02x ", data[i]);
+		}
+		blog(LOG_INFO, "[Daydream WHEP] Msg #%llu: size=%d, pt=%d, bytes: %s", (unsigned long long)msg_count,
+		     size, pt, hex);
 		last_log_time = now;
 	}
 
