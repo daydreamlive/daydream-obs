@@ -29,6 +29,7 @@ void daydream_whep_destroy(struct daydream_whep *whep);
 bool daydream_whep_connect(struct daydream_whep *whep);
 void daydream_whep_disconnect(struct daydream_whep *whep);
 bool daydream_whep_is_connected(struct daydream_whep *whep);
+bool daydream_whep_request_keyframe(struct daydream_whep *whep);
 
 #ifdef __cplusplus
 }

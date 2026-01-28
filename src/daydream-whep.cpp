@@ -366,3 +366,14 @@ bool daydream_whep_is_connected(struct daydream_whep *whep)
 		return false;
 	return whep->connected;
 }
+
+bool daydream_whep_request_keyframe(struct daydream_whep *whep)
+{
+	if (!whep || !whep->track || !whep->connected)
+		return false;
+
+	bool result = whep->track->requestKeyframe();
+	if (result)
+		blog(LOG_INFO, "[Daydream WHEP] Requested keyframe (PLI sent)");
+	return result;
+}
