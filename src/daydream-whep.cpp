@@ -260,83 +260,79 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
 	});
 
-	whep->pc->onTrack([whep](std::shared_ptr<rtc::Track> track) {
-		blog(LOG_INFO, "[Daydream WHEP] Remote track received");
-		whep->track = track;
-		whep->waiting_keyframe = true;
-
-		track->onMessage([whep](rtc::message_variant data) {
-			if (!std::holds_alternative<rtc::binary>(data))
-				return;
-
-			const auto &bin = std::get<rtc::binary>(data);
-			int size = static_cast<int>(bin.size());
-
-			static uint64_t msg_count = 0;
-			static uint64_t last_log_time = 0;
-			msg_count++;
-
-			if (size <= 12)
-				return;
-
-			const uint8_t *rtp_data = reinterpret_cast<const uint8_t *>(bin.data());
-
-			uint8_t pt = rtp_data[1] & 0x7F;
-			if (pt < 96 || pt > 127) {
-				return;
-			}
-
-			uint64_t now = os_gettime_ns();
-			if (now - last_log_time > 1000000000ULL) {
-				blog(LOG_INFO, "[Daydream WHEP] Received %llu video packets, last size=%d",
-				     (unsigned long long)msg_count, size);
-				last_log_time = now;
-			}
-
-			uint32_t timestamp = (rtp_data[4] << 24) | (rtp_data[5] << 16) | (rtp_data[6] << 8) |
-					     rtp_data[7];
-
-			int header_size = 12;
-			int cc = rtp_data[0] & 0x0F;
-			header_size += cc * 4;
-
-			if (rtp_data[0] & 0x10) {
-				if (size > header_size + 4) {
-					int ext_len = (rtp_data[header_size + 2] << 8) | rtp_data[header_size + 3];
-					header_size += 4 + ext_len * 4;
-				}
-			}
-
-			if (size <= header_size)
-				return;
-
-			const uint8_t *payload = rtp_data + header_size;
-			int payload_size = size - header_size;
-
-			if (payload_size <= 0)
-				return;
-
-			uint8_t nal_type = payload[0] & 0x1F;
-			bool is_keyframe = (nal_type == 5 || nal_type == 7 || nal_type == 8);
-
-			if (whep->waiting_keyframe && !is_keyframe)
-				return;
-
-			if (is_keyframe)
-				whep->waiting_keyframe = false;
-
-			if (whep->on_frame) {
-				whep->on_frame(payload, payload_size, timestamp, is_keyframe, whep->userdata);
-			}
-		});
-	});
-
 	rtc::Description::Video media("video", rtc::Description::Direction::RecvOnly);
 	media.addH264Codec(96);
 
 	whep->track = whep->pc->addTrack(media);
 
 	blog(LOG_INFO, "[Daydream WHEP] Video track added (recvonly)");
+
+	whep->track->onMessage([whep](rtc::message_variant data) {
+		if (!std::holds_alternative<rtc::binary>(data))
+			return;
+
+		const auto &bin = std::get<rtc::binary>(data);
+		int size = static_cast<int>(bin.size());
+
+		static uint64_t msg_count = 0;
+		static uint64_t last_log_time = 0;
+		msg_count++;
+
+		if (size <= 12)
+			return;
+
+		const uint8_t *rtp_data = reinterpret_cast<const uint8_t *>(bin.data());
+
+		uint8_t pt = rtp_data[1] & 0x7F;
+
+		uint64_t now = os_gettime_ns();
+		if (now - last_log_time > 1000000000ULL) {
+			blog(LOG_INFO, "[Daydream WHEP] Received %llu packets, last size=%d, pt=%d",
+			     (unsigned long long)msg_count, size, pt);
+			last_log_time = now;
+		}
+
+		if (pt < 96 || pt > 127) {
+			return;
+		}
+
+		uint32_t timestamp = (rtp_data[4] << 24) | (rtp_data[5] << 16) | (rtp_data[6] << 8) | rtp_data[7];
+
+		int header_size = 12;
+		int cc = rtp_data[0] & 0x0F;
+		header_size += cc * 4;
+
+		if (rtp_data[0] & 0x10) {
+			if (size > header_size + 4) {
+				int ext_len = (rtp_data[header_size + 2] << 8) | rtp_data[header_size + 3];
+				header_size += 4 + ext_len * 4;
+			}
+		}
+
+		if (size <= header_size)
+			return;
+
+		const uint8_t *payload = rtp_data + header_size;
+		int payload_size = size - header_size;
+
+		if (payload_size <= 0)
+			return;
+
+		uint8_t nal_type = payload[0] & 0x1F;
+		bool is_keyframe = (nal_type == 5 || nal_type == 7 || nal_type == 8);
+
+		if (whep->waiting_keyframe && !is_keyframe)
+			return;
+
+		if (is_keyframe)
+			whep->waiting_keyframe = false;
+
+		if (whep->on_frame) {
+			whep->on_frame(payload, payload_size, timestamp, is_keyframe, whep->userdata);
+		}
+	});
+
+	blog(LOG_INFO, "[Daydream WHEP] Message callback set on track");
 
 	whep->pc->setLocalDescription();
 
@@ -367,8 +363,6 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		whep->pc.reset();
 		return false;
 	}
-
-	blog(LOG_INFO, "[Daydream] WHEP connected successfully");
 
 	return true;
 }
