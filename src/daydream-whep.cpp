@@ -266,6 +266,10 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	whep->track->setMediaHandler(depacketizer);
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
+		static uint64_t frame_count = 0;
+		static uint64_t last_log_time = 0;
+		static uint64_t last_frame_time = 0;
+
 		int size = static_cast<int>(data.size());
 		if (size <= 4)
 			return;
@@ -292,6 +296,17 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 			return;
 		if (has_idr)
 			whep->waiting_keyframe = false;
+
+		frame_count++;
+		uint64_t now = os_gettime_ns();
+		uint64_t delta_ms = last_frame_time > 0 ? (now - last_frame_time) / 1000000 : 0;
+		last_frame_time = now;
+
+		if (now - last_log_time > 1000000000ULL) {
+			blog(LOG_INFO, "[Daydream WHEP] Received %llu frames, last delta=%llums, size=%d",
+			     (unsigned long long)frame_count, (unsigned long long)delta_ms, size);
+			last_log_time = now;
+		}
 
 		if (whep->on_frame)
 			whep->on_frame(frame_data, size, info.timestamp, has_idr, whep->userdata);
