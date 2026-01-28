@@ -701,6 +701,13 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 			int64_t early_ms = (int64_t)(scheduled_time - now) / 1000000;
 			if (early_ms > 100) {
+				static uint64_t last_early_log = 0;
+				if (now - last_early_log > 500000000ULL) {
+					blog(LOG_WARNING,
+					     "[Daydream Jitter] Waiting: next frame %lldms early, queue=%d",
+					     (long long)early_ms, ctx->queue_count);
+					last_early_log = now;
+				}
 				break;
 			}
 

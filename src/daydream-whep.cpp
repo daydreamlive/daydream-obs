@@ -302,6 +302,11 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		uint64_t delta_ms = last_frame_time > 0 ? (now - last_frame_time) / 1000000 : 0;
 		last_frame_time = now;
 
+		if (delta_ms > 200) {
+			blog(LOG_WARNING, "[Daydream WHEP] Long gap: %llums between frames",
+			     (unsigned long long)delta_ms);
+		}
+
 		if (now - last_log_time > 1000000000ULL) {
 			blog(LOG_INFO, "[Daydream WHEP] Received %llu frames, last delta=%llums, size=%d",
 			     (unsigned long long)frame_count, (unsigned long long)delta_ms, size);
