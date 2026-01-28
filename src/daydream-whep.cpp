@@ -13,58 +13,6 @@
 #include <cstring>
 #include <memory>
 
-class GapDetectingSession : public rtc::RtcpReceivingSession {
-public:
-	GapDetectingSession() = default;
-
-	void setTrack(std::shared_ptr<rtc::Track> track) { mTrack = track; }
-
-	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override
-	{
-		for (const auto &message : messages) {
-			if (message->type != rtc::Message::Binary)
-				continue;
-			if (message->size() < sizeof(rtc::RtpHeader))
-				continue;
-
-			auto rtp = reinterpret_cast<const rtc::RtpHeader *>(message->data());
-			uint16_t seq = rtp->seqNumber();
-
-			if (!mInitialized) {
-				mExpectedSeq = seq;
-				mInitialized = true;
-			}
-
-			int16_t diff = static_cast<int16_t>(seq - mExpectedSeq);
-			if (diff > 1 && diff < 1000) {
-				mGapCount++;
-				uint64_t now = os_gettime_ns();
-				if (now - mLastPliTime > 200000000ULL) {
-					if (auto track = mTrack.lock()) {
-						track->requestKeyframe();
-						blog(LOG_INFO,
-						     "[Daydream WHEP] Gap detected (expected=%u got=%u), PLI sent",
-						     mExpectedSeq, seq);
-					}
-					mLastPliTime = now;
-				}
-			}
-
-			if (diff >= 0)
-				mExpectedSeq = seq + 1;
-		}
-
-		rtc::RtcpReceivingSession::incoming(messages, send);
-	}
-
-private:
-	std::weak_ptr<rtc::Track> mTrack;
-	uint16_t mExpectedSeq = 0;
-	bool mInitialized = false;
-	uint64_t mLastPliTime = 0;
-	uint32_t mGapCount = 0;
-};
-
 struct daydream_whep {
 	std::string whep_url;
 	std::string api_key;
@@ -81,6 +29,10 @@ struct daydream_whep {
 	std::atomic<bool> gathering_done;
 
 	bool waiting_keyframe;
+
+	std::atomic<bool> pli_thread_running;
+	pthread_t pli_thread;
+	uint64_t pli_interval_ns;
 };
 
 struct http_response {
@@ -229,6 +181,8 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->connected = false;
 	whep->gathering_done = false;
 	whep->waiting_keyframe = true;
+	whep->pli_thread_running = false;
+	whep->pli_interval_ns = 2000000000ULL;
 
 	return whep;
 }
@@ -240,6 +194,28 @@ void daydream_whep_destroy(struct daydream_whep *whep)
 
 	daydream_whep_disconnect(whep);
 	delete whep;
+}
+
+static void *pli_thread_func(void *arg)
+{
+	struct daydream_whep *whep = static_cast<struct daydream_whep *>(arg);
+
+	blog(LOG_INFO, "[Daydream WHEP] PLI thread started (interval: %llu ms)",
+	     (unsigned long long)(whep->pli_interval_ns / 1000000));
+
+	while (whep->pli_thread_running) {
+		os_sleep_ms((uint32_t)(whep->pli_interval_ns / 1000000));
+
+		if (!whep->pli_thread_running)
+			break;
+
+		if (whep->connected && whep->track) {
+			whep->track->requestKeyframe();
+		}
+	}
+
+	blog(LOG_INFO, "[Daydream WHEP] PLI thread stopped");
+	return nullptr;
 }
 
 bool daydream_whep_connect(struct daydream_whep *whep)
@@ -315,12 +291,10 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	whep->track = whep->pc->addTrack(media);
 
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-	auto gapSession = std::make_shared<GapDetectingSession>();
-	gapSession->setTrack(whep->track);
-	depacketizer->addToChain(gapSession);
+	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
 	whep->track->setMediaHandler(depacketizer);
 
-	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> GapDetectingSession");
+	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> RtcpReceivingSession");
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
 		int size = static_cast<int>(data.size());
@@ -393,6 +367,9 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		return false;
 	}
 
+	whep->pli_thread_running = true;
+	pthread_create(&whep->pli_thread, nullptr, pli_thread_func, whep);
+
 	return true;
 }
 
@@ -400,6 +377,11 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 {
 	if (!whep)
 		return;
+
+	if (whep->pli_thread_running) {
+		whep->pli_thread_running = false;
+		pthread_join(whep->pli_thread, nullptr);
+	}
 
 	if (whep->pc) {
 		whep->pc->close();
