@@ -262,12 +262,11 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	whep->track = whep->pc->addTrack(media);
 
-	auto rtcpSession = std::make_shared<rtc::RtcpReceivingSession>();
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-	rtcpSession->addToChain(depacketizer);
-	whep->track->setMediaHandler(rtcpSession);
+	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+	whep->track->setMediaHandler(depacketizer);
 
-	blog(LOG_INFO, "[Daydream WHEP] Video track with RtcpReceivingSession + H264RtpDepacketizer");
+	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> RtcpReceivingSession");
 
 	whep->track->onMessage([whep](rtc::message_variant data) {
 		if (!std::holds_alternative<rtc::binary>(data))
