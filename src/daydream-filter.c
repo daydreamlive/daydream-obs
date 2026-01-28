@@ -417,6 +417,11 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_mutex_init(&ctx->raw_mutex, NULL);
 	pthread_cond_init(&ctx->raw_cond, NULL);
 
+	ctx->jitter_state = JITTER_BUFFERING;
+	ctx->jitter_min_start = 6;
+	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
+	ctx->timestamp_initialized = false;
+
 	ctx->auth = daydream_auth_create();
 
 	daydream_filter_update(ctx, settings);
