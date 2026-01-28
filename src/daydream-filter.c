@@ -23,6 +23,7 @@
 #define PROP_STOP "stop"
 
 #define FRAME_QUEUE_SIZE 16
+#define RAW_QUEUE_SIZE 32
 #define FRAME_INTERVAL_NS (1000000000ULL / 30)
 #define JITTER_HISTORY_SIZE 16
 #define MIN_BUFFER_FRAMES 3
@@ -33,6 +34,11 @@ struct frame_entry {
 	uint32_t width;
 	uint32_t height;
 	uint32_t linesize;
+};
+
+struct raw_packet {
+	uint8_t *data;
+	size_t size;
 };
 
 struct daydream_filter {
@@ -72,11 +78,21 @@ struct daydream_filter {
 	pthread_t encode_thread;
 	bool encode_thread_running;
 
+	pthread_t decode_thread;
+	bool decode_thread_running;
+
 	pthread_t whep_thread;
 	bool whep_thread_running;
 
 	pthread_t start_thread;
 	bool start_thread_running;
+
+	struct raw_packet raw_queue[RAW_QUEUE_SIZE];
+	int raw_queue_head;
+	int raw_queue_tail;
+	int raw_queue_count;
+	pthread_mutex_t raw_mutex;
+	pthread_cond_t raw_cond;
 
 	uint8_t *pending_frame;
 	uint32_t pending_frame_width;
@@ -142,63 +158,118 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 	UNUSED_PARAMETER(timestamp);
 	UNUSED_PARAMETER(is_keyframe);
 
-	if (!ctx || !ctx->decoder)
+	if (!ctx)
 		return;
 
-	struct daydream_decoded_frame decoded;
-	if (daydream_decoder_decode(ctx->decoder, data, size, &decoded)) {
-		pthread_mutex_lock(&ctx->mutex);
+	pthread_mutex_lock(&ctx->raw_mutex);
 
-		uint64_t now = os_gettime_ns();
-		if (ctx->last_receive_time > 0) {
-			uint64_t delta = now - ctx->last_receive_time;
-			ctx->jitter_history[ctx->jitter_idx] = delta;
-			ctx->jitter_idx = (ctx->jitter_idx + 1) % JITTER_HISTORY_SIZE;
+	if (ctx->raw_queue_count >= RAW_QUEUE_SIZE) {
+		pthread_mutex_unlock(&ctx->raw_mutex);
+		return;
+	}
 
-			uint64_t max_delta = 0;
-			for (int i = 0; i < JITTER_HISTORY_SIZE; i++) {
-				if (ctx->jitter_history[i] > max_delta)
-					max_delta = ctx->jitter_history[i];
+	struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_head];
+
+	if (!pkt->data || pkt->size < size) {
+		bfree(pkt->data);
+		pkt->data = bmalloc(size);
+	}
+
+	memcpy(pkt->data, data, size);
+	pkt->size = size;
+
+	ctx->raw_queue_head = (ctx->raw_queue_head + 1) % RAW_QUEUE_SIZE;
+	ctx->raw_queue_count++;
+
+	pthread_cond_signal(&ctx->raw_cond);
+	pthread_mutex_unlock(&ctx->raw_mutex);
+}
+
+static void *decode_thread_func(void *data)
+{
+	struct daydream_filter *ctx = data;
+
+	blog(LOG_INFO, "[Daydream Decode] Thread started");
+
+	while (ctx->decode_thread_running) {
+		pthread_mutex_lock(&ctx->raw_mutex);
+
+		while (ctx->raw_queue_count == 0 && ctx->decode_thread_running && !ctx->stopping) {
+			pthread_cond_wait(&ctx->raw_cond, &ctx->raw_mutex);
+		}
+
+		if (!ctx->decode_thread_running || ctx->stopping) {
+			pthread_mutex_unlock(&ctx->raw_mutex);
+			break;
+		}
+
+		struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_tail];
+		uint8_t *raw_data = bmalloc(pkt->size);
+		size_t raw_size = pkt->size;
+		memcpy(raw_data, pkt->data, raw_size);
+
+		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
+		ctx->raw_queue_count--;
+
+		pthread_mutex_unlock(&ctx->raw_mutex);
+
+		struct daydream_decoded_frame decoded;
+		if (ctx->decoder && daydream_decoder_decode(ctx->decoder, raw_data, raw_size, &decoded)) {
+			pthread_mutex_lock(&ctx->mutex);
+
+			uint64_t now = os_gettime_ns();
+			if (ctx->last_receive_time > 0) {
+				uint64_t delta = now - ctx->last_receive_time;
+				ctx->jitter_history[ctx->jitter_idx] = delta;
+				ctx->jitter_idx = (ctx->jitter_idx + 1) % JITTER_HISTORY_SIZE;
+
+				uint64_t max_delta = 0;
+				for (int i = 0; i < JITTER_HISTORY_SIZE; i++) {
+					if (ctx->jitter_history[i] > max_delta)
+						max_delta = ctx->jitter_history[i];
+				}
+
+				int needed_frames = (int)((max_delta + FRAME_INTERVAL_NS - 1) / FRAME_INTERVAL_NS) + 1;
+				if (needed_frames < MIN_BUFFER_FRAMES)
+					needed_frames = MIN_BUFFER_FRAMES;
+				if (needed_frames > MAX_BUFFER_FRAMES)
+					needed_frames = MAX_BUFFER_FRAMES;
+
+				if (ctx->underrun_count > 0)
+					needed_frames += ctx->underrun_count;
+				if (needed_frames > MAX_BUFFER_FRAMES)
+					needed_frames = MAX_BUFFER_FRAMES;
+
+				ctx->target_buffer_frames = needed_frames;
+			}
+			ctx->last_receive_time = now;
+
+			if (ctx->queue_count < FRAME_QUEUE_SIZE) {
+				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
+				size_t frame_size = decoded.linesize * decoded.height;
+
+				if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
+					bfree(entry->data);
+					entry->data = bmalloc(frame_size);
+				}
+
+				memcpy(entry->data, decoded.data, frame_size);
+				entry->width = decoded.width;
+				entry->height = decoded.height;
+				entry->linesize = decoded.linesize;
+
+				ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
+				ctx->queue_count++;
 			}
 
-			int needed_frames = (int)((max_delta + FRAME_INTERVAL_NS - 1) / FRAME_INTERVAL_NS) + 1;
-			if (needed_frames < MIN_BUFFER_FRAMES)
-				needed_frames = MIN_BUFFER_FRAMES;
-			if (needed_frames > MAX_BUFFER_FRAMES)
-				needed_frames = MAX_BUFFER_FRAMES;
-
-			if (ctx->underrun_count > 0)
-				needed_frames += ctx->underrun_count;
-			if (needed_frames > MAX_BUFFER_FRAMES)
-				needed_frames = MAX_BUFFER_FRAMES;
-
-			ctx->target_buffer_frames = needed_frames;
-		}
-		ctx->last_receive_time = now;
-
-		if (ctx->queue_count >= FRAME_QUEUE_SIZE) {
 			pthread_mutex_unlock(&ctx->mutex);
-			return;
 		}
 
-		struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
-		size_t frame_size = decoded.linesize * decoded.height;
-
-		if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
-			bfree(entry->data);
-			entry->data = bmalloc(frame_size);
-		}
-
-		memcpy(entry->data, decoded.data, frame_size);
-		entry->width = decoded.width;
-		entry->height = decoded.height;
-		entry->linesize = decoded.linesize;
-
-		ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
-		ctx->queue_count++;
-
-		pthread_mutex_unlock(&ctx->mutex);
+		bfree(raw_data);
 	}
+
+	blog(LOG_INFO, "[Daydream Decode] Thread stopped");
+	return NULL;
 }
 
 static void on_whep_state(bool connected, const char *error, void *userdata)
@@ -325,6 +396,8 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
+	pthread_mutex_init(&ctx->raw_mutex, NULL);
+	pthread_cond_init(&ctx->raw_cond, NULL);
 
 	ctx->auth = daydream_auth_create();
 
@@ -341,6 +414,12 @@ static void stop_streaming(struct daydream_filter *ctx)
 		ctx->encode_thread_running = false;
 		pthread_cond_signal(&ctx->frame_cond);
 		pthread_join(ctx->encode_thread, NULL);
+	}
+
+	if (ctx->decode_thread_running) {
+		ctx->decode_thread_running = false;
+		pthread_cond_signal(&ctx->raw_cond);
+		pthread_join(ctx->decode_thread, NULL);
 	}
 
 	if (ctx->whep_thread_running) {
@@ -390,6 +469,10 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->underrun_count = 0;
 	for (int i = 0; i < JITTER_HISTORY_SIZE; i++)
 		ctx->jitter_history[i] = 0;
+
+	ctx->raw_queue_head = 0;
+	ctx->raw_queue_tail = 0;
+	ctx->raw_queue_count = 0;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -428,8 +511,14 @@ static void daydream_filter_destroy(void *data)
 		bfree(ctx->frame_queue[i].data);
 	}
 
+	for (int i = 0; i < RAW_QUEUE_SIZE; i++) {
+		bfree(ctx->raw_queue[i].data);
+	}
+
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
+	pthread_cond_destroy(&ctx->raw_cond);
+	pthread_mutex_destroy(&ctx->raw_mutex);
 
 	bfree(ctx);
 }
@@ -865,6 +954,9 @@ static void *start_streaming_thread_func(void *data)
 
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
+
+	ctx->decode_thread_running = true;
+	pthread_create(&ctx->decode_thread, NULL, decode_thread_func, ctx);
 
 	blog(LOG_INFO, "[Daydream] WHIP streaming started, connecting WHEP in background...");
 
