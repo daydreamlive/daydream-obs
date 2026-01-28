@@ -4,6 +4,7 @@
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <string.h>
 
 struct daydream_encoder {
 	AVCodecContext *codec_ctx;
@@ -22,6 +23,53 @@ struct daydream_encoder {
 	size_t output_buffer_size;
 };
 
+static const AVCodec *find_best_h264_encoder(void)
+{
+	const char *encoder_names[] = {
+#if defined(__APPLE__)
+		"h264_videotoolbox",
+#elif defined(_WIN32)
+		"h264_nvenc", "h264_amf", "h264_qsv",
+#elif defined(__linux__)
+		"h264_nvenc", "h264_vaapi", "h264_qsv",
+#endif
+		"libx264", NULL};
+
+	for (int i = 0; encoder_names[i]; i++) {
+		const AVCodec *codec = avcodec_find_encoder_by_name(encoder_names[i]);
+		if (codec) {
+			blog(LOG_INFO, "[Daydream Encoder] Found encoder: %s", encoder_names[i]);
+			return codec;
+		}
+	}
+
+	return avcodec_find_encoder(AV_CODEC_ID_H264);
+}
+
+static void configure_encoder_options(AVCodecContext *ctx, const AVCodec *codec)
+{
+	const char *name = codec->name;
+
+	if (strcmp(name, "libx264") == 0) {
+		av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
+		av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
+		av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+	} else if (strcmp(name, "h264_videotoolbox") == 0) {
+		av_opt_set(ctx->priv_data, "realtime", "1", 0);
+		av_opt_set(ctx->priv_data, "allow_sw", "0", 0);
+	} else if (strcmp(name, "h264_nvenc") == 0) {
+		av_opt_set(ctx->priv_data, "preset", "p1", 0);
+		av_opt_set(ctx->priv_data, "tune", "ll", 0);
+		av_opt_set(ctx->priv_data, "rc", "cbr", 0);
+	} else if (strcmp(name, "h264_amf") == 0) {
+		av_opt_set(ctx->priv_data, "usage", "ultralowlatency", 0);
+		av_opt_set(ctx->priv_data, "quality", "speed", 0);
+	} else if (strcmp(name, "h264_qsv") == 0) {
+		av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
+		av_opt_set(ctx->priv_data, "low_power", "1", 0);
+	}
+}
+
 struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_config *config)
 {
 	if (!config || config->width == 0 || config->height == 0)
@@ -34,10 +82,7 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->frame_count = 0;
 	encoder->request_keyframe = true;
 
-	const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
-	if (!codec) {
-		codec = avcodec_find_encoder(AV_CODEC_ID_H264);
-	}
+	const AVCodec *codec = find_best_h264_encoder();
 	if (!codec) {
 		blog(LOG_ERROR, "[Daydream Encoder] H.264 encoder not found");
 		bfree(encoder);
@@ -64,11 +109,7 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->codec_ctx->rc_max_rate = bitrate;
 	encoder->codec_ctx->rc_buffer_size = bitrate / 2;
 
-	if (codec->id == AV_CODEC_ID_H264) {
-		av_opt_set(encoder->codec_ctx->priv_data, "preset", "ultrafast", 0);
-		av_opt_set(encoder->codec_ctx->priv_data, "tune", "zerolatency", 0);
-		av_opt_set(encoder->codec_ctx->priv_data, "profile", "baseline", 0);
-	}
+	configure_encoder_options(encoder->codec_ctx, codec);
 
 	if (avcodec_open2(encoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Encoder] Failed to open codec");
@@ -121,8 +162,8 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->output_buffer_size = config->width * config->height * 2;
 	encoder->output_buffer = bmalloc(encoder->output_buffer_size);
 
-	blog(LOG_INFO, "[Daydream Encoder] Created %dx%d @ %d fps, %d kbps", config->width, config->height,
-	     encoder->fps, bitrate / 1000);
+	blog(LOG_INFO, "[Daydream Encoder] Created %dx%d @ %d fps, %d kbps (encoder: %s)", config->width,
+	     config->height, encoder->fps, bitrate / 1000, codec->name);
 
 	return encoder;
 }
