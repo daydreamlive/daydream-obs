@@ -4,13 +4,14 @@
 #include <util/platform.h>
 #include <curl/curl.h>
 
-#include <rtc/rtc.h>
+#include <rtc/rtc.hpp>
 
 #include <string>
 #include <atomic>
 #include <mutex>
 #include <vector>
 #include <cstring>
+#include <memory>
 
 struct daydream_whep {
 	std::string whep_url;
@@ -21,12 +22,11 @@ struct daydream_whep {
 	daydream_whep_state_callback on_state;
 	void *userdata;
 
-	int pc_id;
-	int track_id;
+	std::shared_ptr<rtc::PeerConnection> pc;
+	std::shared_ptr<rtc::Track> track;
 
 	std::atomic<bool> connected;
 	std::atomic<bool> gathering_done;
-	std::mutex mutex;
 
 	std::vector<uint8_t> frame_buffer;
 	uint32_t current_timestamp;
@@ -52,7 +52,12 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 	http_response *resp = static_cast<http_response *>(userdata);
 
 	std::string header(buffer, realsize);
-	if (header.find("Location:") == 0 || header.find("location:") == 0) {
+
+	std::string header_lower = header;
+	for (char &c : header_lower)
+		c = (char)tolower((unsigned char)c);
+
+	if (header_lower.find("location:") == 0) {
 		size_t pos = header.find(':');
 		if (pos != std::string::npos) {
 			std::string value = header.substr(pos + 1);
@@ -63,142 +68,8 @@ static size_t header_callback(char *buffer, size_t size, size_t nitems, void *us
 			resp->location = value;
 		}
 	}
+
 	return realsize;
-}
-
-static void on_state_change(int, rtcState state, void *ptr)
-{
-	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
-
-	const char *state_str = "unknown";
-	switch (state) {
-	case RTC_NEW:
-		state_str = "new";
-		break;
-	case RTC_CONNECTING:
-		state_str = "connecting";
-		break;
-	case RTC_CONNECTED:
-		state_str = "connected";
-		break;
-	case RTC_DISCONNECTED:
-		state_str = "disconnected";
-		break;
-	case RTC_FAILED:
-		state_str = "failed";
-		break;
-	case RTC_CLOSED:
-		state_str = "closed";
-		break;
-	}
-
-	blog(LOG_INFO, "[Daydream WHEP] State changed: %s", state_str);
-
-	if (state == RTC_CONNECTED) {
-		whep->connected = true;
-		if (whep->on_state)
-			whep->on_state(true, nullptr, whep->userdata);
-	} else if (state == RTC_DISCONNECTED || state == RTC_FAILED || state == RTC_CLOSED) {
-		whep->connected = false;
-		if (whep->on_state)
-			whep->on_state(false, state == RTC_FAILED ? "Connection failed" : nullptr, whep->userdata);
-	}
-}
-
-static void on_gathering_state_change(int, rtcGatheringState state, void *ptr)
-{
-	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
-
-	const char *state_str = "unknown";
-	switch (state) {
-	case RTC_GATHERING_NEW:
-		state_str = "new";
-		break;
-	case RTC_GATHERING_INPROGRESS:
-		state_str = "in-progress";
-		break;
-	case RTC_GATHERING_COMPLETE:
-		state_str = "complete";
-		whep->gathering_done = true;
-		break;
-	}
-	blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
-}
-
-static void on_message(int, const char *message, int size, void *ptr)
-{
-	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
-
-	static uint64_t msg_count = 0;
-	static uint64_t last_log_time = 0;
-	msg_count++;
-
-	if (size <= 0)
-		return;
-
-	const uint8_t *data = reinterpret_cast<const uint8_t *>(message);
-
-	uint8_t pt = data[1] & 0x7F;
-
-	uint64_t now = os_gettime_ns();
-	if (now - last_log_time > 1000000000ULL || msg_count <= 5) {
-		char hex[64] = {0};
-		int hex_len = 0;
-		for (int i = 0; i < size && i < 16; i++) {
-			hex_len += snprintf(hex + hex_len, sizeof(hex) - hex_len, "%02x ", data[i]);
-		}
-		blog(LOG_INFO, "[Daydream WHEP] Msg #%llu: size=%d, pt=%d, bytes: %s", (unsigned long long)msg_count,
-		     size, pt, hex);
-		last_log_time = now;
-	}
-
-	bool is_keyframe = false;
-	if (size > 12) {
-		uint32_t timestamp = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
-
-		int header_size = 12;
-		int cc = data[0] & 0x0F;
-		header_size += cc * 4;
-
-		if (data[0] & 0x10) {
-			if (size > header_size + 4) {
-				int ext_len = (data[header_size + 2] << 8) | data[header_size + 3];
-				header_size += 4 + ext_len * 4;
-			}
-		}
-
-		if (size > header_size) {
-			const uint8_t *payload = data + header_size;
-			int payload_size = size - header_size;
-
-			if (payload_size > 0) {
-				uint8_t nal_type = payload[0] & 0x1F;
-				is_keyframe = (nal_type == 5 || nal_type == 7 || nal_type == 8);
-
-				if (whep->waiting_keyframe && !is_keyframe)
-					return;
-
-				if (is_keyframe)
-					whep->waiting_keyframe = false;
-
-				if (whep->on_frame) {
-					whep->on_frame(payload, payload_size, timestamp, is_keyframe, whep->userdata);
-				}
-			}
-		}
-	}
-}
-
-static void on_track(int pc, int tr, void *ptr)
-{
-	UNUSED_PARAMETER(pc);
-	daydream_whep *whep = static_cast<daydream_whep *>(ptr);
-
-	blog(LOG_INFO, "[Daydream WHEP] Remote track added: %d, setting message callback", tr);
-	whep->track_id = tr;
-	whep->waiting_keyframe = true;
-
-	rtcSetMessageCallback(tr, on_message);
 }
 
 static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_offer, long *out_http_code)
@@ -252,7 +123,7 @@ static bool send_whep_request_once(daydream_whep *whep, const std::string &sdp_o
 
 	if (!response->data.empty()) {
 		blog(LOG_INFO, "[Daydream WHEP] Setting remote description (answer)");
-		rtcSetRemoteDescription(whep->pc_id, response->data.c_str(), "answer");
+		whep->pc->setRemoteDescription(rtc::Description(response->data, rtc::Description::Type::Answer));
 	}
 
 	delete response;
@@ -305,10 +176,9 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->on_frame = config->on_frame;
 	whep->on_state = config->on_state;
 	whep->userdata = config->userdata;
-	whep->pc_id = -1;
-	whep->track_id = -1;
 	whep->connected = false;
 	whep->gathering_done = false;
+	whep->current_timestamp = 0;
 	whep->waiting_keyframe = true;
 
 	return whep;
@@ -330,46 +200,145 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	blog(LOG_INFO, "[Daydream WHEP] Connecting to %s", whep->whep_url.c_str());
 
-	rtcConfiguration config = {};
-	config.iceServers = nullptr;
-	config.iceServersCount = 0;
+	rtc::Configuration config;
 
-	whep->pc_id = rtcCreatePeerConnection(&config);
-	if (whep->pc_id < 0) {
-		blog(LOG_ERROR, "[Daydream WHEP] Failed to create peer connection");
-		return false;
-	}
+	whep->pc = std::make_shared<rtc::PeerConnection>(config);
 
-	rtcSetUserPointer(whep->pc_id, whep);
-	rtcSetStateChangeCallback(whep->pc_id, on_state_change);
-	rtcSetGatheringStateChangeCallback(whep->pc_id, on_gathering_state_change);
-	rtcSetTrackCallback(whep->pc_id, on_track);
+	whep->pc->onStateChange([whep](rtc::PeerConnection::State state) {
+		const char *state_str = "unknown";
+		switch (state) {
+		case rtc::PeerConnection::State::New:
+			state_str = "new";
+			break;
+		case rtc::PeerConnection::State::Connecting:
+			state_str = "connecting";
+			break;
+		case rtc::PeerConnection::State::Connected:
+			state_str = "connected";
+			break;
+		case rtc::PeerConnection::State::Disconnected:
+			state_str = "disconnected";
+			break;
+		case rtc::PeerConnection::State::Failed:
+			state_str = "failed";
+			break;
+		case rtc::PeerConnection::State::Closed:
+			state_str = "closed";
+			break;
+		}
+		blog(LOG_INFO, "[Daydream WHEP] State changed: %s", state_str);
 
-	rtcTrackInit track_init = {};
-	track_init.direction = RTC_DIRECTION_RECVONLY;
-	track_init.codec = RTC_CODEC_H264;
-	track_init.payloadType = 96;
-	track_init.ssrc = 0;
-	track_init.mid = "0";
-	track_init.name = "video";
-	track_init.msid = "daydream";
-	track_init.trackId = "video";
+		if (state == rtc::PeerConnection::State::Connected) {
+			whep->connected = true;
+			if (whep->on_state)
+				whep->on_state(true, nullptr, whep->userdata);
+		} else if (state == rtc::PeerConnection::State::Disconnected ||
+			   state == rtc::PeerConnection::State::Failed || state == rtc::PeerConnection::State::Closed) {
+			whep->connected = false;
+			if (whep->on_state)
+				whep->on_state(false,
+					       state == rtc::PeerConnection::State::Failed ? "Connection failed"
+											   : nullptr,
+					       whep->userdata);
+		}
+	});
 
-	int recv_track = rtcAddTrackEx(whep->pc_id, &track_init);
-	if (recv_track < 0) {
-		blog(LOG_ERROR, "[Daydream WHEP] Failed to add video track");
-		rtcDeletePeerConnection(whep->pc_id);
-		whep->pc_id = -1;
-		return false;
-	}
+	whep->pc->onGatheringStateChange([whep](rtc::PeerConnection::GatheringState state) {
+		const char *state_str = "unknown";
+		switch (state) {
+		case rtc::PeerConnection::GatheringState::New:
+			state_str = "new";
+			break;
+		case rtc::PeerConnection::GatheringState::InProgress:
+			state_str = "in-progress";
+			break;
+		case rtc::PeerConnection::GatheringState::Complete:
+			state_str = "complete";
+			whep->gathering_done = true;
+			break;
+		}
+		blog(LOG_INFO, "[Daydream WHEP] Gathering state: %s", state_str);
+	});
 
-	whep->track_id = recv_track;
-	whep->waiting_keyframe = true;
-	rtcSetMessageCallback(recv_track, on_message);
+	whep->pc->onTrack([whep](std::shared_ptr<rtc::Track> track) {
+		blog(LOG_INFO, "[Daydream WHEP] Remote track received");
+		whep->track = track;
+		whep->waiting_keyframe = true;
 
-	blog(LOG_INFO, "[Daydream WHEP] Local video track added: %d, message callback set", recv_track);
+		track->onMessage([whep](rtc::message_variant data) {
+			if (!std::holds_alternative<rtc::binary>(data))
+				return;
 
-	rtcSetLocalDescription(whep->pc_id, "offer");
+			const auto &bin = std::get<rtc::binary>(data);
+			int size = static_cast<int>(bin.size());
+
+			static uint64_t msg_count = 0;
+			static uint64_t last_log_time = 0;
+			msg_count++;
+
+			if (size <= 12)
+				return;
+
+			const uint8_t *rtp_data = reinterpret_cast<const uint8_t *>(bin.data());
+
+			uint8_t pt = rtp_data[1] & 0x7F;
+			if (pt < 96 || pt > 127) {
+				return;
+			}
+
+			uint64_t now = os_gettime_ns();
+			if (now - last_log_time > 1000000000ULL) {
+				blog(LOG_INFO, "[Daydream WHEP] Received %llu video packets, last size=%d",
+				     (unsigned long long)msg_count, size);
+				last_log_time = now;
+			}
+
+			uint32_t timestamp = (rtp_data[4] << 24) | (rtp_data[5] << 16) | (rtp_data[6] << 8) |
+					     rtp_data[7];
+
+			int header_size = 12;
+			int cc = rtp_data[0] & 0x0F;
+			header_size += cc * 4;
+
+			if (rtp_data[0] & 0x10) {
+				if (size > header_size + 4) {
+					int ext_len = (rtp_data[header_size + 2] << 8) | rtp_data[header_size + 3];
+					header_size += 4 + ext_len * 4;
+				}
+			}
+
+			if (size <= header_size)
+				return;
+
+			const uint8_t *payload = rtp_data + header_size;
+			int payload_size = size - header_size;
+
+			if (payload_size <= 0)
+				return;
+
+			uint8_t nal_type = payload[0] & 0x1F;
+			bool is_keyframe = (nal_type == 5 || nal_type == 7 || nal_type == 8);
+
+			if (whep->waiting_keyframe && !is_keyframe)
+				return;
+
+			if (is_keyframe)
+				whep->waiting_keyframe = false;
+
+			if (whep->on_frame) {
+				whep->on_frame(payload, payload_size, timestamp, is_keyframe, whep->userdata);
+			}
+		});
+	});
+
+	rtc::Description::Video media("video", rtc::Description::Direction::RecvOnly);
+	media.addH264Codec(96);
+
+	whep->track = whep->pc->addTrack(media);
+
+	blog(LOG_INFO, "[Daydream WHEP] Video track added (recvonly)");
+
+	whep->pc->setLocalDescription();
 
 	whep->gathering_done = false;
 	int timeout = 100;
@@ -380,29 +349,26 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	if (!whep->gathering_done) {
 		blog(LOG_ERROR, "[Daydream WHEP] ICE gathering timeout");
-		rtcDeletePeerConnection(whep->pc_id);
-		whep->pc_id = -1;
+		whep->pc.reset();
 		return false;
 	}
 
-	char sdp_buffer[16384];
-	int sdp_size = rtcGetLocalDescription(whep->pc_id, sdp_buffer, sizeof(sdp_buffer));
-
-	if (sdp_size <= 0) {
+	auto localDesc = whep->pc->localDescription();
+	if (!localDesc) {
 		blog(LOG_ERROR, "[Daydream WHEP] Failed to get local description");
-		rtcDeletePeerConnection(whep->pc_id);
-		whep->pc_id = -1;
+		whep->pc.reset();
 		return false;
 	}
 
-	std::string local_sdp(sdp_buffer, sdp_size);
-	blog(LOG_INFO, "[Daydream WHEP] Local SDP created (%d bytes):\n%s", sdp_size, local_sdp.c_str());
+	std::string sdp = std::string(*localDesc);
+	blog(LOG_INFO, "[Daydream WHEP] Local SDP created (%zu bytes):\n%s", sdp.size(), sdp.c_str());
 
-	if (!send_whep_request(whep, local_sdp)) {
-		rtcDeletePeerConnection(whep->pc_id);
-		whep->pc_id = -1;
+	if (!send_whep_request(whep, sdp)) {
+		whep->pc.reset();
 		return false;
 	}
+
+	blog(LOG_INFO, "[Daydream] WHEP connected successfully");
 
 	return true;
 }
@@ -412,12 +378,12 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 	if (!whep)
 		return;
 
-	if (whep->pc_id >= 0) {
-		rtcDeletePeerConnection(whep->pc_id);
-		whep->pc_id = -1;
+	if (whep->pc) {
+		whep->pc->close();
+		whep->pc.reset();
 	}
 
-	whep->track_id = -1;
+	whep->track.reset();
 	whep->connected = false;
 	whep->gathering_done = false;
 	whep->resource_url.clear();
