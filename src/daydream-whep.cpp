@@ -12,6 +12,87 @@
 #include <vector>
 #include <cstring>
 #include <memory>
+#include <set>
+
+class NackSender : public rtc::MediaHandler {
+public:
+	NackSender() : mSsrc(0), mInitialized(false), mLastSeq(0) {}
+
+	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override
+	{
+		std::vector<uint16_t> missing;
+
+		for (const auto &message : messages) {
+			if (message->type == rtc::Message::Control)
+				continue;
+
+			if (message->size() < sizeof(rtc::RtpHeader))
+				continue;
+
+			auto rtp = reinterpret_cast<const rtc::RtpHeader *>(message->data());
+			uint16_t seq = rtp->seqNumber();
+			mSsrc = rtp->ssrc();
+
+			if (!mInitialized) {
+				mInitialized = true;
+				mLastSeq = seq;
+				continue;
+			}
+
+			int16_t diff = static_cast<int16_t>(seq - mLastSeq);
+
+			if (diff > 1 && diff < 100) {
+				for (uint16_t s = mLastSeq + 1; s != seq; ++s) {
+					if (mRequested.find(s) == mRequested.end()) {
+						missing.push_back(s);
+						mRequested.insert(s);
+					}
+				}
+			}
+
+			if (diff > 0)
+				mLastSeq = seq;
+
+			if (mRequested.size() > 1000)
+				mRequested.clear();
+		}
+
+		if (!missing.empty() && mSsrc != 0) {
+			sendNack(missing, send);
+		}
+	}
+
+private:
+	void sendNack(const std::vector<uint16_t> &seqs, const rtc::message_callback &send)
+	{
+		size_t maxFci = (seqs.size() + 16) / 17 + 1;
+		size_t bufSize = rtc::RtcpNack::Size((unsigned int)maxFci);
+		auto msg = rtc::make_message(bufSize, rtc::Message::Control);
+		auto nack = reinterpret_cast<rtc::RtcpNack *>(msg->data());
+		memset(msg->data(), 0, bufSize);
+
+		unsigned int fciCount = 0;
+		uint16_t fciPid = 0;
+
+		for (uint16_t seq : seqs) {
+			nack->addMissingPacket(&fciCount, &fciPid, seq);
+		}
+
+		nack->preparePacket(mSsrc, fciCount);
+
+		size_t actualSize = rtc::RtcpNack::Size(fciCount);
+		msg->resize(actualSize);
+
+		send(msg);
+
+		blog(LOG_INFO, "[Daydream WHEP] Sent NACK for %zu missing packets (fci=%u)", seqs.size(), fciCount);
+	}
+
+	uint32_t mSsrc;
+	bool mInitialized;
+	uint16_t mLastSeq;
+	std::set<uint16_t> mRequested;
+};
 
 struct daydream_whep {
 	std::string whep_url;
@@ -29,10 +110,6 @@ struct daydream_whep {
 	std::atomic<bool> gathering_done;
 
 	bool waiting_keyframe;
-
-	std::atomic<bool> pli_thread_running;
-	pthread_t pli_thread;
-	uint64_t pli_interval_ns;
 };
 
 struct http_response {
@@ -181,8 +258,6 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->connected = false;
 	whep->gathering_done = false;
 	whep->waiting_keyframe = true;
-	whep->pli_thread_running = false;
-	whep->pli_interval_ns = 2000000000ULL;
 
 	return whep;
 }
@@ -194,28 +269,6 @@ void daydream_whep_destroy(struct daydream_whep *whep)
 
 	daydream_whep_disconnect(whep);
 	delete whep;
-}
-
-static void *pli_thread_func(void *arg)
-{
-	struct daydream_whep *whep = static_cast<struct daydream_whep *>(arg);
-
-	blog(LOG_INFO, "[Daydream WHEP] PLI thread started (interval: %llu ms)",
-	     (unsigned long long)(whep->pli_interval_ns / 1000000));
-
-	while (whep->pli_thread_running) {
-		os_sleep_ms((uint32_t)(whep->pli_interval_ns / 1000000));
-
-		if (!whep->pli_thread_running)
-			break;
-
-		if (whep->connected && whep->track) {
-			whep->track->requestKeyframe();
-		}
-	}
-
-	blog(LOG_INFO, "[Daydream WHEP] PLI thread stopped");
-	return nullptr;
 }
 
 bool daydream_whep_connect(struct daydream_whep *whep)
@@ -290,11 +343,15 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	whep->track = whep->pc->addTrack(media);
 
+	auto rtcpSession = std::make_shared<rtc::RtcpReceivingSession>();
+	auto nackSender = std::make_shared<NackSender>();
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+
+	depacketizer->addToChain(nackSender);
+	nackSender->addToChain(rtcpSession);
 	whep->track->setMediaHandler(depacketizer);
 
-	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> RtcpReceivingSession");
+	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> NackSender -> RtcpReceivingSession");
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
 		int size = static_cast<int>(data.size());
@@ -367,9 +424,6 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		return false;
 	}
 
-	whep->pli_thread_running = true;
-	pthread_create(&whep->pli_thread, nullptr, pli_thread_func, whep);
-
 	return true;
 }
 
@@ -377,11 +431,6 @@ void daydream_whep_disconnect(struct daydream_whep *whep)
 {
 	if (!whep)
 		return;
-
-	if (whep->pli_thread_running) {
-		whep->pli_thread_running = false;
-		pthread_join(whep->pli_thread, nullptr);
-	}
 
 	if (whep->pc) {
 		whep->pc->close();
