@@ -718,9 +718,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
 
-	gs_technique_begin(tech);
-	gs_technique_begin_pass(tech, 0);
-
+	gs_texture_t *blur_tex = NULL;
 	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready) {
 		const uint32_t BLUR_SIZE = 16;
 
@@ -734,16 +732,26 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
 			gs_ortho(0.0f, (float)STREAM_SIZE, 0.0f, (float)STREAM_SIZE, -100.0f, 100.0f);
 
-			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
+			gs_effect_t *blur_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+			gs_technique_t *blur_tech = gs_effect_get_technique(blur_effect, "Draw");
+			gs_technique_begin(blur_tech);
+			gs_technique_begin_pass(blur_tech, 0);
+			gs_effect_set_texture(gs_effect_get_param_by_name(blur_effect, "image"), output);
 			gs_draw_sprite(output, 0, STREAM_SIZE, STREAM_SIZE);
+			gs_technique_end_pass(blur_tech);
+			gs_technique_end(blur_tech);
+
 			gs_texrender_end(ctx->blur_texrender);
 		}
+		blur_tex = gs_texrender_get_texture(ctx->blur_texrender);
+	}
 
-		gs_texture_t *blur_tex = gs_texrender_get_texture(ctx->blur_texrender);
-		if (blur_tex) {
-			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), blur_tex);
-			gs_draw_sprite(blur_tex, 0, ctx->width, ctx->height);
-		}
+	gs_technique_begin(tech);
+	gs_technique_begin_pass(tech, 0);
+
+	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready && blur_tex) {
+		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), blur_tex);
+		gs_draw_sprite(blur_tex, 0, ctx->width, ctx->height);
 
 		float scale;
 		if (parent_width < parent_height) {
