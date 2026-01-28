@@ -273,12 +273,18 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		const uint8_t *frame_data = reinterpret_cast<const uint8_t *>(data.data());
 
 		bool has_idr = false;
-		for (int i = 0; i + 4 < size && !has_idr; i++) {
+		int scan_limit = size < 256 ? size : 256;
+		for (int i = 0; i + 4 < scan_limit; i++) {
 			if (frame_data[i] == 0 && frame_data[i + 1] == 0 && frame_data[i + 2] == 0 &&
 			    frame_data[i + 3] == 1) {
 				uint8_t nal_type = frame_data[i + 4] & 0x1F;
-				if (nal_type == 5 || nal_type == 7 || nal_type == 8)
+				if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
 					has_idr = true;
+					break;
+				}
+				if (nal_type == 1) {
+					break;
+				}
 			}
 		}
 
