@@ -701,8 +701,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
 			uint32_t ts_diff = entry->rtp_timestamp - ctx->base_rtp_timestamp;
-			uint64_t scheduled_time =
-				ctx->base_wall_time + ctx->playout_delay_ns + (uint64_t)ts_diff * 1000000000ULL / 90000ULL;
+			uint64_t scheduled_time = ctx->base_wall_time + ctx->playout_delay_ns +
+						  (uint64_t)ts_diff * 1000000000ULL / 90000ULL;
 
 			int64_t early_ms = (int64_t)(scheduled_time - now) / 1000000;
 			if (early_ms > 50) {
