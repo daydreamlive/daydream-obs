@@ -673,26 +673,39 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	if (!ctx->queue_started && ctx->queue_count >= MIN_BUFFER_FRAMES) {
 		ctx->queue_started = true;
+		ctx->last_output_time = os_gettime_ns();
 		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
 	}
 
-	if (ctx->queue_started && ctx->queue_count > 0) {
-		struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+	if (ctx->queue_started) {
+		uint64_t now = os_gettime_ns();
+		bool should_pop = false;
 
-		size_t frame_size = entry->linesize * entry->height;
-		if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
-		    ctx->decoded_frame_height != entry->height) {
-			bfree(ctx->decoded_frame);
-			ctx->decoded_frame = bmalloc(frame_size);
+		if (ctx->queue_count >= 6) {
+			should_pop = true;
+		} else if (ctx->queue_count > 0 && now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+			should_pop = true;
 		}
 
-		memcpy(ctx->decoded_frame, entry->data, frame_size);
-		ctx->decoded_frame_width = entry->width;
-		ctx->decoded_frame_height = entry->height;
-		ctx->decoded_frame_ready = true;
+		if (should_pop && ctx->queue_count > 0) {
+			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
-		ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-		ctx->queue_count--;
+			size_t frame_size = entry->linesize * entry->height;
+			if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
+			    ctx->decoded_frame_height != entry->height) {
+				bfree(ctx->decoded_frame);
+				ctx->decoded_frame = bmalloc(frame_size);
+			}
+
+			memcpy(ctx->decoded_frame, entry->data, frame_size);
+			ctx->decoded_frame_width = entry->width;
+			ctx->decoded_frame_height = entry->height;
+			ctx->decoded_frame_ready = true;
+
+			ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+			ctx->queue_count--;
+			ctx->last_output_time = now;
+		}
 	}
 
 	uint64_t tex_start = os_gettime_ns();
