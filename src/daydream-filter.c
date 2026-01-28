@@ -22,8 +22,11 @@
 #define PROP_START "start"
 #define PROP_STOP "stop"
 
-#define FRAME_QUEUE_SIZE 6
+#define FRAME_QUEUE_SIZE 16
 #define FRAME_INTERVAL_NS (1000000000ULL / 30)
+#define JITTER_HISTORY_SIZE 16
+#define MIN_BUFFER_FRAMES 3
+#define MAX_BUFFER_FRAMES 12
 
 struct frame_entry {
 	uint8_t *data;
@@ -91,6 +94,12 @@ struct daydream_filter {
 	bool queue_started;
 	uint64_t last_output_time;
 
+	uint64_t jitter_history[JITTER_HISTORY_SIZE];
+	int jitter_idx;
+	uint64_t last_receive_time;
+	int target_buffer_frames;
+	int underrun_count;
+
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
 
@@ -137,6 +146,33 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 	struct daydream_decoded_frame decoded;
 	if (daydream_decoder_decode(ctx->decoder, data, size, &decoded)) {
 		pthread_mutex_lock(&ctx->mutex);
+
+		uint64_t now = os_gettime_ns();
+		if (ctx->last_receive_time > 0) {
+			uint64_t delta = now - ctx->last_receive_time;
+			ctx->jitter_history[ctx->jitter_idx] = delta;
+			ctx->jitter_idx = (ctx->jitter_idx + 1) % JITTER_HISTORY_SIZE;
+
+			uint64_t max_delta = 0;
+			for (int i = 0; i < JITTER_HISTORY_SIZE; i++) {
+				if (ctx->jitter_history[i] > max_delta)
+					max_delta = ctx->jitter_history[i];
+			}
+
+			int needed_frames = (int)((max_delta + FRAME_INTERVAL_NS - 1) / FRAME_INTERVAL_NS) + 1;
+			if (needed_frames < MIN_BUFFER_FRAMES)
+				needed_frames = MIN_BUFFER_FRAMES;
+			if (needed_frames > MAX_BUFFER_FRAMES)
+				needed_frames = MAX_BUFFER_FRAMES;
+
+			if (ctx->underrun_count > 0)
+				needed_frames += ctx->underrun_count;
+			if (needed_frames > MAX_BUFFER_FRAMES)
+				needed_frames = MAX_BUFFER_FRAMES;
+
+			ctx->target_buffer_frames = needed_frames;
+		}
+		ctx->last_receive_time = now;
 
 		if (ctx->queue_count >= FRAME_QUEUE_SIZE) {
 			pthread_mutex_unlock(&ctx->mutex);
@@ -345,6 +381,13 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->queue_count = 0;
 	ctx->queue_started = false;
 	ctx->decoded_frame_ready = false;
+
+	ctx->jitter_idx = 0;
+	ctx->last_receive_time = 0;
+	ctx->target_buffer_frames = MIN_BUFFER_FRAMES;
+	ctx->underrun_count = 0;
+	for (int i = 0; i < JITTER_HISTORY_SIZE; i++)
+		ctx->jitter_history[i] = 0;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -519,32 +562,49 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	if (!ctx->queue_started && ctx->queue_count >= 3) {
-		ctx->queue_started = true;
-		ctx->last_output_time = os_gettime_ns();
-		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
+	static uint64_t last_queue_log = 0;
+	uint64_t now_ns = os_gettime_ns();
+	if (now_ns - last_queue_log > 1000000000ULL) {
+		blog(LOG_INFO, "[Daydream] Queue: count=%d target=%d started=%d underruns=%d", ctx->queue_count,
+		     ctx->target_buffer_frames, ctx->queue_started, ctx->underrun_count);
+		last_queue_log = now_ns;
 	}
 
-	if (ctx->queue_started && ctx->queue_count > 0) {
-		uint64_t now = os_gettime_ns();
-		if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
-			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+	int target = ctx->target_buffer_frames > 0 ? ctx->target_buffer_frames : MIN_BUFFER_FRAMES;
 
-			size_t frame_size = entry->linesize * entry->height;
-			if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
-			    ctx->decoded_frame_height != entry->height) {
-				bfree(ctx->decoded_frame);
-				ctx->decoded_frame = bmalloc(frame_size);
+	if (!ctx->queue_started && ctx->queue_count >= target) {
+		ctx->queue_started = true;
+		ctx->last_output_time = os_gettime_ns();
+		blog(LOG_INFO, "[Daydream] Frame queue started with %d/%d frames buffered", ctx->queue_count, target);
+	}
+
+	if (ctx->queue_started) {
+		if (ctx->queue_count == 0) {
+			ctx->queue_started = false;
+			ctx->underrun_count++;
+			blog(LOG_INFO, "[Daydream] Frame queue underrun #%d, rebuffering to %d frames...",
+			     ctx->underrun_count, target);
+		} else {
+			uint64_t now = os_gettime_ns();
+			if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+
+				size_t frame_size = entry->linesize * entry->height;
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
+				    ctx->decoded_frame_height != entry->height) {
+					bfree(ctx->decoded_frame);
+					ctx->decoded_frame = bmalloc(frame_size);
+				}
+
+				memcpy(ctx->decoded_frame, entry->data, frame_size);
+				ctx->decoded_frame_width = entry->width;
+				ctx->decoded_frame_height = entry->height;
+				ctx->decoded_frame_ready = true;
+
+				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+				ctx->queue_count--;
+				ctx->last_output_time = now;
 			}
-
-			memcpy(ctx->decoded_frame, entry->data, frame_size);
-			ctx->decoded_frame_width = entry->width;
-			ctx->decoded_frame_height = entry->height;
-			ctx->decoded_frame_ready = true;
-
-			ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-			ctx->queue_count--;
-			ctx->last_output_time = now;
 		}
 	}
 
