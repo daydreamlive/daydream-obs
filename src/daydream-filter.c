@@ -565,28 +565,20 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	static uint64_t last_queue_log = 0;
 	uint64_t now_ns = os_gettime_ns();
 	if (now_ns - last_queue_log > 1000000000ULL) {
-		blog(LOG_INFO, "[Daydream] Queue: count=%d target=%d started=%d underruns=%d", ctx->queue_count,
-		     ctx->target_buffer_frames, ctx->queue_started, ctx->underrun_count);
+		blog(LOG_INFO, "[Daydream] Queue: count=%d repeats=%d", ctx->queue_count, ctx->underrun_count);
 		last_queue_log = now_ns;
 	}
 
-	int target = ctx->target_buffer_frames > 0 ? ctx->target_buffer_frames : MIN_BUFFER_FRAMES;
-
-	if (!ctx->queue_started && ctx->queue_count >= target) {
+	if (!ctx->queue_started && ctx->queue_count >= MIN_BUFFER_FRAMES) {
 		ctx->queue_started = true;
 		ctx->last_output_time = os_gettime_ns();
-		blog(LOG_INFO, "[Daydream] Frame queue started with %d/%d frames buffered", ctx->queue_count, target);
+		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
 	}
 
 	if (ctx->queue_started) {
-		if (ctx->queue_count == 0) {
-			ctx->queue_started = false;
-			ctx->underrun_count++;
-			blog(LOG_INFO, "[Daydream] Frame queue underrun #%d, rebuffering to %d frames...",
-			     ctx->underrun_count, target);
-		} else {
-			uint64_t now = os_gettime_ns();
-			if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+		uint64_t now = os_gettime_ns();
+		if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+			if (ctx->queue_count > 0) {
 				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
 				size_t frame_size = entry->linesize * entry->height;
@@ -603,8 +595,10 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
 				ctx->queue_count--;
-				ctx->last_output_time = now;
+			} else {
+				ctx->underrun_count++;
 			}
+			ctx->last_output_time = now;
 		}
 	}
 
