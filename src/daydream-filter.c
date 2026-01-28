@@ -164,8 +164,8 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 	pthread_mutex_lock(&ctx->raw_mutex);
 
 	if (ctx->raw_queue_count >= RAW_QUEUE_SIZE) {
-		pthread_mutex_unlock(&ctx->raw_mutex);
-		return;
+		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
+		ctx->raw_queue_count--;
 	}
 
 	struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_head];
@@ -244,23 +244,26 @@ static void *decode_thread_func(void *data)
 			}
 			ctx->last_receive_time = now;
 
-			if (ctx->queue_count < FRAME_QUEUE_SIZE) {
-				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
-				size_t frame_size = decoded.linesize * decoded.height;
-
-				if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
-					bfree(entry->data);
-					entry->data = bmalloc(frame_size);
-				}
-
-				memcpy(entry->data, decoded.data, frame_size);
-				entry->width = decoded.width;
-				entry->height = decoded.height;
-				entry->linesize = decoded.linesize;
-
-				ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
-				ctx->queue_count++;
+			if (ctx->queue_count >= FRAME_QUEUE_SIZE) {
+				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+				ctx->queue_count--;
 			}
+
+			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
+			size_t frame_size = decoded.linesize * decoded.height;
+
+			if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
+				bfree(entry->data);
+				entry->data = bmalloc(frame_size);
+			}
+
+			memcpy(entry->data, decoded.data, frame_size);
+			entry->width = decoded.width;
+			entry->height = decoded.height;
+			entry->linesize = decoded.linesize;
+
+			ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
+			ctx->queue_count++;
 
 			pthread_mutex_unlock(&ctx->mutex);
 		}
