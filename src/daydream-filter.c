@@ -75,6 +75,7 @@ struct daydream_filter {
 	bool decoded_frame_ready;
 
 	pthread_mutex_t mutex;
+	pthread_cond_t frame_cond;
 
 	uint64_t frame_count;
 	uint64_t last_encode_time;
@@ -183,7 +184,6 @@ static void *encode_thread_func(void *data)
 	uint64_t frame_interval_ns = 1000000000ULL / ctx->target_fps;
 	uint64_t last_debug_time = 0;
 	uint64_t frames_sent = 0;
-	uint64_t frames_waiting = 0;
 
 	blog(LOG_INFO, "[Daydream Encode] Thread started, target_fps=%u", ctx->target_fps);
 
@@ -191,10 +191,7 @@ static void *encode_thread_func(void *data)
 		pthread_mutex_lock(&ctx->mutex);
 
 		while (!ctx->pending_frame_ready && ctx->encode_thread_running && !ctx->stopping) {
-			pthread_mutex_unlock(&ctx->mutex);
-			frames_waiting++;
-			os_sleep_ms(10);
-			pthread_mutex_lock(&ctx->mutex);
+			pthread_cond_wait(&ctx->frame_cond, &ctx->mutex);
 		}
 
 		if (!ctx->encode_thread_running || ctx->stopping) {
@@ -233,12 +230,10 @@ static void *encode_thread_func(void *data)
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_debug_time > 1000000000ULL) {
-			blog(LOG_INFO,
-			     "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu waiting=%llu",
+			blog(LOG_INFO, "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu",
 			     frame_width, frame_height, has_encoder, has_whip, whip_connected,
-			     (unsigned long long)frames_sent, (unsigned long long)frames_waiting);
+			     (unsigned long long)frames_sent);
 			last_debug_time = now;
-			frames_waiting = 0;
 		}
 
 		bfree(frame_copy);
@@ -265,6 +260,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->frame_count = 0;
 
 	pthread_mutex_init(&ctx->mutex, NULL);
+	pthread_cond_init(&ctx->frame_cond, NULL);
 
 	ctx->auth = daydream_auth_create();
 
@@ -279,6 +275,7 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	if (ctx->encode_thread_running) {
 		ctx->encode_thread_running = false;
+		pthread_cond_signal(&ctx->frame_cond);
 		pthread_join(ctx->encode_thread, NULL);
 	}
 
@@ -348,6 +345,7 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
 
+	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
 
 	bfree(ctx);
@@ -472,6 +470,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				memcpy(ctx->pending_frame, video_data, data_size);
 				ctx->pending_frame_linesize = video_linesize;
 				ctx->pending_frame_ready = true;
+				pthread_cond_signal(&ctx->frame_cond);
 
 				pthread_mutex_unlock(&ctx->mutex);
 
