@@ -1,13 +1,11 @@
 #include "daydream-decoder.h"
 #include <obs-module.h>
-#include <util/platform.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 
 struct daydream_decoder {
 	AVCodecContext *codec_ctx;
-	AVCodecParserContext *parser;
 	AVFrame *frame;
 	AVPacket *packet;
 	struct SwsContext *sws_ctx;
@@ -36,17 +34,9 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 		return NULL;
 	}
 
-	decoder->parser = av_parser_init(codec->id);
-	if (!decoder->parser) {
-		blog(LOG_ERROR, "[Daydream Decoder] Failed to create parser");
-		bfree(decoder);
-		return NULL;
-	}
-
 	decoder->codec_ctx = avcodec_alloc_context3(codec);
 	if (!decoder->codec_ctx) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to allocate codec context");
-		av_parser_close(decoder->parser);
 		bfree(decoder);
 		return NULL;
 	}
@@ -57,7 +47,6 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to open codec");
 		avcodec_free_context(&decoder->codec_ctx);
-		av_parser_close(decoder->parser);
 		bfree(decoder);
 		return NULL;
 	}
@@ -66,7 +55,6 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	if (!decoder->frame) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to allocate frame");
 		avcodec_free_context(&decoder->codec_ctx);
-		av_parser_close(decoder->parser);
 		bfree(decoder);
 		return NULL;
 	}
@@ -76,7 +64,6 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to allocate packet");
 		av_frame_free(&decoder->frame);
 		avcodec_free_context(&decoder->codec_ctx);
-		av_parser_close(decoder->parser);
 		bfree(decoder);
 		return NULL;
 	}
@@ -99,8 +86,6 @@ void daydream_decoder_destroy(struct daydream_decoder *decoder)
 		av_frame_free(&decoder->frame);
 	if (decoder->codec_ctx)
 		avcodec_free_context(&decoder->codec_ctx);
-	if (decoder->parser)
-		av_parser_close(decoder->parser);
 	if (decoder->output_buffer)
 		bfree(decoder->output_buffer);
 
@@ -113,29 +98,16 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	if (!decoder || !h264_data || size == 0 || !out_frame)
 		return false;
 
-	static uint64_t decode_call_count = 0;
-	decode_call_count++;
-
 	decoder->packet->data = (uint8_t *)h264_data;
 	decoder->packet->size = (int)size;
 
 	int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
-	if (ret < 0 && ret != AVERROR(EAGAIN)) {
-		if (decode_call_count <= 10) {
-			blog(LOG_ERROR, "[Daydream Decoder] Error sending packet: %d (size=%zu)", ret, size);
-		}
+	if (ret < 0 && ret != AVERROR(EAGAIN))
 		return false;
-	}
 
 	ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
-	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+	if (ret < 0)
 		return false;
-	} else if (ret < 0) {
-		if (decode_call_count <= 10) {
-			blog(LOG_ERROR, "[Daydream Decoder] Error receiving frame: %d", ret);
-		}
-		return false;
-	}
 
 	uint32_t frame_width = decoder->frame->width;
 	uint32_t frame_height = decoder->frame->height;

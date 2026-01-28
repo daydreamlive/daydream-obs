@@ -8,101 +8,9 @@
 
 #include <string>
 #include <atomic>
-#include <mutex>
 #include <vector>
 #include <cstring>
 #include <memory>
-#include <set>
-
-class NackSender : public rtc::MediaHandler {
-public:
-	NackSender() : mSsrc(0), mInitialized(false), mLastSeq(0), mPacketCount(0), mLastLogTime(0) {}
-
-	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override
-	{
-		std::vector<uint16_t> missing;
-
-		for (const auto &message : messages) {
-			if (message->type == rtc::Message::Control)
-				continue;
-
-			if (message->size() < sizeof(rtc::RtpHeader))
-				continue;
-
-			auto rtp = reinterpret_cast<const rtc::RtpHeader *>(message->data());
-			uint16_t seq = rtp->seqNumber();
-			mSsrc = rtp->ssrc();
-			mPacketCount++;
-
-			if (!mInitialized) {
-				mInitialized = true;
-				mLastSeq = seq;
-				continue;
-			}
-
-			int16_t diff = static_cast<int16_t>(seq - mLastSeq);
-
-			if (diff > 1 && diff < 100) {
-				for (uint16_t s = mLastSeq + 1; s != seq; ++s) {
-					if (mRequested.find(s) == mRequested.end()) {
-						missing.push_back(s);
-						mRequested.insert(s);
-					}
-				}
-			}
-
-			if (diff > 0)
-				mLastSeq = seq;
-
-			if (mRequested.size() > 1000)
-				mRequested.clear();
-		}
-
-		if (!missing.empty() && mSsrc != 0) {
-			sendNack(missing, send);
-		}
-
-		uint64_t now = os_gettime_ns();
-		if (now - mLastLogTime > 5000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP NackSender] packets=%llu lastSeq=%u ssrc=0x%x",
-			     (unsigned long long)mPacketCount, mLastSeq, mSsrc);
-			mLastLogTime = now;
-		}
-	}
-
-private:
-	void sendNack(const std::vector<uint16_t> &seqs, const rtc::message_callback &send)
-	{
-		size_t maxFci = (seqs.size() + 16) / 17 + 1;
-		size_t bufSize = rtc::RtcpNack::Size((unsigned int)maxFci);
-		auto msg = rtc::make_message(bufSize, rtc::Message::Control);
-		auto nack = reinterpret_cast<rtc::RtcpNack *>(msg->data());
-		memset(msg->data(), 0, bufSize);
-
-		unsigned int fciCount = 0;
-		uint16_t fciPid = 0;
-
-		for (uint16_t seq : seqs) {
-			nack->addMissingPacket(&fciCount, &fciPid, seq);
-		}
-
-		nack->preparePacket(mSsrc, fciCount);
-
-		size_t actualSize = rtc::RtcpNack::Size(fciCount);
-		msg->resize(actualSize);
-
-		send(msg);
-
-		blog(LOG_INFO, "[Daydream WHEP] Sent NACK for %zu missing packets (fci=%u)", seqs.size(), fciCount);
-	}
-
-	uint32_t mSsrc;
-	bool mInitialized;
-	uint16_t mLastSeq;
-	std::set<uint16_t> mRequested;
-	uint64_t mPacketCount;
-	uint64_t mLastLogTime;
-};
 
 struct daydream_whep {
 	std::string whep_url;
@@ -353,15 +261,9 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	whep->track = whep->pc->addTrack(media);
 
-	auto rtcpSession = std::make_shared<rtc::RtcpReceivingSession>();
-	auto nackSender = std::make_shared<NackSender>();
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-
-	depacketizer->addToChain(nackSender);
-	nackSender->addToChain(rtcpSession);
+	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
 	whep->track->setMediaHandler(depacketizer);
-
-	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> NackSender -> RtcpReceivingSession");
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
 		int size = static_cast<int>(data.size());
@@ -370,28 +272,13 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 		const uint8_t *frame_data = reinterpret_cast<const uint8_t *>(data.data());
 
-		static uint64_t frame_count = 0;
-		static uint64_t last_log = 0;
-		frame_count++;
-
-		int nal_count = 0;
-		int sps_count = 0, pps_count = 0, idr_count = 0, non_idr_count = 0;
 		bool has_idr = false;
-
-		for (int i = 0; i + 4 < size; i++) {
+		for (int i = 0; i + 4 < size && !has_idr; i++) {
 			if (frame_data[i] == 0 && frame_data[i + 1] == 0 && frame_data[i + 2] == 0 &&
 			    frame_data[i + 3] == 1) {
-				nal_count++;
 				uint8_t nal_type = frame_data[i + 4] & 0x1F;
-				if (nal_type == 7)
-					sps_count++;
-				else if (nal_type == 8)
-					pps_count++;
-				else if (nal_type == 5) {
-					idr_count++;
+				if (nal_type == 5 || nal_type == 7 || nal_type == 8)
 					has_idr = true;
-				} else if (nal_type == 1)
-					non_idr_count++;
 			}
 		}
 
@@ -400,19 +287,9 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 		if (has_idr)
 			whep->waiting_keyframe = false;
 
-		uint64_t now = os_gettime_ns();
-		if (now - last_log > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP] frames=%llu size=%d nals=%d (sps=%d pps=%d idr=%d p=%d) ts=%u",
-			     (unsigned long long)frame_count, size, nal_count, sps_count, pps_count, idr_count,
-			     non_idr_count, info.timestamp);
-			last_log = now;
-		}
-
 		if (whep->on_frame)
 			whep->on_frame(frame_data, size, info.timestamp, has_idr, whep->userdata);
 	});
-
-	blog(LOG_INFO, "[Daydream WHEP] Frame callback set on track");
 
 	whep->pc->setLocalDescription();
 
@@ -470,15 +347,4 @@ bool daydream_whep_is_connected(struct daydream_whep *whep)
 	if (!whep)
 		return false;
 	return whep->connected;
-}
-
-bool daydream_whep_request_keyframe(struct daydream_whep *whep)
-{
-	if (!whep || !whep->track || !whep->connected)
-		return false;
-
-	bool result = whep->track->requestKeyframe();
-	if (result)
-		blog(LOG_INFO, "[Daydream WHEP] Requested keyframe (PLI sent)");
-	return result;
 }

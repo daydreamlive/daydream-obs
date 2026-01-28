@@ -79,9 +79,6 @@ struct daydream_filter {
 	uint64_t frame_count;
 	uint64_t last_encode_time;
 	uint32_t target_fps;
-
-	uint64_t last_keyframe_request;
-	uint32_t decode_errors;
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -114,12 +111,10 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(timestamp);
+	UNUSED_PARAMETER(is_keyframe);
 
 	if (!ctx || !ctx->decoder)
 		return;
-
-	if (is_keyframe)
-		ctx->decode_errors = 0;
 
 	struct daydream_decoded_frame decoded;
 	if (daydream_decoder_decode(ctx->decoder, data, size, &decoded)) {
@@ -136,7 +131,6 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 		ctx->decoded_frame_width = decoded.width;
 		ctx->decoded_frame_height = decoded.height;
 		ctx->decoded_frame_ready = true;
-		ctx->decode_errors = 0;
 
 		pthread_mutex_unlock(&ctx->mutex);
 	}
