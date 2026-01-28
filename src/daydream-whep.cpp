@@ -268,17 +268,12 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> RtcpReceivingSession");
 
-	whep->track->onMessage([whep](rtc::message_variant data) {
-		if (!std::holds_alternative<rtc::binary>(data))
-			return;
-
-		const auto &bin = std::get<rtc::binary>(data);
-		int size = static_cast<int>(bin.size());
-
+	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
+		int size = static_cast<int>(data.size());
 		if (size <= 4)
 			return;
 
-		const uint8_t *frame_data = reinterpret_cast<const uint8_t *>(bin.data());
+		const uint8_t *frame_data = reinterpret_cast<const uint8_t *>(data.data());
 
 		static uint64_t frame_count = 0;
 		static uint64_t last_log = 0;
@@ -303,16 +298,16 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 		uint64_t now = os_gettime_ns();
 		if (now - last_log > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP] frames=%llu size=%d keyframe=%d",
-			     (unsigned long long)frame_count, size, has_idr ? 1 : 0);
+			blog(LOG_INFO, "[Daydream WHEP] frames=%llu size=%d keyframe=%d ts=%u",
+			     (unsigned long long)frame_count, size, has_idr ? 1 : 0, info.timestamp);
 			last_log = now;
 		}
 
 		if (whep->on_frame)
-			whep->on_frame(frame_data, size, 0, has_idr, whep->userdata);
+			whep->on_frame(frame_data, size, info.timestamp, has_idr, whep->userdata);
 	});
 
-	blog(LOG_INFO, "[Daydream WHEP] Message callback set on track");
+	blog(LOG_INFO, "[Daydream WHEP] Frame callback set on track");
 
 	whep->pc->setLocalDescription();
 
