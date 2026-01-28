@@ -630,7 +630,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_technique_begin_pass(tech, 0);
 
 	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready) {
-		const uint32_t BLUR_SIZE = 64;
+		const uint32_t BLUR_SIZE = 16;
 
 		if (!ctx->blur_texrender)
 			ctx->blur_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
