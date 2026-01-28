@@ -213,8 +213,14 @@ static void *decode_thread_func(void *data)
 
 		pthread_mutex_unlock(&ctx->raw_mutex);
 
+		uint64_t decode_start = os_gettime_ns();
 		struct daydream_decoded_frame decoded;
 		if (ctx->decoder && daydream_decoder_decode(ctx->decoder, raw_data, raw_size, &decoded)) {
+			uint64_t decode_time = (os_gettime_ns() - decode_start) / 1000000;
+			if (decode_time > 15) {
+				blog(LOG_WARNING, "[Daydream Decode] Slow decode: %llums, size=%zu",
+				     (unsigned long long)decode_time, raw_size);
+			}
 			pthread_mutex_lock(&ctx->mutex);
 
 			uint64_t now = os_gettime_ns();
@@ -667,37 +673,29 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	if (!ctx->queue_started && ctx->queue_count >= MIN_BUFFER_FRAMES) {
 		ctx->queue_started = true;
-		ctx->last_output_time = os_gettime_ns();
 		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
 	}
 
-	if (ctx->queue_started) {
-		uint64_t now = os_gettime_ns();
-		if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
-			if (ctx->queue_count > 0) {
-				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+	if (ctx->queue_started && ctx->queue_count > 0) {
+		struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
-				size_t frame_size = entry->linesize * entry->height;
-				if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
-				    ctx->decoded_frame_height != entry->height) {
-					bfree(ctx->decoded_frame);
-					ctx->decoded_frame = bmalloc(frame_size);
-				}
-
-				memcpy(ctx->decoded_frame, entry->data, frame_size);
-				ctx->decoded_frame_width = entry->width;
-				ctx->decoded_frame_height = entry->height;
-				ctx->decoded_frame_ready = true;
-
-				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-				ctx->queue_count--;
-			} else {
-				ctx->underrun_count++;
-			}
-			ctx->last_output_time = now;
+		size_t frame_size = entry->linesize * entry->height;
+		if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
+		    ctx->decoded_frame_height != entry->height) {
+			bfree(ctx->decoded_frame);
+			ctx->decoded_frame = bmalloc(frame_size);
 		}
+
+		memcpy(ctx->decoded_frame, entry->data, frame_size);
+		ctx->decoded_frame_width = entry->width;
+		ctx->decoded_frame_height = entry->height;
+		ctx->decoded_frame_ready = true;
+
+		ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+		ctx->queue_count--;
 	}
 
+	uint64_t tex_start = os_gettime_ns();
 	if (ctx->decoded_frame_ready && ctx->decoded_frame) {
 		if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
 		    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
@@ -714,6 +712,13 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		}
 	}
 	pthread_mutex_unlock(&ctx->mutex);
+
+	uint64_t tex_time = (os_gettime_ns() - tex_start) / 1000000;
+	static uint64_t last_tex_warn = 0;
+	if (tex_time > 10 && os_gettime_ns() - last_tex_warn > 500000000ULL) {
+		blog(LOG_WARNING, "[Daydream Render] Slow texture upload: %llums", (unsigned long long)tex_time);
+		last_tex_warn = os_gettime_ns();
+	}
 
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
