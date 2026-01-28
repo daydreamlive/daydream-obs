@@ -24,16 +24,23 @@
 
 #define FRAME_QUEUE_SIZE 16
 #define RAW_QUEUE_SIZE 32
-#define FRAME_INTERVAL_NS (1000000000ULL / 30)
-#define JITTER_HISTORY_SIZE 16
-#define MIN_BUFFER_FRAMES 6
-#define MAX_BUFFER_FRAMES 14
+#define DEFAULT_FRAME_INTERVAL_NS (1000000000ULL / 20)
+
+typedef enum { JITTER_BUFFERING, JITTER_EMITTING } jitter_state_t;
+
+struct jitter_stats {
+	uint32_t underflow_count;
+	uint32_t overflow_count;
+	uint32_t frames_received;
+	uint32_t frames_played;
+};
 
 struct frame_entry {
 	uint8_t *data;
 	uint32_t width;
 	uint32_t height;
 	uint32_t linesize;
+	uint32_t sequence;
 };
 
 struct raw_packet {
@@ -109,14 +116,13 @@ struct daydream_filter {
 	int queue_head;
 	int queue_tail;
 	int queue_count;
-	bool queue_started;
 	uint64_t last_output_time;
 
-	uint64_t jitter_history[JITTER_HISTORY_SIZE];
-	int jitter_idx;
-	uint64_t last_receive_time;
-	int target_buffer_frames;
-	int underrun_count;
+	jitter_state_t jitter_state;
+	uint16_t jitter_min_start;
+	uint16_t jitter_max_size;
+	uint32_t frame_sequence;
+	struct jitter_stats jitter_stats;
 
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
@@ -223,36 +229,12 @@ static void *decode_thread_func(void *data)
 			}
 			pthread_mutex_lock(&ctx->mutex);
 
-			uint64_t now = os_gettime_ns();
-			if (ctx->last_receive_time > 0) {
-				uint64_t delta = now - ctx->last_receive_time;
-				ctx->jitter_history[ctx->jitter_idx] = delta;
-				ctx->jitter_idx = (ctx->jitter_idx + 1) % JITTER_HISTORY_SIZE;
+			ctx->jitter_stats.frames_received++;
 
-				uint64_t max_delta = 0;
-				for (int i = 0; i < JITTER_HISTORY_SIZE; i++) {
-					if (ctx->jitter_history[i] > max_delta)
-						max_delta = ctx->jitter_history[i];
-				}
-
-				int needed_frames = (int)((max_delta + FRAME_INTERVAL_NS - 1) / FRAME_INTERVAL_NS) + 1;
-				if (needed_frames < MIN_BUFFER_FRAMES)
-					needed_frames = MIN_BUFFER_FRAMES;
-				if (needed_frames > MAX_BUFFER_FRAMES)
-					needed_frames = MAX_BUFFER_FRAMES;
-
-				if (ctx->underrun_count > 0)
-					needed_frames += ctx->underrun_count;
-				if (needed_frames > MAX_BUFFER_FRAMES)
-					needed_frames = MAX_BUFFER_FRAMES;
-
-				ctx->target_buffer_frames = needed_frames;
-			}
-			ctx->last_receive_time = now;
-
-			if (ctx->queue_count >= FRAME_QUEUE_SIZE) {
+			if (ctx->queue_count >= ctx->jitter_max_size) {
 				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
 				ctx->queue_count--;
+				ctx->jitter_stats.overflow_count++;
 			}
 
 			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
@@ -267,9 +249,17 @@ static void *decode_thread_func(void *data)
 			entry->width = decoded.width;
 			entry->height = decoded.height;
 			entry->linesize = decoded.linesize;
+			entry->sequence = ctx->frame_sequence++;
 
 			ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
 			ctx->queue_count++;
+
+			if (ctx->jitter_state == JITTER_BUFFERING && ctx->queue_count >= ctx->jitter_min_start) {
+				ctx->jitter_state = JITTER_EMITTING;
+				ctx->last_output_time = os_gettime_ns();
+				blog(LOG_INFO, "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d)",
+				     ctx->queue_count);
+			}
 
 			pthread_mutex_unlock(&ctx->mutex);
 		}
@@ -477,15 +467,14 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->queue_head = 0;
 	ctx->queue_tail = 0;
 	ctx->queue_count = 0;
-	ctx->queue_started = false;
 	ctx->decoded_frame_ready = false;
 
-	ctx->jitter_idx = 0;
-	ctx->last_receive_time = 0;
-	ctx->target_buffer_frames = MIN_BUFFER_FRAMES;
-	ctx->underrun_count = 0;
-	for (int i = 0; i < JITTER_HISTORY_SIZE; i++)
-		ctx->jitter_history[i] = 0;
+	ctx->jitter_state = JITTER_BUFFERING;
+	ctx->jitter_min_start = 6;
+	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
+	ctx->frame_sequence = 0;
+	ctx->last_output_time = 0;
+	memset(&ctx->jitter_stats, 0, sizeof(ctx->jitter_stats));
 
 	ctx->raw_queue_head = 0;
 	ctx->raw_queue_tail = 0;
@@ -675,50 +664,60 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	static uint64_t last_queue_log = 0;
 	uint64_t now_ns = os_gettime_ns();
 	if (now_ns - last_queue_log > 1000000000ULL) {
-		blog(LOG_INFO, "[Daydream] Queue: count=%d repeats=%d", ctx->queue_count, ctx->underrun_count);
+		const char *state_str = ctx->jitter_state == JITTER_BUFFERING ? "BUFF" : "EMIT";
+		blog(LOG_INFO, "[Daydream Jitter] state=%s count=%d rx=%u tx=%u under=%u over=%u", state_str,
+		     ctx->queue_count, ctx->jitter_stats.frames_received, ctx->jitter_stats.frames_played,
+		     ctx->jitter_stats.underflow_count, ctx->jitter_stats.overflow_count);
 		last_queue_log = now_ns;
 	}
 
-	if (!ctx->queue_started && ctx->queue_count >= MIN_BUFFER_FRAMES) {
-		ctx->queue_started = true;
-		ctx->last_output_time = os_gettime_ns();
-		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
-	}
-
-	static uint64_t last_low_warn = 0;
-	if (ctx->queue_started && ctx->queue_count <= 2 && now_ns - last_low_warn > 500000000ULL) {
-		blog(LOG_WARNING, "[Daydream] Queue low: %d frames", ctx->queue_count);
-		last_low_warn = now_ns;
-	}
-
-	if (ctx->queue_started) {
+	if (ctx->jitter_state == JITTER_EMITTING) {
 		uint64_t now = os_gettime_ns();
 		bool should_pop = false;
 
-		if (ctx->queue_count >= 10) {
+		uint64_t adaptive_interval;
+		if (ctx->queue_count <= 2) {
+			adaptive_interval = 1000000000ULL / 15;
+		} else if (ctx->queue_count <= 4) {
+			adaptive_interval = 1000000000ULL / 18;
+		} else if (ctx->queue_count >= 10) {
+			adaptive_interval = 0;
+		} else {
+			adaptive_interval = DEFAULT_FRAME_INTERVAL_NS;
+		}
+
+		if (adaptive_interval == 0) {
 			should_pop = true;
-		} else if (ctx->queue_count > 0 && now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+		} else if (ctx->queue_count > 0 && now - ctx->last_output_time >= adaptive_interval) {
 			should_pop = true;
 		}
 
-		if (should_pop && ctx->queue_count > 0) {
-			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+		if (should_pop) {
+			if (ctx->queue_count > 0) {
+				struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
 
-			size_t frame_size = entry->linesize * entry->height;
-			if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
-			    ctx->decoded_frame_height != entry->height) {
-				bfree(ctx->decoded_frame);
-				ctx->decoded_frame = bmalloc(frame_size);
+				size_t frame_size = entry->linesize * entry->height;
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
+				    ctx->decoded_frame_height != entry->height) {
+					bfree(ctx->decoded_frame);
+					ctx->decoded_frame = bmalloc(frame_size);
+				}
+
+				memcpy(ctx->decoded_frame, entry->data, frame_size);
+				ctx->decoded_frame_width = entry->width;
+				ctx->decoded_frame_height = entry->height;
+				ctx->decoded_frame_ready = true;
+
+				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+				ctx->queue_count--;
+				ctx->last_output_time = now;
+				ctx->jitter_stats.frames_played++;
+			} else {
+				ctx->jitter_stats.underflow_count++;
+				ctx->jitter_state = JITTER_BUFFERING;
+				blog(LOG_WARNING, "[Daydream Jitter] State: EMITTING -> BUFFERING (underflow #%u)",
+				     ctx->jitter_stats.underflow_count);
 			}
-
-			memcpy(ctx->decoded_frame, entry->data, frame_size);
-			ctx->decoded_frame_width = entry->width;
-			ctx->decoded_frame_height = entry->height;
-			ctx->decoded_frame_ready = true;
-
-			ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-			ctx->queue_count--;
-			ctx->last_output_time = now;
 		}
 	}
 
