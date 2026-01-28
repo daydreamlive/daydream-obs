@@ -13,6 +13,58 @@
 #include <cstring>
 #include <memory>
 
+class GapDetectingSession : public rtc::RtcpReceivingSession {
+public:
+	GapDetectingSession() = default;
+
+	void setTrack(std::shared_ptr<rtc::Track> track) { mTrack = track; }
+
+	void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override
+	{
+		for (const auto &message : messages) {
+			if (message->type != rtc::Message::Binary)
+				continue;
+			if (message->size() < sizeof(rtc::RtpHeader))
+				continue;
+
+			auto rtp = reinterpret_cast<const rtc::RtpHeader *>(message->data());
+			uint16_t seq = rtp->seqNumber();
+
+			if (!mInitialized) {
+				mExpectedSeq = seq;
+				mInitialized = true;
+			}
+
+			int16_t diff = static_cast<int16_t>(seq - mExpectedSeq);
+			if (diff > 1 && diff < 1000) {
+				mGapCount++;
+				uint64_t now = os_gettime_ns();
+				if (now - mLastPliTime > 200000000ULL) {
+					if (auto track = mTrack.lock()) {
+						track->requestKeyframe();
+						blog(LOG_INFO,
+						     "[Daydream WHEP] Gap detected (expected=%u got=%u), PLI sent",
+						     mExpectedSeq, seq);
+					}
+					mLastPliTime = now;
+				}
+			}
+
+			if (diff >= 0)
+				mExpectedSeq = seq + 1;
+		}
+
+		rtc::RtcpReceivingSession::incoming(messages, send);
+	}
+
+private:
+	std::weak_ptr<rtc::Track> mTrack;
+	uint16_t mExpectedSeq = 0;
+	bool mInitialized = false;
+	uint64_t mLastPliTime = 0;
+	uint32_t mGapCount = 0;
+};
+
 struct daydream_whep {
 	std::string whep_url;
 	std::string api_key;
@@ -263,10 +315,12 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	whep->track = whep->pc->addTrack(media);
 
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+	auto gapSession = std::make_shared<GapDetectingSession>();
+	gapSession->setTrack(whep->track);
+	depacketizer->addToChain(gapSession);
 	whep->track->setMediaHandler(depacketizer);
 
-	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> RtcpReceivingSession");
+	blog(LOG_INFO, "[Daydream WHEP] Video track with H264RtpDepacketizer -> GapDetectingSession");
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
 		int size = static_cast<int>(data.size());
