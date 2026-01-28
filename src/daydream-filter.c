@@ -22,6 +22,16 @@
 #define PROP_START "start"
 #define PROP_STOP "stop"
 
+#define FRAME_QUEUE_SIZE 6
+#define FRAME_INTERVAL_NS (1000000000ULL / 30)
+
+struct frame_entry {
+	uint8_t *data;
+	uint32_t width;
+	uint32_t height;
+	uint32_t linesize;
+};
+
 struct daydream_filter {
 	obs_source_t *source;
 
@@ -74,6 +84,13 @@ struct daydream_filter {
 	uint32_t decoded_frame_height;
 	bool decoded_frame_ready;
 
+	struct frame_entry frame_queue[FRAME_QUEUE_SIZE];
+	int queue_head;
+	int queue_tail;
+	int queue_count;
+	bool queue_started;
+	uint64_t last_output_time;
+
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
 
@@ -121,17 +138,26 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 	if (daydream_decoder_decode(ctx->decoder, data, size, &decoded)) {
 		pthread_mutex_lock(&ctx->mutex);
 
-		size_t frame_size = decoded.linesize * decoded.height;
-		if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
-		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->decoded_frame);
-			ctx->decoded_frame = bmalloc(frame_size);
+		if (ctx->queue_count >= FRAME_QUEUE_SIZE) {
+			pthread_mutex_unlock(&ctx->mutex);
+			return;
 		}
 
-		memcpy(ctx->decoded_frame, decoded.data, frame_size);
-		ctx->decoded_frame_width = decoded.width;
-		ctx->decoded_frame_height = decoded.height;
-		ctx->decoded_frame_ready = true;
+		struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
+		size_t frame_size = decoded.linesize * decoded.height;
+
+		if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
+			bfree(entry->data);
+			entry->data = bmalloc(frame_size);
+		}
+
+		memcpy(entry->data, decoded.data, frame_size);
+		entry->width = decoded.width;
+		entry->height = decoded.height;
+		entry->linesize = decoded.linesize;
+
+		ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
+		ctx->queue_count++;
 
 		pthread_mutex_unlock(&ctx->mutex);
 	}
@@ -313,6 +339,12 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	ctx->streaming = false;
 	ctx->stopping = false;
+
+	ctx->queue_head = 0;
+	ctx->queue_tail = 0;
+	ctx->queue_count = 0;
+	ctx->queue_started = false;
+	ctx->decoded_frame_ready = false;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -344,6 +376,10 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->whep_url);
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
+
+	for (int i = 0; i < FRAME_QUEUE_SIZE; i++) {
+		bfree(ctx->frame_queue[i].data);
+	}
 
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
@@ -482,6 +518,36 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_texture_t *output = tex;
 
 	pthread_mutex_lock(&ctx->mutex);
+
+	if (!ctx->queue_started && ctx->queue_count >= 3) {
+		ctx->queue_started = true;
+		ctx->last_output_time = os_gettime_ns();
+		blog(LOG_INFO, "[Daydream] Frame queue started with %d frames buffered", ctx->queue_count);
+	}
+
+	if (ctx->queue_started && ctx->queue_count > 0) {
+		uint64_t now = os_gettime_ns();
+		if (now - ctx->last_output_time >= FRAME_INTERVAL_NS) {
+			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
+
+			size_t frame_size = entry->linesize * entry->height;
+			if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
+			    ctx->decoded_frame_height != entry->height) {
+				bfree(ctx->decoded_frame);
+				ctx->decoded_frame = bmalloc(frame_size);
+			}
+
+			memcpy(ctx->decoded_frame, entry->data, frame_size);
+			ctx->decoded_frame_width = entry->width;
+			ctx->decoded_frame_height = entry->height;
+			ctx->decoded_frame_ready = true;
+
+			ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
+			ctx->queue_count--;
+			ctx->last_output_time = now;
+		}
+	}
+
 	if (ctx->decoded_frame_ready && ctx->decoded_frame) {
 		if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
 		    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
