@@ -25,6 +25,7 @@ struct daydream_whip {
 	uint32_t fps;
 
 	daydream_whip_state_callback on_state;
+	daydream_whip_keyframe_callback on_keyframe_request;
 	void *userdata;
 
 	std::shared_ptr<rtc::PeerConnection> pc;
@@ -167,6 +168,7 @@ struct daydream_whip *daydream_whip_create(const struct daydream_whip_config *co
 	whip->height = config->height > 0 ? config->height : 512;
 	whip->fps = config->fps > 0 ? config->fps : 30;
 	whip->on_state = config->on_state;
+	whip->on_keyframe_request = config->on_keyframe_request;
 	whip->userdata = config->userdata;
 	whip->connected = false;
 	whip->gathering_done = false;
@@ -271,6 +273,13 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 
 	auto nackResponder = std::make_shared<rtc::RtcpNackResponder>();
 	packetizer->addToChain(nackResponder);
+
+	auto pliHandler = std::make_shared<rtc::PliHandler>([whip]() {
+		blog(LOG_INFO, "[Daydream WHIP] PLI received, requesting keyframe");
+		if (whip->on_keyframe_request)
+			whip->on_keyframe_request(whip->userdata);
+	});
+	packetizer->addToChain(pliHandler);
 
 	whip->track->setMediaHandler(packetizer);
 

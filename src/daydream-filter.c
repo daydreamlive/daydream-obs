@@ -293,6 +293,14 @@ static void on_whep_state(bool connected, const char *error, void *userdata)
 	}
 }
 
+static void on_whip_keyframe_request(void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+	if (ctx && ctx->encoder) {
+		daydream_encoder_request_keyframe(ctx->encoder);
+	}
+}
+
 static void on_whip_state(bool connected, const char *error, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
@@ -923,6 +931,7 @@ static void *start_streaming_thread_func(void *data)
 		.height = STREAM_SIZE,
 		.fps = target_fps,
 		.on_state = on_whip_state,
+		.on_keyframe_request = on_whip_keyframe_request,
 		.userdata = ctx,
 	};
 	ctx->whip = daydream_whip_create(&whip_config);

@@ -11,6 +11,7 @@ extern "C" {
 struct daydream_whip;
 
 typedef void (*daydream_whip_state_callback)(bool connected, const char *error, void *userdata);
+typedef void (*daydream_whip_keyframe_callback)(void *userdata);
 
 struct daydream_whip_config {
 	const char *whip_url;
@@ -19,6 +20,7 @@ struct daydream_whip_config {
 	uint32_t height;
 	uint32_t fps;
 	daydream_whip_state_callback on_state;
+	daydream_whip_keyframe_callback on_keyframe_request;
 	void *userdata;
 };
 
