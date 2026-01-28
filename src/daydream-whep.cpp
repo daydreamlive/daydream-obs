@@ -396,7 +396,7 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	}
 
 	std::string local_sdp(sdp_buffer, sdp_size);
-	blog(LOG_INFO, "[Daydream WHEP] Local SDP created (%d bytes)", sdp_size);
+	blog(LOG_INFO, "[Daydream WHEP] Local SDP created (%d bytes):\n%s", sdp_size, local_sdp.c_str());
 
 	if (!send_whep_request(whep, local_sdp)) {
 		rtcDeletePeerConnection(whep->pc_id);

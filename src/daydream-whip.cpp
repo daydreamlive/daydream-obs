@@ -294,7 +294,7 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 	}
 
 	std::string sdp = std::string(*localDesc);
-	blog(LOG_INFO, "[Daydream WHIP] Local SDP created (%zu bytes)", sdp.size());
+	blog(LOG_INFO, "[Daydream WHIP] Local SDP created (%zu bytes):\n%s", sdp.size(), sdp.c_str());
 
 	if (!send_whip_offer(whip, sdp)) {
 		whip->pc.reset();
