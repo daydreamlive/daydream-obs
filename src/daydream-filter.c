@@ -33,6 +33,8 @@
 #define JITTER_BUFFER_SIZE 60          // ~2 seconds @ 30fps
 #define JITTER_DELAY_MS 500            // 500ms buffering delay
 #define RTP_CLOCK_RATE 90000           // H264 RTP clock rate
+#define FRAME_POOL_SIZE 64             // Pre-allocated frame buffers
+#define MAX_FRAME_SIZE (512 * 512 * 4) // 512x512 BGRA = 1MB per frame
 
 struct jitter_frame {
 	uint8_t *data;
@@ -41,6 +43,7 @@ struct jitter_frame {
 	uint32_t height;
 	uint32_t rtp_timestamp;
 	uint64_t receive_time_ns;
+	int pool_index;  // Index into frame pool (-1 if not from pool)
 };
 
 struct daydream_filter {
@@ -111,6 +114,11 @@ struct daydream_filter {
 	bool jitter_playback_started;
 	pthread_mutex_t jitter_mutex;
 
+	// Frame memory pool (pre-allocated to avoid malloc during burst)
+	uint8_t *frame_pool[FRAME_POOL_SIZE];
+	bool frame_pool_used[FRAME_POOL_SIZE];
+	int frame_pool_initialized;
+
 	// Adaptive playback rate control
 	int buffer_target;   // Target buffer level (frames)
 	float adapt_speed;   // How fast to adapt (0.01-0.5)
@@ -175,6 +183,51 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->speed_max = (float)obs_data_get_double(settings, PROP_SPEED_MAX);
 
 	pthread_mutex_unlock(&ctx->mutex);
+}
+
+// Frame pool helpers - avoid malloc/free during frame processing
+static void frame_pool_init(struct daydream_filter *ctx)
+{
+	if (ctx->frame_pool_initialized)
+		return;
+
+	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+		ctx->frame_pool[i] = bmalloc(MAX_FRAME_SIZE);
+		ctx->frame_pool_used[i] = false;
+	}
+	ctx->frame_pool_initialized = true;
+	blog(LOG_INFO, "[Pool] Initialized %d frame buffers (%d MB total)",
+	     FRAME_POOL_SIZE, (FRAME_POOL_SIZE * MAX_FRAME_SIZE) / (1024 * 1024));
+}
+
+static void frame_pool_destroy(struct daydream_filter *ctx)
+{
+	if (!ctx->frame_pool_initialized)
+		return;
+
+	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+		bfree(ctx->frame_pool[i]);
+		ctx->frame_pool[i] = NULL;
+	}
+	ctx->frame_pool_initialized = false;
+}
+
+static int frame_pool_alloc(struct daydream_filter *ctx)
+{
+	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
+		if (!ctx->frame_pool_used[i]) {
+			ctx->frame_pool_used[i] = true;
+			return i;
+		}
+	}
+	return -1; // Pool exhausted
+}
+
+static void frame_pool_free(struct daydream_filter *ctx, int index)
+{
+	if (index >= 0 && index < FRAME_POOL_SIZE) {
+		ctx->frame_pool_used[index] = false;
+	}
 }
 
 static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timestamp, bool is_keyframe, void *userdata)
@@ -244,6 +297,11 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		// Smooth mode: add to jitter buffer
 		pthread_mutex_lock(&ctx->jitter_mutex);
 
+		// Initialize frame pool on first use
+		if (!ctx->frame_pool_initialized) {
+			frame_pool_init(ctx);
+		}
+
 		uint64_t now_us = receive_time_ns / 1000;
 
 		// Update timestamp extrapolator
@@ -262,12 +320,19 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 
 		// Buffer full handling
 		if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
-			bfree(ctx->jitter_buffer[0].data);
+			// Return buffer to pool or free
+			if (ctx->jitter_buffer[0].pool_index >= 0) {
+				frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
+			} else {
+				bfree(ctx->jitter_buffer[0].data);
+			}
 			ctx->jitter_buffer[0].data = NULL;
+			ctx->jitter_buffer[0].pool_index = -1;
 			for (int i = 0; i < ctx->jitter_count - 1; i++) {
 				ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
 			}
 			ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
+			ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
 			ctx->jitter_count--;
 		}
 
@@ -298,14 +363,30 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 				ctx->jitter_buffer[i] = ctx->jitter_buffer[i - 1];
 			}
 			ctx->jitter_buffer[insert_pos].data = NULL;
+			ctx->jitter_buffer[insert_pos].pool_index = -1;
 		}
 
-		// Insert frame
+		// Insert frame using pool
 		struct jitter_frame *jf = &ctx->jitter_buffer[insert_pos];
-		if (!jf->data || jf->size < frame_size) {
-			bfree(jf->data);
-			jf->data = bmalloc(frame_size);
+
+		// Try to get buffer from pool
+		int pool_idx = frame_pool_alloc(ctx);
+		if (pool_idx >= 0) {
+			// Free old buffer if it wasn't from pool
+			if (jf->data && jf->pool_index < 0) {
+				bfree(jf->data);
+			}
+			jf->data = ctx->frame_pool[pool_idx];
+			jf->pool_index = pool_idx;
+		} else {
+			// Pool exhausted, fallback to malloc
+			if (!jf->data || jf->size < frame_size) {
+				if (jf->pool_index < 0) bfree(jf->data);
+				jf->data = bmalloc(frame_size);
+				jf->pool_index = -1;
+			}
 		}
+
 		memcpy(jf->data, decoded.data, frame_size);
 		jf->size = frame_size;
 		jf->width = decoded.width;
@@ -637,9 +718,15 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
 
+	// Free non-pool jitter buffer frames
 	for (int i = 0; i < JITTER_BUFFER_SIZE; i++) {
-		bfree(ctx->jitter_buffer[i].data);
+		if (ctx->jitter_buffer[i].data && ctx->jitter_buffer[i].pool_index < 0) {
+			bfree(ctx->jitter_buffer[i].data);
+		}
 	}
+
+	// Destroy frame pool
+	frame_pool_destroy(ctx);
 
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
@@ -896,12 +983,19 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 				// Skip frames by removing oldest ones
 				for (int i = 0; i < frames_to_skip && ctx->jitter_count > ctx->buffer_target; i++) {
-					bfree(ctx->jitter_buffer[0].data);
+					// Return to pool or free
+					if (ctx->jitter_buffer[0].pool_index >= 0) {
+						frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
+					} else {
+						bfree(ctx->jitter_buffer[0].data);
+					}
 					ctx->jitter_buffer[0].data = NULL;
+					ctx->jitter_buffer[0].pool_index = -1;
 					for (int j = 0; j < ctx->jitter_count - 1; j++) {
 						ctx->jitter_buffer[j] = ctx->jitter_buffer[j + 1];
 					}
 					ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
+					ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
 					ctx->jitter_count--;
 				}
 
@@ -973,12 +1067,18 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				pthread_mutex_unlock(&ctx->mutex);
 
 				// Pop this frame from buffer
-				bfree(ctx->jitter_buffer[0].data);
+				if (ctx->jitter_buffer[0].pool_index >= 0) {
+					frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
+				} else {
+					bfree(ctx->jitter_buffer[0].data);
+				}
 				ctx->jitter_buffer[0].data = NULL;
+				ctx->jitter_buffer[0].pool_index = -1;
 				for (int i = 0; i < ctx->jitter_count - 1; i++) {
 					ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
 				}
 				ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
+				ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
 				ctx->jitter_count--;
 			}
 
