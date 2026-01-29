@@ -84,8 +84,11 @@ struct jitter_estimator {
 	int fps_count;
 	uint64_t last_update_time_us;
 
-	// Long-term FPS using EMA (for playback pacing, immune to burst patterns)
-	double long_fps_ema; // EMA of inter-frame intervals in ms
+	// Long-term FPS (adaptive window, for playback pacing)
+	uint64_t long_fps_window_start_us;
+	int long_fps_window_frames;
+	double long_fps_value;      // Current FPS estimate
+	double long_fps_window_sec; // Current window size (grows over time)
 
 	// Inter-frame delay variation (IFDV) tracking
 	uint32_t prev_rtp_timestamp;
@@ -227,8 +230,11 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->fps_count = 0;
 	je->last_update_time_us = 0;
 
-	// Long-term FPS EMA (immune to burst patterns)
-	je->long_fps_ema = 50.0; // Start with 20fps assumption (50ms interval)
+	// Long-term FPS (adaptive window: starts small, grows to max)
+	je->long_fps_window_start_us = 0;
+	je->long_fps_window_frames = 0;
+	je->long_fps_value = 20.0;     // Start with conservative assumption
+	je->long_fps_window_sec = 1.0; // Start with 1 second window
 
 	// Reset IFDV tracking
 	je->prev_rtp_timestamp = 0;
@@ -449,11 +455,8 @@ double jitter_estimator_get_fps(jitter_estimator_t *je)
 	if (!je)
 		return 20.0; // Default
 
-	// Return long-term FPS from EMA of intervals
-	// long_fps_ema is the average inter-frame interval in ms
-	if (je->long_fps_ema <= 0)
-		return 20.0;
-	return 1000.0 / je->long_fps_ema;
+	// Return long-term FPS from 2-second window measurement
+	return je->long_fps_value;
 }
 
 // CUSUM detection for sudden delay changes (from Chrome WebRTC)
@@ -523,15 +526,32 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 
 			// Smooth the max gap with EMA (alpha=0.1 for stability)
 			je->smoothed_max_gap_ms = 0.9 * je->smoothed_max_gap_ms + 0.1 * je->max_gap_ms;
-
-			// Long-term FPS EMA (immune to burst patterns)
-			// Only count intervals > 30ms to ignore intra-burst frames
-			if (delta_ms > 30.0 && delta_ms < 1000.0) {
-				je->long_fps_ema = 0.98 * je->long_fps_ema + 0.02 * delta_ms;
-			}
 		}
 	}
 	je->last_update_time_us = receive_time_us;
+
+	// Long-term FPS: adaptive window (1s -> 2s -> 3s -> 5s max)
+	if (je->long_fps_window_start_us == 0) {
+		je->long_fps_window_start_us = receive_time_us;
+		je->long_fps_window_frames = 0;
+	}
+	je->long_fps_window_frames++;
+
+	uint64_t window_us = (uint64_t)(je->long_fps_window_sec * 1000000.0);
+	uint64_t window_elapsed_us = receive_time_us - je->long_fps_window_start_us;
+
+	if (window_elapsed_us >= window_us) {
+		double fps = (double)je->long_fps_window_frames * 1000000.0 / (double)window_elapsed_us;
+		// Gentle smoothing to avoid sudden jumps
+		je->long_fps_value = 0.7 * je->long_fps_value + 0.3 * fps;
+		// Reset window
+		je->long_fps_window_start_us = receive_time_us;
+		je->long_fps_window_frames = 0;
+		// Grow window size (max 10 seconds)
+		if (je->long_fps_window_sec < 10.0) {
+			je->long_fps_window_sec += 1.0;
+		}
+	}
 
 	// Calculate Inter-Frame Delay Variation (IFDV)
 	// IFDV = (wall_clock_delta) - (rtp_timestamp_delta / 90000)
