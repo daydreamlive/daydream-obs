@@ -479,6 +479,26 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	// Capture and send frames when streaming
 	if (ctx->streaming && ctx->encode_thread_running) {
+#if defined(__APPLE__)
+		// Create IOSurface texture on first frame (must be done in render thread)
+		if (ctx->use_zerocopy && !ctx->iosurface_texture && ctx->encoder) {
+			IOSurfaceRef iosurface = daydream_encoder_get_iosurface(ctx->encoder);
+			if (iosurface) {
+				ctx->iosurface_texture = gs_texture_create_from_iosurface(iosurface);
+				if (ctx->iosurface_texture) {
+					blog(LOG_INFO, "[Daydream] IOSurface texture created in render thread");
+				} else {
+					blog(LOG_WARNING,
+					     "[Daydream] Failed to create IOSurface texture, falling back");
+					ctx->use_zerocopy = false;
+				}
+			} else {
+				blog(LOG_WARNING, "[Daydream] No IOSurface available, falling back");
+				ctx->use_zerocopy = false;
+			}
+		}
+#endif
+
 		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
 							     : (float)STREAM_SIZE / (float)parent_height;
 
@@ -837,21 +857,10 @@ static void *start_streaming_thread_func(void *data)
 	}
 
 #if defined(__APPLE__)
-	// Create IOSurface-backed texture for zero-copy encoding
+	// Mark that we want to use zero-copy, texture will be created in render thread
 	if (daydream_encoder_is_zerocopy(ctx->encoder)) {
-		IOSurfaceRef iosurface = daydream_encoder_get_iosurface(ctx->encoder);
-		if (iosurface) {
-			obs_enter_graphics();
-			ctx->iosurface_texture = gs_texture_create_from_iosurface(iosurface);
-			obs_leave_graphics();
-
-			if (ctx->iosurface_texture) {
-				ctx->use_zerocopy = true;
-				blog(LOG_INFO, "[Daydream] Zero-copy encoding enabled");
-			} else {
-				blog(LOG_WARNING, "[Daydream] Failed to create IOSurface texture");
-			}
-		}
+		ctx->use_zerocopy = true;
+		blog(LOG_INFO, "[Daydream] Zero-copy encoding requested, texture will be created in render thread");
 	}
 #endif
 
