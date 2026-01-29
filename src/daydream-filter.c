@@ -121,12 +121,10 @@ struct daydream_filter {
 	uint64_t last_encode_time;
 	uint32_t target_fps;
 
-	// Jitter buffer for smooth playback
+	// Jitter buffer for smooth playback (sorted by RTP timestamp)
 	bool smooth_mode;
 	struct jitter_frame jitter_buffer[JITTER_BUFFER_SIZE];
-	int jitter_head;
-	int jitter_tail;
-	int jitter_count;
+	int jitter_count; // Number of frames in buffer (index 0 = oldest)
 	uint64_t jitter_playback_start_time;
 	uint32_t jitter_playback_start_rtp;
 	bool jitter_playback_started;
@@ -385,14 +383,53 @@ static void *decode_thread_func(void *data)
 				}
 
 				if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
-					// Buffer full, drop oldest
-					bfree(ctx->jitter_buffer[ctx->jitter_tail].data);
-					ctx->jitter_buffer[ctx->jitter_tail].data = NULL;
-					ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+					// Buffer full, drop oldest (index 0)
+					bfree(ctx->jitter_buffer[0].data);
+					ctx->jitter_buffer[0].data = NULL;
+					// Shift all frames down
+					for (int i = 0; i < ctx->jitter_count - 1; i++) {
+						ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
+					}
+					ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
 					ctx->jitter_count--;
 				}
 
-				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_head];
+				// Find sorted insertion position by RTP timestamp
+				// Use signed comparison to handle RTP wraparound
+				int insert_pos = ctx->jitter_count; // Default: append at end
+				for (int i = ctx->jitter_count - 1; i >= 0; i--) {
+					int32_t diff = (int32_t)(rtp_timestamp - ctx->jitter_buffer[i].rtp_timestamp);
+					if (diff > 0) {
+						// New frame is after frame[i], insert after it
+						insert_pos = i + 1;
+						break;
+					} else if (diff == 0) {
+						// Duplicate timestamp, skip
+						blog(LOG_WARNING, "[Jitter] Duplicate RTP timestamp %u, skipping",
+						     rtp_timestamp);
+						pthread_mutex_unlock(&ctx->jitter_mutex);
+						goto skip_jitter_insert;
+					}
+					insert_pos = i; // New frame is before frame[i]
+				}
+
+				// Log out-of-order insertions
+				bool out_of_order = (insert_pos < ctx->jitter_count);
+				if (out_of_order) {
+					blog(LOG_INFO, "[Jitter] Out-of-order frame: rtp=%u inserted at pos %d/%d",
+					     rtp_timestamp, insert_pos, ctx->jitter_count);
+				}
+
+				// Shift frames to make room for insertion
+				if (insert_pos < ctx->jitter_count) {
+					for (int i = ctx->jitter_count; i > insert_pos; i--) {
+						ctx->jitter_buffer[i] = ctx->jitter_buffer[i - 1];
+					}
+					ctx->jitter_buffer[insert_pos].data = NULL; // Clear moved pointer
+				}
+
+				// Insert the new frame
+				struct jitter_frame *jf = &ctx->jitter_buffer[insert_pos];
 				if (!jf->data || jf->size < frame_size) {
 					bfree(jf->data);
 					jf->data = bmalloc(frame_size);
@@ -404,10 +441,23 @@ static void *decode_thread_func(void *data)
 				jf->rtp_timestamp = rtp_timestamp;
 				jf->receive_time_ns = receive_time_ns;
 
-				ctx->jitter_head = (ctx->jitter_head + 1) % JITTER_BUFFER_SIZE;
 				ctx->jitter_count++;
 
+				// Log buffer state periodically
+				static int jitter_log_counter = 0;
+				if (jitter_log_counter++ % 30 == 0) {
+					uint32_t oldest_rtp = ctx->jitter_buffer[0].rtp_timestamp;
+					uint32_t newest_rtp = ctx->jitter_buffer[ctx->jitter_count - 1].rtp_timestamp;
+					int32_t rtp_span = (int32_t)(newest_rtp - oldest_rtp);
+					double span_ms = (double)rtp_span / 90.0;
+					blog(LOG_INFO,
+					     "[Jitter] Buffer: count=%d, rtp_span=%.1fms (oldest=%u, newest=%u)",
+					     ctx->jitter_count, span_ms, oldest_rtp, newest_rtp);
+				}
+
 				pthread_mutex_unlock(&ctx->jitter_mutex);
+			} else if (0) {
+			skip_jitter_insert:; // Label requires a statement
 			} else {
 				// Normal mode: directly copy to decoded_frame
 				pthread_mutex_lock(&ctx->mutex);
@@ -566,9 +616,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_cond_init(&ctx->raw_cond, NULL);
 	pthread_mutex_init(&ctx->jitter_mutex, NULL);
 
-	// Initialize jitter buffer
-	ctx->jitter_head = 0;
-	ctx->jitter_tail = 0;
+	// Initialize jitter buffer (sorted by RTP timestamp)
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
 	ctx->current_speed = 1.0f;
@@ -643,8 +691,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->raw_queue_count = 0;
 
 	// Reset jitter buffer
-	ctx->jitter_head = 0;
-	ctx->jitter_tail = 0;
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
 
@@ -877,7 +923,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				start_threshold = 3;
 
 			if (ctx->jitter_count >= start_threshold) {
-				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
+				struct jitter_frame *oldest = &ctx->jitter_buffer[0]; // Index 0 is always oldest
 				ctx->jitter_playback_started = true;
 				ctx->jitter_playback_start_time = now;
 				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
@@ -943,9 +989,20 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * ticks_per_ms * ctx->current_speed;
 			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
 
-			// Frame management with interpolation
+// Frame management with interpolation
+// Helper: pop oldest frame from sorted buffer (index 0)
+#define POP_OLDEST_FRAME() do { \
+				bfree(ctx->jitter_buffer[0].data); \
+				ctx->jitter_buffer[0].data = NULL; \
+				for (int _i = 0; _i < ctx->jitter_count - 1; _i++) { \
+					ctx->jitter_buffer[_i] = ctx->jitter_buffer[_i + 1]; \
+				} \
+				ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL; \
+				ctx->jitter_count--; \
+			} while(0)
+
 			if (!ctx->interp_has_a && ctx->jitter_count > 0) {
-				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+				struct jitter_frame *jf = &ctx->jitter_buffer[0]; // Oldest is at index 0
 				size_t frame_size = jf->size;
 
 				if (!ctx->interp_frame_a || ctx->interp_width != jf->width ||
@@ -965,12 +1022,11 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				ctx->interp_receive_a = jf->receive_time_ns;
 				ctx->interp_has_a = true;
 
-				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
-				ctx->jitter_count--;
+				POP_OLDEST_FRAME();
 			}
 
 			if (ctx->interp_has_a && !ctx->interp_has_b && ctx->jitter_count > 0) {
-				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+				struct jitter_frame *jf = &ctx->jitter_buffer[0]; // Oldest is at index 0
 				memcpy(ctx->interp_frame_b, jf->data, jf->size);
 				ctx->interp_rtp_b = jf->rtp_timestamp;
 				ctx->interp_receive_b = jf->receive_time_ns;
@@ -984,8 +1040,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					blog(LOG_INFO, "[RTP] Frame gap: %.1fms (rtp_ticks=%d)", rtp_gap_ms, rtp_gap);
 				}
 
-				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
-				ctx->jitter_count--;
+				POP_OLDEST_FRAME();
 			}
 
 			// Advance frames if current time passed frame B
@@ -1000,16 +1055,17 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					ctx->interp_has_b = false;
 
 					if (ctx->jitter_count > 0) {
-						struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+						struct jitter_frame *jf = &ctx->jitter_buffer[0]; // Oldest at index 0
 						memcpy(ctx->interp_frame_b, jf->data, jf->size);
 						ctx->interp_rtp_b = jf->rtp_timestamp;
 						ctx->interp_receive_b = jf->receive_time_ns;
 						ctx->interp_has_b = true;
-						ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
-						ctx->jitter_count--;
+						POP_OLDEST_FRAME();
 					}
 				}
 			}
+
+#undef POP_OLDEST_FRAME
 
 			// Render interpolated frame
 			pthread_mutex_lock(&ctx->mutex);
