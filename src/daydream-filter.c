@@ -5,8 +5,6 @@
 #include "daydream-decoder.h"
 #include "daydream-whip.h"
 #include "daydream-whep.h"
-#include "jitter-estimator.h"
-#include "timestamp-extrapolator.h"
 #include <obs-module.h>
 #include <graphics/graphics.h>
 #include <util/threading.h>
@@ -23,28 +21,6 @@
 #define PROP_STEPS "steps"
 #define PROP_START "start"
 #define PROP_STOP "stop"
-#define PROP_SMOOTH_MODE "smooth_mode"
-#define PROP_BUFFER_TARGET "buffer_target"
-#define PROP_ADAPT_SPEED "adapt_speed"
-#define PROP_SPEED_MIN "speed_min"
-#define PROP_SPEED_MAX "speed_max"
-
-// Jitter buffer for smooth playback
-#define JITTER_BUFFER_SIZE 60          // ~2 seconds @ 30fps
-#define JITTER_DELAY_MS 500            // 500ms buffering delay
-#define RTP_CLOCK_RATE 90000           // H264 RTP clock rate
-#define FRAME_POOL_SIZE 64             // Pre-allocated frame buffers
-#define MAX_FRAME_SIZE (512 * 512 * 4) // 512x512 BGRA = 1MB per frame
-
-struct jitter_frame {
-	uint8_t *data;
-	size_t size;
-	uint32_t width;
-	uint32_t height;
-	uint32_t rtp_timestamp;
-	uint64_t receive_time_ns;
-	int pool_index; // Index into frame pool (-1 if not from pool)
-};
 
 struct daydream_filter {
 	obs_source_t *source;
@@ -100,12 +76,12 @@ struct daydream_filter {
 	bool decoded_frame_is_nv12;
 
 	// NV12 GPU conversion
-	gs_texture_t *nv12_tex_y;       // Y plane texture (GS_R8)
-	gs_texture_t *nv12_tex_uv;      // UV plane texture (GS_R8G8)
-	gs_effect_t *nv12_effect;       // NV12 to RGB conversion effect
-	gs_texrender_t *nv12_texrender; // Texrender for NV12 conversion
-	uint8_t *nv12_y_data;           // Y plane data
-	uint8_t *nv12_uv_data;          // UV plane data
+	gs_texture_t *nv12_tex_y;
+	gs_texture_t *nv12_tex_uv;
+	gs_effect_t *nv12_effect;
+	gs_texrender_t *nv12_texrender;
+	uint8_t *nv12_y_data;
+	uint8_t *nv12_uv_data;
 	uint32_t nv12_y_linesize;
 	uint32_t nv12_uv_linesize;
 
@@ -115,52 +91,6 @@ struct daydream_filter {
 	uint64_t frame_count;
 	uint64_t last_encode_time;
 	uint32_t target_fps;
-
-	// Jitter buffer for smooth playback (sorted by RTP timestamp)
-	bool smooth_mode;
-	struct jitter_frame jitter_buffer[JITTER_BUFFER_SIZE];
-	int jitter_count; // Number of frames in buffer (index 0 = oldest)
-	uint64_t jitter_playback_start_time;
-	uint32_t jitter_playback_start_rtp;
-	bool jitter_playback_started;
-	pthread_mutex_t jitter_mutex;
-
-	// Frame memory pool (pre-allocated to avoid malloc during burst)
-	uint8_t *frame_pool[FRAME_POOL_SIZE];
-	bool frame_pool_used[FRAME_POOL_SIZE];
-	int frame_pool_initialized;
-
-	// Adaptive playback rate control
-	int buffer_target;   // Target buffer level (frames)
-	float adapt_speed;   // How fast to adapt (0.01-0.5)
-	float speed_min;     // Minimum playback speed
-	float speed_max;     // Maximum playback speed
-	float current_speed; // Smoothed current speed
-	uint64_t last_render_time;
-	double accumulated_rtp; // Use double for precision
-
-	// Chrome-style jitter estimator and timestamp extrapolator
-	jitter_estimator_t *jitter_est;
-	timestamp_extrapolator_t *ts_extrap;
-	uint64_t last_frame_time_us; // For frame delay calculation
-	double current_delay_ms;     // Current playout delay (jitter buffer delay)
-
-	// FPS measurement
-	uint64_t fps_measure_start;
-	int fps_frame_count;
-
-	// Current playback frame
-	uint32_t current_rtp;          // RTP timestamp of current display frame
-	uint64_t current_receive_time; // Receive time for latency tracking
-
-	// Burst pattern detection for proactive speed control
-	uint64_t last_frame_receive_ns; // When last frame was received
-	uint64_t burst_start_time_ns;   // When current burst started
-	int burst_frame_count;          // Frames in current burst
-	bool in_gap;                    // True if we're in a gap between bursts
-	double avg_gap_duration_ms;     // Average gap duration (learned)
-	double avg_burst_frames;        // Average frames per burst (learned)
-	int burst_count;                // Number of bursts seen (for learning)
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -185,359 +115,82 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->guidance = (float)obs_data_get_double(settings, PROP_GUIDANCE);
 	ctx->delta = (float)obs_data_get_double(settings, PROP_DELTA);
 	ctx->steps = (int)obs_data_get_int(settings, PROP_STEPS);
-	ctx->smooth_mode = obs_data_get_bool(settings, PROP_SMOOTH_MODE);
-
-	// Adaptive rate control parameters
-	ctx->buffer_target = (int)obs_data_get_int(settings, PROP_BUFFER_TARGET);
-	ctx->adapt_speed = (float)obs_data_get_double(settings, PROP_ADAPT_SPEED);
-	ctx->speed_min = (float)obs_data_get_double(settings, PROP_SPEED_MIN);
-	ctx->speed_max = (float)obs_data_get_double(settings, PROP_SPEED_MAX);
 
 	pthread_mutex_unlock(&ctx->mutex);
-}
-
-// Frame pool helpers - avoid malloc/free during frame processing
-static void frame_pool_init(struct daydream_filter *ctx)
-{
-	if (ctx->frame_pool_initialized)
-		return;
-
-	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-		ctx->frame_pool[i] = bmalloc(MAX_FRAME_SIZE);
-		ctx->frame_pool_used[i] = false;
-	}
-	ctx->frame_pool_initialized = true;
-	blog(LOG_INFO, "[Pool] Initialized %d frame buffers (%d MB total)", FRAME_POOL_SIZE,
-	     (FRAME_POOL_SIZE * MAX_FRAME_SIZE) / (1024 * 1024));
-}
-
-static void frame_pool_destroy(struct daydream_filter *ctx)
-{
-	if (!ctx->frame_pool_initialized)
-		return;
-
-	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-		bfree(ctx->frame_pool[i]);
-		ctx->frame_pool[i] = NULL;
-	}
-	ctx->frame_pool_initialized = false;
-}
-
-static int frame_pool_alloc(struct daydream_filter *ctx)
-{
-	for (int i = 0; i < FRAME_POOL_SIZE; i++) {
-		if (!ctx->frame_pool_used[i]) {
-			ctx->frame_pool_used[i] = true;
-			return i;
-		}
-	}
-	return -1; // Pool exhausted
-}
-
-static void frame_pool_free(struct daydream_filter *ctx, int index)
-{
-	if (index >= 0 && index < FRAME_POOL_SIZE) {
-		ctx->frame_pool_used[index] = false;
-	}
 }
 
 static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timestamp, bool is_keyframe, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(is_keyframe);
-	uint64_t receive_time_ns = os_gettime_ns();
+	UNUSED_PARAMETER(rtp_timestamp);
 
 	if (!ctx || !ctx->decoder || ctx->stopping)
 		return;
 
-	// === DEBUG: frame receive logging ===
-	static uint64_t last_whep_frame_time = 0;
-	static uint64_t whep_frame_count = 0;
-	uint64_t now = os_gettime_ns();
-	uint64_t gap_ms = (last_whep_frame_time > 0) ? (now - last_whep_frame_time) / 1000000 : 0;
-
-	if (gap_ms > 100 || whep_frame_count % 30 == 0) {
-		blog(LOG_INFO, "[WHEP] frame #%llu, gap=%llums, size=%zu", (unsigned long long)whep_frame_count,
-		     (unsigned long long)gap_ms, size);
-	}
-	last_whep_frame_time = now;
-	whep_frame_count++;
-
-	// Inline decode - no queue needed
-	static uint64_t decode_success_count = 0;
-	static uint64_t decode_fail_count = 0;
-
-	uint64_t decode_start = os_gettime_ns();
 	struct daydream_decoded_frame decoded;
-	bool decode_success = daydream_decoder_decode(ctx->decoder, data, size, &decoded);
-
-	if (!decode_success) {
-		decode_fail_count++;
-		if (decode_fail_count % 10 == 1) {
-			blog(LOG_WARNING, "[Decode] FAILED! total_fails=%llu, size=%zu",
-			     (unsigned long long)decode_fail_count, size);
-		}
+	if (!daydream_decoder_decode(ctx->decoder, data, size, &decoded))
 		return;
-	}
 
-	decode_success_count++;
-	uint64_t decode_time_ms = (os_gettime_ns() - decode_start) / 1000000;
+	pthread_mutex_lock(&ctx->mutex);
 
-	if (decode_time_ms > 10) {
-		blog(LOG_INFO, "[Decode] Slow: %llums, size=%zu", (unsigned long long)decode_time_ms, size);
-	}
+	if (decoded.is_nv12) {
+		size_t y_size = decoded.y_linesize * decoded.height;
+		size_t uv_size = decoded.uv_linesize * (decoded.height / 2);
 
-	// FPS measurement
-	if (ctx->fps_measure_start == 0) {
-		ctx->fps_measure_start = now;
-		ctx->fps_frame_count = 0;
-	}
-	ctx->fps_frame_count++;
-	uint64_t elapsed_ms = (now - ctx->fps_measure_start) / 1000000;
-	if (elapsed_ms >= 5000) {
-		double actual_fps = (double)ctx->fps_frame_count * 1000.0 / (double)elapsed_ms;
-		blog(LOG_INFO, "[FPS] Server: %.1f fps (%d frames in %llums)", actual_fps, ctx->fps_frame_count,
-		     (unsigned long long)elapsed_ms);
-		ctx->fps_measure_start = now;
-		ctx->fps_frame_count = 0;
-	}
+		if (!ctx->nv12_y_data || ctx->decoded_frame_width != decoded.width ||
+		    ctx->decoded_frame_height != decoded.height) {
+			bfree(ctx->nv12_y_data);
+			bfree(ctx->nv12_uv_data);
+			ctx->nv12_y_data = bmalloc(y_size);
+			ctx->nv12_uv_data = bmalloc(uv_size);
+		}
 
-	// Get frame data based on format
-	bool is_nv12 = decoded.is_nv12;
-	uint8_t *frame_data;
-	uint32_t frame_linesize;
-	size_t frame_size;
-
-	if (is_nv12) {
-		// NV12: store Y and UV separately
-		frame_data = decoded.y_data;
-		frame_linesize = decoded.y_linesize;
-		frame_size = decoded.y_linesize * decoded.height + decoded.uv_linesize * (decoded.height / 2);
+		memcpy(ctx->nv12_y_data, decoded.y_data, y_size);
+		memcpy(ctx->nv12_uv_data, decoded.uv_data, uv_size);
+		ctx->nv12_y_linesize = decoded.y_linesize;
+		ctx->nv12_uv_linesize = decoded.uv_linesize;
+		ctx->decoded_frame_is_nv12 = true;
 	} else {
-		// BGRA
-		frame_data = decoded.bgra_data;
-		frame_linesize = decoded.bgra_linesize;
-		frame_size = frame_linesize * decoded.height;
+		size_t frame_size = decoded.bgra_linesize * decoded.height;
+
+		if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+		    ctx->decoded_frame_height != decoded.height) {
+			bfree(ctx->decoded_frame);
+			ctx->decoded_frame = bmalloc(frame_size);
+		}
+
+		memcpy(ctx->decoded_frame, decoded.bgra_data, frame_size);
+		ctx->decoded_frame_is_nv12 = false;
 	}
 
-	if (ctx->smooth_mode) {
-		// Smooth mode: add to jitter buffer
-		pthread_mutex_lock(&ctx->jitter_mutex);
+	ctx->decoded_frame_width = decoded.width;
+	ctx->decoded_frame_height = decoded.height;
+	ctx->decoded_frame_ready = true;
 
-		// Initialize frame pool on first use
-		if (!ctx->frame_pool_initialized) {
-			frame_pool_init(ctx);
-		}
-
-		uint64_t now_us = receive_time_ns / 1000;
-
-		// Update timestamp extrapolator
-		if (ctx->ts_extrap) {
-			timestamp_extrapolator_update(ctx->ts_extrap, now_us, rtp_timestamp);
-		}
-
-		// Update jitter estimator
-		if (ctx->jitter_est) {
-			jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, size);
-			int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, 0);
-			if (new_target != ctx->buffer_target) {
-				ctx->buffer_target = new_target;
-			}
-		}
-
-		// Buffer full handling
-		if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
-			// Return buffer to pool or free
-			if (ctx->jitter_buffer[0].pool_index >= 0) {
-				frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
-			} else {
-				bfree(ctx->jitter_buffer[0].data);
-			}
-			ctx->jitter_buffer[0].data = NULL;
-			ctx->jitter_buffer[0].pool_index = -1;
-			for (int i = 0; i < ctx->jitter_count - 1; i++) {
-				ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
-			}
-			ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
-			ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
-			ctx->jitter_count--;
-		}
-
-		// Find sorted insertion position by RTP timestamp
-		int insert_pos = ctx->jitter_count;
-		for (int i = ctx->jitter_count - 1; i >= 0; i--) {
-			int32_t diff = (int32_t)(rtp_timestamp - ctx->jitter_buffer[i].rtp_timestamp);
-			if (diff > 0) {
-				insert_pos = i + 1;
-				break;
-			} else if (diff == 0) {
-				blog(LOG_WARNING, "[Jitter] Duplicate RTP %u, skipping", rtp_timestamp);
-				pthread_mutex_unlock(&ctx->jitter_mutex);
-				return;
-			}
-			insert_pos = i;
-		}
-
-		// Log out-of-order
-		if (insert_pos < ctx->jitter_count) {
-			blog(LOG_INFO, "[Jitter] Out-of-order: rtp=%u at pos %d/%d", rtp_timestamp, insert_pos,
-			     ctx->jitter_count);
-		}
-
-		// Shift frames for insertion
-		if (insert_pos < ctx->jitter_count) {
-			for (int i = ctx->jitter_count; i > insert_pos; i--) {
-				ctx->jitter_buffer[i] = ctx->jitter_buffer[i - 1];
-			}
-			ctx->jitter_buffer[insert_pos].data = NULL;
-			ctx->jitter_buffer[insert_pos].pool_index = -1;
-		}
-
-		// Insert frame using pool
-		struct jitter_frame *jf = &ctx->jitter_buffer[insert_pos];
-
-		// Try to get buffer from pool
-		int pool_idx = frame_pool_alloc(ctx);
-		if (pool_idx >= 0) {
-			// Free old buffer if it wasn't from pool
-			if (jf->data && jf->pool_index < 0) {
-				bfree(jf->data);
-			}
-			jf->data = ctx->frame_pool[pool_idx];
-			jf->pool_index = pool_idx;
-		} else {
-			// Pool exhausted, fallback to malloc
-			if (!jf->data || jf->size < frame_size) {
-				if (jf->pool_index < 0)
-					bfree(jf->data);
-				jf->data = bmalloc(frame_size);
-				jf->pool_index = -1;
-			}
-		}
-
-		memcpy(jf->data, frame_data, frame_size);
-		jf->size = frame_size;
-		jf->width = decoded.width;
-		jf->height = decoded.height;
-		jf->rtp_timestamp = rtp_timestamp;
-		jf->receive_time_ns = receive_time_ns;
-		ctx->jitter_count++;
-
-		// Burst pattern detection
-		uint64_t burst_gap_ns = (ctx->last_frame_receive_ns > 0) ? (now - ctx->last_frame_receive_ns) : 0;
-		double burst_gap_ms = (double)burst_gap_ns / 1000000.0;
-		const double GAP_THRESHOLD_MS = 100.0;
-
-		if (burst_gap_ms > GAP_THRESHOLD_MS && ctx->last_frame_receive_ns > 0) {
-			if (ctx->burst_frame_count > 0) {
-				ctx->burst_count++;
-				double alpha = (ctx->burst_count > 10) ? 0.1 : 0.3;
-				ctx->avg_burst_frames =
-					ctx->avg_burst_frames * (1.0 - alpha) + ctx->burst_frame_count * alpha;
-				ctx->avg_gap_duration_ms =
-					ctx->avg_gap_duration_ms * (1.0 - alpha) + burst_gap_ms * alpha;
-				blog(LOG_INFO,
-				     "[Burst] New burst: prev=%d frames, gap=%.0fms, avg_burst=%.1f, avg_gap=%.0fms",
-				     ctx->burst_frame_count, burst_gap_ms, ctx->avg_burst_frames,
-				     ctx->avg_gap_duration_ms);
-			}
-			ctx->burst_start_time_ns = now;
-			ctx->burst_frame_count = 1;
-			ctx->in_gap = false;
-		} else {
-			ctx->burst_frame_count++;
-		}
-		ctx->last_frame_receive_ns = now;
-
-		// Periodic buffer state log
-		static int jitter_log_counter = 0;
-		if (jitter_log_counter++ % 30 == 0 && ctx->jitter_count > 0) {
-			uint32_t oldest_rtp = ctx->jitter_buffer[0].rtp_timestamp;
-			uint32_t newest_rtp = ctx->jitter_buffer[ctx->jitter_count - 1].rtp_timestamp;
-			int32_t rtp_span = (int32_t)(newest_rtp - oldest_rtp);
-			blog(LOG_INFO, "[Jitter] Buffer: count=%d, span=%.1fms", ctx->jitter_count,
-			     (double)rtp_span / 90.0);
-		}
-
-		pthread_mutex_unlock(&ctx->jitter_mutex);
-	} else {
-		// Normal mode: direct to decoded_frame
-		pthread_mutex_lock(&ctx->mutex);
-
-		if (is_nv12) {
-			// NV12: store Y and UV planes separately
-			size_t y_size = decoded.y_linesize * decoded.height;
-			size_t uv_size = decoded.uv_linesize * (decoded.height / 2);
-
-			if (!ctx->nv12_y_data || ctx->decoded_frame_width != decoded.width ||
-			    ctx->decoded_frame_height != decoded.height) {
-				bfree(ctx->nv12_y_data);
-				bfree(ctx->nv12_uv_data);
-				ctx->nv12_y_data = bmalloc(y_size);
-				ctx->nv12_uv_data = bmalloc(uv_size);
-			}
-
-			memcpy(ctx->nv12_y_data, decoded.y_data, y_size);
-			memcpy(ctx->nv12_uv_data, decoded.uv_data, uv_size);
-			ctx->nv12_y_linesize = decoded.y_linesize;
-			ctx->nv12_uv_linesize = decoded.uv_linesize;
-			ctx->decoded_frame_is_nv12 = true;
-		} else {
-			// BGRA
-			if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
-			    ctx->decoded_frame_height != decoded.height) {
-				bfree(ctx->decoded_frame);
-				ctx->decoded_frame = bmalloc(frame_size);
-			}
-
-			memcpy(ctx->decoded_frame, frame_data, frame_size);
-			ctx->decoded_frame_is_nv12 = false;
-		}
-
-		ctx->decoded_frame_width = decoded.width;
-		ctx->decoded_frame_height = decoded.height;
-		ctx->decoded_frame_ready = true;
-
-		pthread_mutex_unlock(&ctx->mutex);
-	}
+	pthread_mutex_unlock(&ctx->mutex);
 }
 
 static void on_whep_state(bool connected, const char *error, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(ctx);
-
-	if (connected) {
-		blog(LOG_INFO, "[Daydream] WHEP connected");
-	} else {
-		blog(LOG_INFO, "[Daydream] WHEP disconnected: %s", error ? error : "");
-	}
+	UNUSED_PARAMETER(error);
+	UNUSED_PARAMETER(connected);
 }
 
 static void on_whip_state(bool connected, const char *error, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(ctx);
-
-	if (connected) {
-		blog(LOG_INFO, "[Daydream] WHIP connected");
-	} else {
-		blog(LOG_INFO, "[Daydream] WHIP disconnected: %s", error ? error : "");
-	}
+	UNUSED_PARAMETER(error);
+	UNUSED_PARAMETER(connected);
 }
 
 static void *whep_connect_thread_func(void *data)
 {
 	struct daydream_filter *ctx = data;
-
-	blog(LOG_INFO, "[Daydream] WHEP connect thread started");
-
-	if (daydream_whep_connect(ctx->whep)) {
-		blog(LOG_INFO, "[Daydream] WHEP connected successfully");
-	} else {
-		blog(LOG_ERROR, "[Daydream] WHEP connection failed");
-	}
-
+	daydream_whep_connect(ctx->whep);
 	ctx->whep_thread_running = false;
 	return NULL;
 }
@@ -545,7 +198,6 @@ static void *whep_connect_thread_func(void *data)
 static void *encode_thread_func(void *data)
 {
 	struct daydream_filter *ctx = data;
-
 	uint64_t frame_interval_ns = 1000000000ULL / ctx->target_fps;
 
 	while (ctx->encode_thread_running) {
@@ -572,32 +224,13 @@ static void *encode_thread_func(void *data)
 
 		pthread_mutex_unlock(&ctx->mutex);
 
-		bool has_encoder = ctx->encoder != NULL;
-		bool has_whip = ctx->whip != NULL;
-		bool whip_connected = has_whip && daydream_whip_is_connected(ctx->whip);
-
-		if (has_encoder && whip_connected) {
+		if (ctx->encoder && ctx->whip && daydream_whip_is_connected(ctx->whip)) {
 			struct daydream_encoded_frame encoded;
 			if (daydream_encoder_encode(ctx->encoder, frame_copy, frame_linesize, &encoded)) {
 				uint32_t timestamp_ms = (uint32_t)(ctx->frame_count * 1000 / ctx->target_fps);
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
 				ctx->frame_count++;
-
-				// Debug: log WHIP send rate
-				static uint64_t last_whip_send_time = 0;
-				static uint64_t whip_send_count = 0;
-				uint64_t now_send = os_gettime_ns();
-				uint64_t send_gap_ms =
-					(last_whip_send_time > 0) ? (now_send - last_whip_send_time) / 1000000 : 0;
-				whip_send_count++;
-
-				if (send_gap_ms > 50 || whip_send_count % 30 == 0) {
-					blog(LOG_INFO, "[DEBUG WHIP Send] #%llu, gap=%llums, size=%zu, keyframe=%s",
-					     (unsigned long long)whip_send_count, (unsigned long long)send_gap_ms,
-					     encoded.size, encoded.is_keyframe ? "YES" : "no");
-				}
-				last_whip_send_time = now_send;
 			}
 		}
 
@@ -625,30 +258,8 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
-	pthread_mutex_init(&ctx->jitter_mutex, NULL);
-
-	// Initialize jitter buffer (sorted by RTP timestamp)
-	ctx->jitter_count = 0;
-	ctx->jitter_playback_started = false;
-	ctx->current_speed = 1.0f;
-
-	// Initialize burst detection
-	ctx->last_frame_receive_ns = 0;
-	ctx->burst_start_time_ns = 0;
-	ctx->burst_frame_count = 0;
-	ctx->in_gap = false;
-	ctx->avg_gap_duration_ms = 250.0; // Initial estimate: 250ms gaps
-	ctx->avg_burst_frames = 40.0;     // Initial estimate: ~2s @ 20fps = 40 frames per burst
-	ctx->burst_count = 0;
-
-	// Create Chrome-style jitter estimator and timestamp extrapolator
-	ctx->jitter_est = jitter_estimator_create();
-	ctx->ts_extrap = timestamp_extrapolator_create();
-	ctx->last_frame_time_us = 0;
-	ctx->current_delay_ms = 100.0; // Start with 100ms delay
 
 	ctx->auth = daydream_auth_create();
-
 	daydream_filter_update(ctx, settings);
 
 	return ctx;
@@ -699,40 +310,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->streaming = false;
 	ctx->stopping = false;
 	ctx->decoded_frame_ready = false;
-
-	// Reset jitter buffer
-	ctx->jitter_count = 0;
-	ctx->jitter_playback_started = false;
-
-	// Reset burst detection (keep learned values for faster adaptation on restart)
-	ctx->last_frame_receive_ns = 0;
-	ctx->burst_start_time_ns = 0;
-	ctx->burst_frame_count = 0;
-	ctx->in_gap = false;
-	// Keep avg_gap_duration_ms and avg_burst_frames from previous session
-
-	// Reset adaptive playback
-	ctx->last_render_time = 0;
-	ctx->accumulated_rtp = 0;
-	ctx->current_speed = 1.0f;
-
-	// Reset jitter estimator and timestamp extrapolator
-	if (ctx->jitter_est) {
-		jitter_estimator_reset(ctx->jitter_est);
-	}
-	if (ctx->ts_extrap) {
-		timestamp_extrapolator_reset(ctx->ts_extrap, os_gettime_ns() / 1000);
-	}
-	ctx->last_frame_time_us = 0;
-	ctx->current_delay_ms = 100.0;
-
-	// Reset FPS measurement
-	ctx->fps_measure_start = 0;
-	ctx->fps_frame_count = 0;
-
-	// Reset playback state
-	ctx->current_rtp = 0;
-	ctx->current_receive_time = 0;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -752,7 +329,6 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->crop_texrender);
 	if (ctx->crop_stagesurface)
 		gs_stagesurface_destroy(ctx->crop_stagesurface);
-	// Clean up NV12 GPU conversion resources
 	if (ctx->nv12_tex_y)
 		gs_texture_destroy(ctx->nv12_tex_y);
 	if (ctx->nv12_tex_uv)
@@ -765,10 +341,6 @@ static void daydream_filter_destroy(void *data)
 
 	daydream_auth_destroy(ctx->auth);
 
-	// Destroy jitter estimator and timestamp extrapolator
-	jitter_estimator_destroy(ctx->jitter_est);
-	timestamp_extrapolator_destroy(ctx->ts_extrap);
-
 	bfree(ctx->prompt);
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
@@ -780,19 +352,8 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->nv12_y_data);
 	bfree(ctx->nv12_uv_data);
 
-	// Free non-pool jitter buffer frames
-	for (int i = 0; i < JITTER_BUFFER_SIZE; i++) {
-		if (ctx->jitter_buffer[i].data && ctx->jitter_buffer[i].pool_index < 0) {
-			bfree(ctx->jitter_buffer[i].data);
-		}
-	}
-
-	// Destroy frame pool
-	frame_pool_destroy(ctx);
-
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
-	pthread_mutex_destroy(&ctx->jitter_mutex);
 
 	bfree(ctx);
 }
@@ -843,7 +404,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		vec4_zero(&clear_color);
 		gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
 		gs_ortho(0.0f, (float)ctx->width, 0.0f, (float)ctx->height, -100.0f, 100.0f);
-
 		obs_source_video_render(parent);
 		gs_texrender_end(ctx->texrender);
 	}
@@ -852,18 +412,15 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	if (!tex)
 		return;
 
+	// Capture and send frames when streaming
 	if (ctx->streaming && ctx->encode_thread_running) {
 		if (!ctx->crop_texrender)
 			ctx->crop_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 		if (!ctx->crop_stagesurface)
 			ctx->crop_stagesurface = gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
 
-		float scale;
-		if (parent_width < parent_height) {
-			scale = (float)STREAM_SIZE / (float)parent_width;
-		} else {
-			scale = (float)STREAM_SIZE / (float)parent_height;
-		}
+		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
+							     : (float)STREAM_SIZE / (float)parent_height;
 
 		float scaled_width = parent_width * scale;
 		float scaled_height = parent_height * scale;
@@ -875,7 +432,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			struct vec4 clear_color;
 			vec4_zero(&clear_color);
 			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-
 			gs_ortho(offset_x / scale, (offset_x + STREAM_SIZE) / scale, offset_y / scale,
 				 (offset_y + STREAM_SIZE) / scale, -100.0f, 100.0f);
 
@@ -909,8 +465,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					ctx->pending_frame = bmalloc(data_size);
 					ctx->pending_frame_width = STREAM_SIZE;
 					ctx->pending_frame_height = STREAM_SIZE;
-					blog(LOG_INFO, "[Daydream Render] Frame buffer allocated: %ux%u (from %ux%u)",
-					     STREAM_SIZE, STREAM_SIZE, parent_width, parent_height);
 				}
 
 				memcpy(ctx->pending_frame, video_data, data_size);
@@ -919,7 +473,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				pthread_cond_signal(&ctx->frame_cond);
 
 				pthread_mutex_unlock(&ctx->mutex);
-
 				gs_stagesurface_unmap(ctx->crop_stagesurface);
 			}
 		}
@@ -927,243 +480,83 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	gs_texture_t *output = tex;
 
-	// === DEBUG: Hypothesis 4 - render frame update interval ===
-	static uint64_t last_render_update_time = 0;
-	static uint64_t render_update_count = 0;
-	static uint64_t render_no_frame_count = 0;
+	// Render decoded frame
+	pthread_mutex_lock(&ctx->mutex);
 
-	if (ctx->smooth_mode) {
-		// Adaptive speed control optimized for bursty AI video
-		// Key concepts from Chrome: gradual speed transitions
-		pthread_mutex_lock(&ctx->jitter_mutex);
+	if (ctx->decoded_frame_ready) {
+		if (ctx->decoded_frame_is_nv12 && ctx->nv12_y_data && ctx->nv12_uv_data) {
+			uint32_t w = ctx->decoded_frame_width;
+			uint32_t h = ctx->decoded_frame_height;
 
-		uint64_t now = os_gettime_ns();
-
-		// Start playback when we have minimum frames
-		if (!ctx->jitter_playback_started) {
-			int start_threshold = ctx->buffer_target / 2;
-			if (start_threshold < 3)
-				start_threshold = 3;
-
-			if (ctx->jitter_count >= start_threshold) {
-				struct jitter_frame *oldest = &ctx->jitter_buffer[0]; // Index 0 is always oldest
-				ctx->jitter_playback_started = true;
-				ctx->jitter_playback_start_time = now;
-				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
-				ctx->current_speed = 1.0f;
-
-				// Calculate initial latency: time since oldest frame was received
-				uint64_t oldest_age_ms = (now - oldest->receive_time_ns) / 1000000;
-				blog(LOG_INFO,
-				     "[Smooth] Playback started with %d frames (target=%d), oldest_frame_age=%llums",
-				     ctx->jitter_count, ctx->buffer_target, (unsigned long long)oldest_age_ms);
-			}
-		}
-
-		if (ctx->jitter_playback_started) {
-			// Burst pattern detection: check if we're in a gap
-			uint64_t time_since_last_frame_ns = now - ctx->last_frame_receive_ns;
-			double time_since_last_frame_ms = (double)time_since_last_frame_ns / 1000000.0;
-			const double GAP_THRESHOLD_MS = 100.0;
-
-			bool in_gap = (ctx->last_frame_receive_ns > 0 && time_since_last_frame_ms > GAP_THRESHOLD_MS);
-
-			// Update gap state
-			if (in_gap && !ctx->in_gap) {
-				ctx->in_gap = true;
-				blog(LOG_INFO, "[Burst] Gap detected: no frames for %.0fms, buf=%d",
-				     time_since_last_frame_ms, ctx->jitter_count);
+			// Create Y texture
+			if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
+			    gs_texture_get_height(ctx->nv12_tex_y) != h) {
+				if (ctx->nv12_tex_y)
+					gs_texture_destroy(ctx->nv12_tex_y);
+				ctx->nv12_tex_y = gs_texture_create(w, h, GS_R8, 1, NULL, GS_DYNAMIC);
 			}
 
-			// Calculate target speed based on buffer level AND burst state
-			float target_speed;
+			// Create UV texture
+			if (!ctx->nv12_tex_uv || gs_texture_get_width(ctx->nv12_tex_uv) != w / 2 ||
+			    gs_texture_get_height(ctx->nv12_tex_uv) != h / 2) {
+				if (ctx->nv12_tex_uv)
+					gs_texture_destroy(ctx->nv12_tex_uv);
+				ctx->nv12_tex_uv = gs_texture_create(w / 2, h / 2, GS_R8G8, 1, NULL, GS_DYNAMIC);
+			}
 
-			if (ctx->jitter_count == 0) {
-				// Emergency: buffer empty - notify for target increase
-				jitter_estimator_notify_underrun(ctx->jitter_est);
-				target_speed = ctx->speed_min;
-			} else if (in_gap) {
-				// PROACTIVE: We're in a gap
-				// Only slow down if buffer is below target
-				if (ctx->jitter_count >= ctx->buffer_target) {
-					// Buffer is healthy - keep normal speed
-					target_speed = 1.0f;
-				} else {
-					// Buffer below target - slow down to conserve
-					double expected_gap_ms =
-						(ctx->avg_gap_duration_ms > 0) ? ctx->avg_gap_duration_ms : 250.0;
-					double remaining_gap_ms = expected_gap_ms - time_since_last_frame_ms;
-					if (remaining_gap_ms < 0)
-						remaining_gap_ms = 0;
+			// Create texrender
+			if (!ctx->nv12_texrender)
+				ctx->nv12_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 
-					double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
-					if (actual_fps < 10.0)
-						actual_fps = 20.0;
-					double frames_needed = (remaining_gap_ms / 1000.0) * actual_fps;
+			// Load effect
+			if (!ctx->nv12_effect) {
+				char *effect_path = obs_module_file("nv12_to_rgb.effect");
+				if (effect_path) {
+					ctx->nv12_effect = gs_effect_create_from_file(effect_path, NULL);
+					bfree(effect_path);
+				}
+			}
 
-					float buffer_margin = (float)ctx->jitter_count / (float)(frames_needed + 1.0);
-					if (buffer_margin < 1.0f) {
-						target_speed = ctx->speed_min + buffer_margin * (0.9f - ctx->speed_min);
-					} else {
-						target_speed = 0.9f;
+			// Upload textures
+			if (ctx->nv12_tex_y && ctx->nv12_tex_uv) {
+				gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data, ctx->nv12_y_linesize, false);
+				gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data, ctx->nv12_uv_linesize, false);
+			}
+
+			// Render NV12 to RGB
+			if (ctx->nv12_effect && ctx->nv12_tex_y && ctx->nv12_tex_uv && ctx->nv12_texrender) {
+				gs_texrender_reset(ctx->nv12_texrender);
+				if (gs_texrender_begin(ctx->nv12_texrender, w, h)) {
+					struct vec4 clear_color;
+					vec4_zero(&clear_color);
+					gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+					gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+
+					gs_eparam_t *param_y = gs_effect_get_param_by_name(ctx->nv12_effect, "image");
+					gs_eparam_t *param_uv =
+						gs_effect_get_param_by_name(ctx->nv12_effect, "image_uv");
+
+					if (param_y && param_uv) {
+						gs_effect_set_texture(param_y, ctx->nv12_tex_y);
+						gs_effect_set_texture(param_uv, ctx->nv12_tex_uv);
+
+						gs_technique_t *tech =
+							gs_effect_get_technique(ctx->nv12_effect, "Draw");
+						gs_technique_begin(tech);
+						gs_technique_begin_pass(tech, 0);
+						gs_draw_sprite(ctx->nv12_tex_y, 0, w, h);
+						gs_technique_end_pass(tech);
+						gs_technique_end(tech);
 					}
 
-					static int gap_log_counter = 0;
-					if (gap_log_counter++ % 30 == 0) {
-						blog(LOG_INFO,
-						     "[Burst] In gap: %.0fms, remaining~%.0fms, need~%.1f frames, have=%d, speed=%.2f",
-						     time_since_last_frame_ms, remaining_gap_ms, frames_needed,
-						     ctx->jitter_count, target_speed);
-					}
+					gs_texrender_end(ctx->nv12_texrender);
 				}
-			} else if (ctx->jitter_count < ctx->buffer_target) {
-				// Below target: slow down proportionally
-				float ratio = (float)ctx->jitter_count / (float)ctx->buffer_target;
-				target_speed = ctx->speed_min + ratio * (1.0f - ctx->speed_min);
-			} else {
-				// At or above target: speed up to reduce latency
-				float excess = (float)(ctx->jitter_count - ctx->buffer_target);
-				float gain = 0.2f; // More aggressive speed-up for bursty patterns
-				target_speed = 1.0f + gain * excess;
-				if (target_speed > ctx->speed_max)
-					target_speed = ctx->speed_max;
+
+				gs_texture_t *rgb_tex = gs_texrender_get_texture(ctx->nv12_texrender);
+				if (rgb_tex)
+					output = rgb_tex;
 			}
-
-			// Frame skip for aggressive catch-up when buffer is way too full
-			// Skip threshold: if buffer > 3x target, skip frames to catch up faster
-			int skip_threshold = ctx->buffer_target * 3;
-			if (ctx->jitter_count > skip_threshold) {
-				int frames_to_skip = ctx->jitter_count - ctx->buffer_target;
-				// Don't skip too many at once (max 50% of excess)
-				if (frames_to_skip > (ctx->jitter_count - ctx->buffer_target) / 2) {
-					frames_to_skip = (ctx->jitter_count - ctx->buffer_target) / 2;
-				}
-				// Minimum 1 frame skip
-				if (frames_to_skip < 1)
-					frames_to_skip = 1;
-
-				blog(LOG_INFO, "[Skip] Buffer overflow: %d frames (target=%d), skipping %d frames",
-				     ctx->jitter_count, ctx->buffer_target, frames_to_skip);
-
-				// Skip frames by removing oldest ones
-				for (int i = 0; i < frames_to_skip && ctx->jitter_count > ctx->buffer_target; i++) {
-					// Return to pool or free
-					if (ctx->jitter_buffer[0].pool_index >= 0) {
-						frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
-					} else {
-						bfree(ctx->jitter_buffer[0].data);
-					}
-					ctx->jitter_buffer[0].data = NULL;
-					ctx->jitter_buffer[0].pool_index = -1;
-					for (int j = 0; j < ctx->jitter_count - 1; j++) {
-						ctx->jitter_buffer[j] = ctx->jitter_buffer[j + 1];
-					}
-					ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
-					ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
-					ctx->jitter_count--;
-				}
-
-				// Reset RTP accumulator to current oldest frame
-				if (ctx->jitter_count > 0) {
-					ctx->jitter_playback_start_rtp = ctx->jitter_buffer[0].rtp_timestamp;
-					ctx->accumulated_rtp = 0;
-				}
-			}
-
-			// Chrome-inspired gradual speed change (prevents jerky playback)
-			uint64_t delta_ns = now - ctx->last_render_time;
-			if (ctx->last_render_time == 0) {
-				delta_ns = 16666667; // Assume 60fps initially
-			}
-			double delta_s = (double)delta_ns / 1e9;
-
-			// Max speed change: 1.0 per second (faster response to burst patterns)
-			float max_speed_change = 1.0f * (float)delta_s;
-			float speed_diff = target_speed - ctx->current_speed;
-			if (speed_diff > max_speed_change)
-				speed_diff = max_speed_change;
-			if (speed_diff < -max_speed_change)
-				speed_diff = -max_speed_change;
-			ctx->current_speed += speed_diff;
-
-			ctx->last_render_time = now;
-
-			// Accumulate RTP ticks based on current speed
-			// Problem: Server RTP timestamps assume 30fps (3000 ticks/frame)
-			//          But actual frame delivery is ~20fps
-			// Solution: Scale playback rate to match actual arrival fps
-			double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
-			if (actual_fps < 10.0)
-				actual_fps = 20.0; // Default to 20fps if not yet estimated
-
-			// At 30fps: 90 ticks/ms. At 20fps: 60 ticks/ms
-			double ticks_per_ms = 90.0 * (actual_fps / 30.0);
-			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * ticks_per_ms * ctx->current_speed;
-			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
-
-			// Simple frame management (no interpolation)
-			// Advance frames when RTP time passes current frame
-			while (ctx->jitter_count > 0) {
-				struct jitter_frame *jf = &ctx->jitter_buffer[0];
-				int32_t diff = (int32_t)(jf->rtp_timestamp - current_rtp);
-
-				// If this frame is in the future, stop advancing
-				if (diff > 0)
-					break;
-
-				// This frame's time has passed, use it and remove from buffer
-				pthread_mutex_lock(&ctx->mutex);
-
-				size_t frame_size = jf->size;
-				if (!ctx->decoded_frame || ctx->decoded_frame_width != jf->width ||
-				    ctx->decoded_frame_height != jf->height) {
-					bfree(ctx->decoded_frame);
-					ctx->decoded_frame = bmalloc(frame_size);
-					ctx->decoded_frame_width = jf->width;
-					ctx->decoded_frame_height = jf->height;
-				}
-
-				memcpy(ctx->decoded_frame, jf->data, frame_size);
-				ctx->decoded_frame_ready = true;
-				ctx->current_rtp = jf->rtp_timestamp;
-				ctx->current_receive_time = jf->receive_time_ns;
-
-				pthread_mutex_unlock(&ctx->mutex);
-
-				// Pop this frame from buffer
-				if (ctx->jitter_buffer[0].pool_index >= 0) {
-					frame_pool_free(ctx, ctx->jitter_buffer[0].pool_index);
-				} else {
-					bfree(ctx->jitter_buffer[0].data);
-				}
-				ctx->jitter_buffer[0].data = NULL;
-				ctx->jitter_buffer[0].pool_index = -1;
-				for (int i = 0; i < ctx->jitter_count - 1; i++) {
-					ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
-				}
-				ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
-				ctx->jitter_buffer[ctx->jitter_count - 1].pool_index = -1;
-				ctx->jitter_count--;
-			}
-
-			// Periodic status log
-			static int smooth_log_counter = 0;
-			if (smooth_log_counter++ % 30 == 0 && ctx->current_receive_time > 0) {
-				uint64_t frame_age_ms = (now - ctx->current_receive_time) / 1000000;
-				double est_fps = jitter_estimator_get_fps(ctx->jitter_est);
-				blog(LOG_INFO, "[Smooth] buf=%d/%d, speed=%.2f, latency=%llums, fps=%.1f",
-				     ctx->jitter_count, ctx->buffer_target, ctx->current_speed,
-				     (unsigned long long)frame_age_ms, est_fps);
-			}
-		}
-
-		pthread_mutex_unlock(&ctx->jitter_mutex);
-
-		// Now render the frame
-		pthread_mutex_lock(&ctx->mutex);
-		if (ctx->decoded_frame_ready && ctx->decoded_frame) {
-			render_update_count++;
-
+		} else if (ctx->decoded_frame) {
 			if (!ctx->output_texture ||
 			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
 			    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
@@ -1180,161 +573,19 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				output = ctx->output_texture;
 			}
 		}
-		pthread_mutex_unlock(&ctx->mutex);
-	} else {
-		// Normal mode: use decoded_frame directly
-		pthread_mutex_lock(&ctx->mutex);
-
-		if (ctx->decoded_frame_ready) {
-			render_update_count++;
-			uint64_t now = os_gettime_ns();
-			uint64_t render_gap_ms =
-				(last_render_update_time > 0) ? (now - last_render_update_time) / 1000000 : 0;
-
-			if (render_gap_ms > 100 || render_update_count % 30 == 0) {
-				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums, nv12=%d",
-				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms,
-				     ctx->decoded_frame_is_nv12);
-			}
-			last_render_update_time = now;
-
-			if (ctx->decoded_frame_is_nv12 && ctx->nv12_y_data && ctx->nv12_uv_data) {
-				// NV12 GPU path - convert NV12 to RGB using shader
-				uint32_t w = ctx->decoded_frame_width;
-				uint32_t h = ctx->decoded_frame_height;
-
-				// Create/update Y texture (full resolution, R8)
-				if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
-				    gs_texture_get_height(ctx->nv12_tex_y) != h) {
-					if (ctx->nv12_tex_y)
-						gs_texture_destroy(ctx->nv12_tex_y);
-					ctx->nv12_tex_y = gs_texture_create(w, h, GS_R8, 1, NULL, GS_DYNAMIC);
-					blog(LOG_INFO, "[NV12] Created Y texture: %ux%u", w, h);
-				}
-
-				// Create/update UV texture (half resolution, R8G8)
-				if (!ctx->nv12_tex_uv || gs_texture_get_width(ctx->nv12_tex_uv) != w / 2 ||
-				    gs_texture_get_height(ctx->nv12_tex_uv) != h / 2) {
-					if (ctx->nv12_tex_uv)
-						gs_texture_destroy(ctx->nv12_tex_uv);
-					ctx->nv12_tex_uv =
-						gs_texture_create(w / 2, h / 2, GS_R8G8, 1, NULL, GS_DYNAMIC);
-					blog(LOG_INFO, "[NV12] Created UV texture: %ux%u", w / 2, h / 2);
-				}
-
-				// Create texrender for NV12 conversion
-				if (!ctx->nv12_texrender) {
-					ctx->nv12_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-					blog(LOG_INFO, "[NV12] Created texrender for GPU conversion");
-				}
-
-				// Load NV12 effect if not loaded
-				if (!ctx->nv12_effect) {
-					char *effect_path = obs_module_file("nv12_to_rgb.effect");
-					if (effect_path) {
-						ctx->nv12_effect = gs_effect_create_from_file(effect_path, NULL);
-						if (ctx->nv12_effect) {
-							blog(LOG_INFO, "[NV12] GPU conversion effect loaded from %s",
-							     effect_path);
-						} else {
-							blog(LOG_ERROR, "[NV12] Failed to load effect from %s",
-							     effect_path);
-						}
-						bfree(effect_path);
-					} else {
-						blog(LOG_ERROR, "[NV12] Effect file not found");
-					}
-				}
-
-				// Upload Y and UV data to textures
-				if (ctx->nv12_tex_y && ctx->nv12_tex_uv) {
-					gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data, ctx->nv12_y_linesize,
-							     false);
-					gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data, ctx->nv12_uv_linesize,
-							     false);
-				}
-
-				// Render NV12 to RGB using effect shader
-				if (ctx->nv12_effect && ctx->nv12_tex_y && ctx->nv12_tex_uv && ctx->nv12_texrender) {
-					gs_texrender_reset(ctx->nv12_texrender);
-					if (gs_texrender_begin(ctx->nv12_texrender, w, h)) {
-						struct vec4 clear_color;
-						vec4_zero(&clear_color);
-						gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-						gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
-
-						// Set effect parameters
-						gs_eparam_t *param_y =
-							gs_effect_get_param_by_name(ctx->nv12_effect, "image");
-						gs_eparam_t *param_uv =
-							gs_effect_get_param_by_name(ctx->nv12_effect, "image_uv");
-
-						if (param_y && param_uv) {
-							gs_effect_set_texture(param_y, ctx->nv12_tex_y);
-							gs_effect_set_texture(param_uv, ctx->nv12_tex_uv);
-
-							// Draw using the NV12 effect
-							gs_technique_t *tech =
-								gs_effect_get_technique(ctx->nv12_effect, "Draw");
-							gs_technique_begin(tech);
-							gs_technique_begin_pass(tech, 0);
-							gs_draw_sprite(ctx->nv12_tex_y, 0, w, h);
-							gs_technique_end_pass(tech);
-							gs_technique_end(tech);
-						}
-
-						gs_texrender_end(ctx->nv12_texrender);
-					}
-
-					// Get the converted RGB texture
-					gs_texture_t *rgb_tex = gs_texrender_get_texture(ctx->nv12_texrender);
-					if (rgb_tex) {
-						output = rgb_tex;
-					}
-				}
-			} else if (ctx->decoded_frame) {
-				// BGRA path (SW decoder fallback)
-				if (!ctx->output_texture ||
-				    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
-				    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
-					if (ctx->output_texture)
-						gs_texture_destroy(ctx->output_texture);
-					ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
-										ctx->decoded_frame_height, GS_BGRA, 1,
-										NULL, GS_DYNAMIC);
-				}
-
-				if (ctx->output_texture) {
-					gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
-							     ctx->decoded_frame_width * 4, false);
-					output = ctx->output_texture;
-				}
-			}
-		} else if (ctx->streaming) {
-			render_no_frame_count++;
-			if (render_no_frame_count % 100 == 0) {
-				blog(LOG_INFO, "[DEBUG Render] No frame available (count=%llu)",
-				     (unsigned long long)render_no_frame_count);
-			}
-		}
-		pthread_mutex_unlock(&ctx->mutex);
 	}
-	// === END DEBUG ===
+	pthread_mutex_unlock(&ctx->mutex);
 
+	// Final render
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
 
 	gs_technique_begin(tech);
 	gs_technique_begin_pass(tech, 0);
 
-	if (ctx->streaming && output == ctx->output_texture && ctx->decoded_frame_ready) {
-		float scale;
-		if (parent_width < parent_height) {
-			scale = (float)STREAM_SIZE / (float)parent_width;
-		} else {
-			scale = (float)STREAM_SIZE / (float)parent_height;
-		}
-
+	if (ctx->streaming && output != tex && ctx->decoded_frame_ready) {
+		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
+							     : (float)STREAM_SIZE / (float)parent_height;
 		float render_size = STREAM_SIZE / scale;
 		float render_x = (ctx->width - render_size) / 2.0f;
 		float render_y = (ctx->height - render_size) / 2.0f;
@@ -1369,13 +620,8 @@ static void on_login_callback(bool success, const char *api_key, const char *err
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(api_key);
-
-	if (success) {
-		blog(LOG_INFO, "[Daydream] Login successful!");
-	} else {
-		blog(LOG_ERROR, "[Daydream] Login failed: %s", error ? error : "Unknown error");
-	}
-
+	UNUSED_PARAMETER(success);
+	UNUSED_PARAMETER(error);
 	obs_source_update_properties(ctx->source);
 }
 
@@ -1386,13 +632,10 @@ static bool on_login_clicked(obs_properties_t *props, obs_property_t *property, 
 
 	struct daydream_filter *ctx = data;
 
-	if (daydream_auth_is_logged_in(ctx->auth)) {
-		blog(LOG_INFO, "[Daydream] Already logged in");
+	if (daydream_auth_is_logged_in(ctx->auth))
 		return false;
-	}
 
 	daydream_auth_login(ctx->auth, on_login_callback, ctx);
-
 	return false;
 }
 
@@ -1402,19 +645,14 @@ static bool on_logout_clicked(obs_properties_t *props, obs_property_t *property,
 	UNUSED_PARAMETER(property);
 
 	struct daydream_filter *ctx = data;
-
 	daydream_auth_logout(ctx->auth);
 	obs_source_update_properties(ctx->source);
-
 	return true;
 }
 
 static void *start_streaming_thread_func(void *data)
 {
 	struct daydream_filter *ctx = data;
-
-	blog(LOG_INFO, "[Daydream] Start streaming thread started");
-
 	const uint32_t STREAM_SIZE = 512;
 
 	pthread_mutex_lock(&ctx->mutex);
@@ -1442,18 +680,7 @@ static void *start_streaming_thread_func(void *data)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	if (ctx->stopping) {
-		blog(LOG_INFO, "[Daydream] Streaming cancelled");
-		bfree(api_key_copy);
-		daydream_api_free_result(&result);
-		ctx->start_thread_running = false;
-		pthread_mutex_unlock(&ctx->mutex);
-		return NULL;
-	}
-
-	if (!result.success) {
-		blog(LOG_ERROR, "[Daydream] Failed to create stream: %s",
-		     result.error ? result.error : "Unknown error");
+	if (ctx->stopping || !result.success) {
 		bfree(api_key_copy);
 		daydream_api_free_result(&result);
 		ctx->start_thread_running = false;
@@ -1469,9 +696,6 @@ static void *start_streaming_thread_func(void *data)
 	ctx->whip_url = bstrdup(result.whip_url);
 	ctx->whep_url = NULL;
 
-	blog(LOG_INFO, "[Daydream] Stream created: %s", ctx->stream_id);
-	blog(LOG_INFO, "[Daydream] WHIP URL: %s", ctx->whip_url);
-
 	struct daydream_encoder_config enc_config = {
 		.width = STREAM_SIZE,
 		.height = STREAM_SIZE,
@@ -1480,7 +704,6 @@ static void *start_streaming_thread_func(void *data)
 	};
 	ctx->encoder = daydream_encoder_create(&enc_config);
 	if (!ctx->encoder) {
-		blog(LOG_ERROR, "[Daydream] Failed to create encoder");
 		bfree(api_key_copy);
 		daydream_api_free_result(&result);
 		ctx->start_thread_running = false;
@@ -1494,7 +717,6 @@ static void *start_streaming_thread_func(void *data)
 	};
 	ctx->decoder = daydream_decoder_create(&dec_config);
 	if (!ctx->decoder) {
-		blog(LOG_ERROR, "[Daydream] Failed to create decoder");
 		daydream_encoder_destroy(ctx->encoder);
 		ctx->encoder = NULL;
 		bfree(api_key_copy);
@@ -1517,7 +739,6 @@ static void *start_streaming_thread_func(void *data)
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (!daydream_whip_connect(ctx->whip)) {
-		blog(LOG_ERROR, "[Daydream] Failed to connect WHIP");
 		pthread_mutex_lock(&ctx->mutex);
 		daydream_whip_destroy(ctx->whip);
 		ctx->whip = NULL;
@@ -1541,12 +762,9 @@ static void *start_streaming_thread_func(void *data)
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
 
-	blog(LOG_INFO, "[Daydream] WHIP streaming started, connecting WHEP in background...");
-
 	const char *whep_url = daydream_whip_get_whep_url(ctx->whip);
 	if (whep_url) {
 		ctx->whep_url = bstrdup(whep_url);
-		blog(LOG_INFO, "[Daydream] WHEP URL: %s", ctx->whep_url);
 
 		struct daydream_whep_config whep_config = {
 			.whep_url = ctx->whep_url,
@@ -1559,16 +777,12 @@ static void *start_streaming_thread_func(void *data)
 
 		ctx->whep_thread_running = true;
 		pthread_create(&ctx->whep_thread, NULL, whep_connect_thread_func, ctx);
-	} else {
-		blog(LOG_WARNING, "[Daydream] No WHEP URL available, output will not be received");
 	}
 
 	bfree(api_key_copy);
 	daydream_api_free_result(&result);
 	ctx->start_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
-
-	blog(LOG_INFO, "[Daydream] Streaming started!");
 
 	return NULL;
 }
@@ -1583,14 +797,12 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	pthread_mutex_lock(&ctx->mutex);
 
 	if (ctx->streaming || ctx->start_thread_running) {
-		blog(LOG_WARNING, "[Daydream] Already streaming or starting");
 		pthread_mutex_unlock(&ctx->mutex);
 		return false;
 	}
 
 	const char *api_key = daydream_auth_get_api_key(ctx->auth);
 	if (!api_key || strlen(api_key) == 0) {
-		blog(LOG_ERROR, "[Daydream] Not logged in. Please login first.");
 		pthread_mutex_unlock(&ctx->mutex);
 		return false;
 	}
@@ -1600,9 +812,6 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	pthread_create(&ctx->start_thread, NULL, start_streaming_thread_func, ctx);
 
 	pthread_mutex_unlock(&ctx->mutex);
-
-	blog(LOG_INFO, "[Daydream] Starting stream in background...");
-
 	return false;
 }
 
@@ -1614,13 +823,10 @@ static bool on_stop_clicked(obs_properties_t *props, obs_property_t *property, v
 	struct daydream_filter *ctx = data;
 
 	pthread_mutex_lock(&ctx->mutex);
-
 	if (!ctx->streaming) {
-		blog(LOG_WARNING, "[Daydream] Not streaming");
 		pthread_mutex_unlock(&ctx->mutex);
 		return false;
 	}
-
 	pthread_mutex_unlock(&ctx->mutex);
 
 	stop_streaming(ctx);
@@ -1634,17 +840,13 @@ static bool on_stop_clicked(obs_properties_t *props, obs_property_t *property, v
 	ctx->whep_url = NULL;
 	pthread_mutex_unlock(&ctx->mutex);
 
-	blog(LOG_INFO, "[Daydream] Streaming stopped");
-
 	return false;
 }
 
 static obs_properties_t *daydream_filter_get_properties(void *data)
 {
 	struct daydream_filter *ctx = data;
-
 	obs_properties_t *props = obs_properties_create();
-
 	bool logged_in = daydream_auth_is_logged_in(ctx->auth);
 
 	if (logged_in) {
@@ -1679,24 +881,6 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *steps = obs_properties_add_int_slider(props, PROP_STEPS, "Steps", 1, 100, 1);
 	obs_property_set_enabled(steps, logged_in);
 
-	obs_property_t *smooth = obs_properties_add_bool(props, PROP_SMOOTH_MODE, "Smooth Mode");
-	obs_property_set_enabled(smooth, logged_in);
-
-	// Adaptive rate control parameters
-	obs_property_t *buffer_target =
-		obs_properties_add_int_slider(props, PROP_BUFFER_TARGET, "Buffer Target (frames)", 5, 30, 1);
-	obs_property_set_enabled(buffer_target, logged_in);
-
-	obs_property_t *adapt_speed =
-		obs_properties_add_float_slider(props, PROP_ADAPT_SPEED, "Adapt Speed", 0.01, 0.5, 0.01);
-	obs_property_set_enabled(adapt_speed, logged_in);
-
-	obs_property_t *speed_min = obs_properties_add_float_slider(props, PROP_SPEED_MIN, "Min Speed", 0.1, 1.0, 0.05);
-	obs_property_set_enabled(speed_min, logged_in);
-
-	obs_property_t *speed_max = obs_properties_add_float_slider(props, PROP_SPEED_MAX, "Max Speed", 1.0, 3.0, 0.1);
-	obs_property_set_enabled(speed_max, logged_in);
-
 	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
 	obs_property_set_enabled(start, logged_in && !ctx->streaming);
 
@@ -1714,13 +898,6 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_GUIDANCE, 1.0);
 	obs_data_set_default_double(settings, PROP_DELTA, 0.7);
 	obs_data_set_default_int(settings, PROP_STEPS, 50);
-	obs_data_set_default_bool(settings, PROP_SMOOTH_MODE, false);
-
-	// Adaptive rate control defaults - tuned for ultra low latency
-	obs_data_set_default_int(settings, PROP_BUFFER_TARGET, 4);    // Ultra low latency (~200ms)
-	obs_data_set_default_double(settings, PROP_ADAPT_SPEED, 0.3); // Very fast adaptation
-	obs_data_set_default_double(settings, PROP_SPEED_MIN, 0.1);   // Can almost pause
-	obs_data_set_default_double(settings, PROP_SPEED_MAX, 3.0);   // Very fast catchup
 }
 
 static struct obs_source_info daydream_filter_info = {

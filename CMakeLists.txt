@@ -123,8 +123,6 @@ target_sources(
     src/daydream-decoder.c
     src/daydream-whip.cpp
     src/daydream-whep.cpp
-    src/jitter-estimator.c
-    src/timestamp-extrapolator.c
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
