@@ -78,11 +78,14 @@ struct jitter_estimator {
 	double prev_estimate;
 	double filtered_estimate;
 
-	// FPS estimation
+	// FPS estimation (short window for jitter calculation)
 	double frame_times[FPS_WINDOW];
 	int fps_index;
 	int fps_count;
 	uint64_t last_update_time_us;
+
+	// Long-term FPS using EMA (for playback pacing, immune to burst patterns)
+	double long_fps_ema; // EMA of inter-frame intervals in ms
 
 	// Inter-frame delay variation (IFDV) tracking
 	uint32_t prev_rtp_timestamp;
@@ -126,6 +129,9 @@ static uint64_t get_time_us(void)
 	return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
 #endif
 }
+
+// Forward declaration
+static double get_short_term_fps(jitter_estimator_t *je);
 
 static void kalman_reset(kalman_state_t *k)
 {
@@ -221,6 +227,9 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->fps_count = 0;
 	je->last_update_time_us = 0;
 
+	// Long-term FPS EMA (immune to burst patterns)
+	je->long_fps_ema = 50.0; // Start with 20fps assumption (50ms interval)
+
 	// Reset IFDV tracking
 	je->prev_rtp_timestamp = 0;
 	je->prev_receive_time_us = 0;
@@ -299,8 +308,8 @@ void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size
 
 	// Update noise estimate
 	if (!is_delay_outlier || is_size_outlier) {
-		// FPS-based alpha scaling
-		double fps = jitter_estimator_get_fps(je);
+		// FPS-based alpha scaling (use short-term fps for responsiveness)
+		double fps = get_short_term_fps(je);
 		double alpha = (double)(je->alpha_count - 1) / (double)je->alpha_count;
 
 		if (fps > 0) {
@@ -373,7 +382,7 @@ double jitter_estimator_get_ms(jitter_estimator_t *je)
 	}
 
 	// Scale by frame rate (ignore jitter for very low fps)
-	double fps = jitter_estimator_get_fps(je);
+	double fps = get_short_term_fps(je);
 	if (fps > 0 && fps < 5.0) {
 		return 0.0; // Ignore jitter for < 5fps
 	} else if (fps >= 5.0 && fps < 10.0) {
@@ -418,7 +427,8 @@ void jitter_estimator_notify_underrun(jitter_estimator_t *je)
 	je->frames_since_underrun = 0;
 }
 
-double jitter_estimator_get_fps(jitter_estimator_t *je)
+// Internal: short-term FPS for jitter calculations
+static double get_short_term_fps(jitter_estimator_t *je)
 {
 	if (!je || je->fps_count == 0)
 		return 0.0;
@@ -432,6 +442,18 @@ double jitter_estimator_get_fps(jitter_estimator_t *je)
 	if (avg_ms <= 0)
 		return 0.0;
 	return 1000.0 / avg_ms;
+}
+
+double jitter_estimator_get_fps(jitter_estimator_t *je)
+{
+	if (!je)
+		return 20.0; // Default
+
+	// Return long-term FPS from EMA of intervals
+	// long_fps_ema is the average inter-frame interval in ms
+	if (je->long_fps_ema <= 0)
+		return 20.0;
+	return 1000.0 / je->long_fps_ema;
 }
 
 // CUSUM detection for sudden delay changes (from Chrome WebRTC)
@@ -480,7 +502,7 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 
 		// Sanity check: delta should be reasonable (0.1ms to 5000ms)
 		if (delta_ms > 0.1 && delta_ms < 5000.0) {
-			// FPS tracking
+			// FPS tracking (short window)
 			je->frame_times[je->fps_index] = delta_ms;
 			je->fps_index = (je->fps_index + 1) % FPS_WINDOW;
 			if (je->fps_count < FPS_WINDOW)
@@ -501,6 +523,12 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 
 			// Smooth the max gap with EMA (alpha=0.1 for stability)
 			je->smoothed_max_gap_ms = 0.9 * je->smoothed_max_gap_ms + 0.1 * je->max_gap_ms;
+
+			// Long-term FPS EMA (immune to burst patterns)
+			// Only count intervals > 30ms to ignore intra-burst frames
+			if (delta_ms > 30.0 && delta_ms < 1000.0) {
+				je->long_fps_ema = 0.98 * je->long_fps_ema + 0.02 * delta_ms;
+			}
 		}
 	}
 	je->last_update_time_us = receive_time_us;
