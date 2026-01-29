@@ -129,4 +129,12 @@ target_sources(
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
+# Copy data files (shaders, etc.)
+file(GLOB data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")
+foreach(data_file ${data_files})
+  get_filename_component(data_file_name ${data_file} NAME)
+  target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${data_file})
+  set_source_files_properties(${data_file} PROPERTIES MACOSX_PACKAGE_LOCATION "Resources")
+endforeach()
+
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

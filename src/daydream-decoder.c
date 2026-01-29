@@ -17,10 +17,18 @@ struct daydream_decoder {
 	bool using_hw;
 	bool hw_failed;           // HW decode permanently failed, using SW
 	int consecutive_failures; // Track decode failures for fallback
+	bool output_nv12;         // Output NV12 (true) or BGRA (false)
 
 	uint32_t width;
 	uint32_t height;
 
+	// NV12 output buffers
+	uint8_t *y_buffer;
+	uint8_t *uv_buffer;
+	size_t y_buffer_size;
+	size_t uv_buffer_size;
+
+	// BGRA output buffer (for SW fallback)
 	uint8_t *output_buffer;
 	size_t output_buffer_size;
 	uint32_t output_linesize;
@@ -177,6 +185,10 @@ void daydream_decoder_destroy(struct daydream_decoder *decoder)
 		avcodec_free_context(&decoder->codec_ctx);
 	if (decoder->output_buffer)
 		bfree(decoder->output_buffer);
+	if (decoder->y_buffer)
+		bfree(decoder->y_buffer);
+	if (decoder->uv_buffer)
+		bfree(decoder->uv_buffer);
 
 	bfree(decoder);
 }
@@ -296,36 +308,82 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	uint32_t frame_width = src_frame->width;
 	uint32_t frame_height = src_frame->height;
 
-	if (decoder->width != frame_width || decoder->height != frame_height || (decoder->sws_ctx == NULL)) {
-		decoder->width = frame_width;
-		decoder->height = frame_height;
+	// Check if source is NV12 (common HW decode output format)
+	bool is_nv12 = (src_frame->format == AV_PIX_FMT_NV12);
 
-		if (decoder->sws_ctx) {
-			sws_freeContext(decoder->sws_ctx);
-			decoder->sws_ctx = NULL;
+	if (is_nv12) {
+		// GPU path: output NV12 directly for GPU color conversion
+		decoder->output_nv12 = true;
+
+		// Reallocate buffers if size changed
+		size_t y_size = src_frame->linesize[0] * frame_height;
+		size_t uv_size = src_frame->linesize[1] * (frame_height / 2);
+
+		if (decoder->width != frame_width || decoder->height != frame_height) {
+			decoder->width = frame_width;
+			decoder->height = frame_height;
+			decoder->y_buffer = brealloc(decoder->y_buffer, y_size);
+			decoder->uv_buffer = brealloc(decoder->uv_buffer, uv_size);
+			decoder->y_buffer_size = y_size;
+			decoder->uv_buffer_size = uv_size;
+			blog(LOG_INFO, "[Daydream Decoder] NV12 output: %dx%d, Y=%zu bytes, UV=%zu bytes", frame_width,
+			     frame_height, y_size, uv_size);
 		}
 
-		decoder->sws_ctx = sws_getContext(frame_width, frame_height, src_frame->format, frame_width,
-						  frame_height, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR, NULL, NULL, NULL);
+		// Copy Y plane
+		memcpy(decoder->y_buffer, src_frame->data[0], y_size);
+		// Copy UV plane
+		memcpy(decoder->uv_buffer, src_frame->data[1], uv_size);
 
-		if (!decoder->sws_ctx) {
-			blog(LOG_ERROR, "[Daydream Decoder] Failed to create sws context");
-			return false;
+		out_frame->is_nv12 = true;
+		out_frame->y_data = decoder->y_buffer;
+		out_frame->uv_data = decoder->uv_buffer;
+		out_frame->y_linesize = src_frame->linesize[0];
+		out_frame->uv_linesize = src_frame->linesize[1];
+		out_frame->bgra_data = NULL;
+		out_frame->bgra_linesize = 0;
+	} else {
+		// CPU path: convert to BGRA via sws_scale (SW decoder fallback)
+		decoder->output_nv12 = false;
+
+		if (decoder->width != frame_width || decoder->height != frame_height || (decoder->sws_ctx == NULL)) {
+			decoder->width = frame_width;
+			decoder->height = frame_height;
+
+			if (decoder->sws_ctx) {
+				sws_freeContext(decoder->sws_ctx);
+				decoder->sws_ctx = NULL;
+			}
+
+			decoder->sws_ctx = sws_getContext(frame_width, frame_height, src_frame->format, frame_width,
+							  frame_height, AV_PIX_FMT_BGRA, SWS_FAST_BILINEAR, NULL, NULL,
+							  NULL);
+
+			if (!decoder->sws_ctx) {
+				blog(LOG_ERROR, "[Daydream Decoder] Failed to create sws context");
+				return false;
+			}
+
+			decoder->output_linesize = frame_width * 4;
+			decoder->output_buffer_size = decoder->output_linesize * frame_height;
+			decoder->output_buffer = brealloc(decoder->output_buffer, decoder->output_buffer_size);
 		}
 
-		decoder->output_linesize = frame_width * 4;
-		decoder->output_buffer_size = decoder->output_linesize * frame_height;
-		decoder->output_buffer = brealloc(decoder->output_buffer, decoder->output_buffer_size);
+		uint8_t *dst_data[1] = {decoder->output_buffer};
+		int dst_linesize[1] = {(int)decoder->output_linesize};
+
+		sws_scale(decoder->sws_ctx, (const uint8_t *const *)src_frame->data, src_frame->linesize, 0,
+			  frame_height, dst_data, dst_linesize);
+
+		out_frame->is_nv12 = false;
+		out_frame->y_data = NULL;
+		out_frame->uv_data = NULL;
+		out_frame->y_linesize = 0;
+		out_frame->uv_linesize = 0;
+		out_frame->bgra_data = decoder->output_buffer;
+		out_frame->bgra_linesize = decoder->output_linesize;
 	}
 
-	uint8_t *dst_data[1] = {decoder->output_buffer};
-	int dst_linesize[1] = {(int)decoder->output_linesize};
-
-	sws_scale(decoder->sws_ctx, (const uint8_t *const *)src_frame->data, src_frame->linesize, 0, frame_height,
-		  dst_data, dst_linesize);
-
-	out_frame->data = decoder->output_buffer;
-	out_frame->linesize = decoder->output_linesize;
 	out_frame->width = frame_width;
 	out_frame->height = frame_height;
 	out_frame->pts = decoder->frame->pts;

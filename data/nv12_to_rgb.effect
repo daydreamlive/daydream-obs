@@ -1,0 +1,62 @@
+// NV12 to RGB conversion shader for Daydream OBS plugin
+// Based on OBS's format_conversion.effect
+
+uniform float4x4 ViewProj;
+uniform texture2d image;    // Y plane (R8)
+uniform texture2d image_uv; // UV plane (R8G8, interleaved CbCr)
+
+// BT.601 YUV to RGB conversion matrix (full range)
+// Y: 0-255, Cb/Cr: 0-255 (centered at 128)
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData vert_out;
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv = v_in.uv;
+    return vert_out;
+}
+
+float4 PSNV12ToRGB(VertData v_in) : TARGET
+{
+    // Sample Y (full resolution)
+    float y = image.Sample(def_sampler, v_in.uv).x;
+
+    // Sample UV (half resolution, interleaved)
+    float2 uv = image_uv.Sample(def_sampler, v_in.uv).xy;
+
+    // Convert from 0-1 range to actual values
+    // Y: 0-1 maps to 0-255
+    // UV: 0-1 maps to 0-255, need to subtract 0.5 (128/255)
+    float cb = uv.x - 0.5;
+    float cr = uv.y - 0.5;
+
+    // BT.601 conversion (commonly used for H.264)
+    // R = Y + 1.402 * Cr
+    // G = Y - 0.344 * Cb - 0.714 * Cr
+    // B = Y + 1.772 * Cb
+    float r = y + 1.402 * cr;
+    float g = y - 0.344 * cb - 0.714 * cr;
+    float b = y + 1.772 * cb;
+
+    return float4(saturate(float3(r, g, b)), 1.0);
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSNV12ToRGB(v_in);
+    }
+}

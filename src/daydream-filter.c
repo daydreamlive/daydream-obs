@@ -97,6 +97,17 @@ struct daydream_filter {
 	uint32_t decoded_frame_width;
 	uint32_t decoded_frame_height;
 	bool decoded_frame_ready;
+	bool decoded_frame_is_nv12;
+
+	// NV12 GPU conversion
+	gs_texture_t *nv12_tex_y;       // Y plane texture (GS_R8)
+	gs_texture_t *nv12_tex_uv;      // UV plane texture (GS_R8G8)
+	gs_effect_t *nv12_effect;       // NV12 to RGB conversion effect
+	gs_texrender_t *nv12_texrender; // Texrender for NV12 conversion
+	uint8_t *nv12_y_data;           // Y plane data
+	uint8_t *nv12_uv_data;          // UV plane data
+	uint32_t nv12_y_linesize;
+	uint32_t nv12_uv_linesize;
 
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
@@ -291,7 +302,23 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		ctx->fps_frame_count = 0;
 	}
 
-	size_t frame_size = decoded.linesize * decoded.height;
+	// Get frame data based on format
+	bool is_nv12 = decoded.is_nv12;
+	uint8_t *frame_data;
+	uint32_t frame_linesize;
+	size_t frame_size;
+
+	if (is_nv12) {
+		// NV12: store Y and UV separately
+		frame_data = decoded.y_data;
+		frame_linesize = decoded.y_linesize;
+		frame_size = decoded.y_linesize * decoded.height + decoded.uv_linesize * (decoded.height / 2);
+	} else {
+		// BGRA
+		frame_data = decoded.bgra_data;
+		frame_linesize = decoded.bgra_linesize;
+		frame_size = frame_linesize * decoded.height;
+	}
 
 	if (ctx->smooth_mode) {
 		// Smooth mode: add to jitter buffer
@@ -388,7 +415,7 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 			}
 		}
 
-		memcpy(jf->data, decoded.data, frame_size);
+		memcpy(jf->data, frame_data, frame_size);
 		jf->size = frame_size;
 		jf->width = decoded.width;
 		jf->height = decoded.height;
@@ -437,13 +464,36 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		// Normal mode: direct to decoded_frame
 		pthread_mutex_lock(&ctx->mutex);
 
-		if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
-		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->decoded_frame);
-			ctx->decoded_frame = bmalloc(frame_size);
+		if (is_nv12) {
+			// NV12: store Y and UV planes separately
+			size_t y_size = decoded.y_linesize * decoded.height;
+			size_t uv_size = decoded.uv_linesize * (decoded.height / 2);
+
+			if (!ctx->nv12_y_data || ctx->decoded_frame_width != decoded.width ||
+			    ctx->decoded_frame_height != decoded.height) {
+				bfree(ctx->nv12_y_data);
+				bfree(ctx->nv12_uv_data);
+				ctx->nv12_y_data = bmalloc(y_size);
+				ctx->nv12_uv_data = bmalloc(uv_size);
+			}
+
+			memcpy(ctx->nv12_y_data, decoded.y_data, y_size);
+			memcpy(ctx->nv12_uv_data, decoded.uv_data, uv_size);
+			ctx->nv12_y_linesize = decoded.y_linesize;
+			ctx->nv12_uv_linesize = decoded.uv_linesize;
+			ctx->decoded_frame_is_nv12 = true;
+		} else {
+			// BGRA
+			if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+			    ctx->decoded_frame_height != decoded.height) {
+				bfree(ctx->decoded_frame);
+				ctx->decoded_frame = bmalloc(frame_size);
+			}
+
+			memcpy(ctx->decoded_frame, frame_data, frame_size);
+			ctx->decoded_frame_is_nv12 = false;
 		}
 
-		memcpy(ctx->decoded_frame, decoded.data, frame_size);
 		ctx->decoded_frame_width = decoded.width;
 		ctx->decoded_frame_height = decoded.height;
 		ctx->decoded_frame_ready = true;
@@ -702,6 +752,15 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->crop_texrender);
 	if (ctx->crop_stagesurface)
 		gs_stagesurface_destroy(ctx->crop_stagesurface);
+	// Clean up NV12 GPU conversion resources
+	if (ctx->nv12_tex_y)
+		gs_texture_destroy(ctx->nv12_tex_y);
+	if (ctx->nv12_tex_uv)
+		gs_texture_destroy(ctx->nv12_tex_uv);
+	if (ctx->nv12_effect)
+		gs_effect_destroy(ctx->nv12_effect);
+	if (ctx->nv12_texrender)
+		gs_texrender_destroy(ctx->nv12_texrender);
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
@@ -718,6 +777,8 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->whep_url);
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
+	bfree(ctx->nv12_y_data);
+	bfree(ctx->nv12_uv_data);
 
 	// Free non-pool jitter buffer frames
 	for (int i = 0; i < JITTER_BUFFER_SIZE; i++) {
@@ -1124,32 +1185,130 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		// Normal mode: use decoded_frame directly
 		pthread_mutex_lock(&ctx->mutex);
 
-		if (ctx->decoded_frame_ready && ctx->decoded_frame) {
+		if (ctx->decoded_frame_ready) {
 			render_update_count++;
 			uint64_t now = os_gettime_ns();
 			uint64_t render_gap_ms =
 				(last_render_update_time > 0) ? (now - last_render_update_time) / 1000000 : 0;
 
 			if (render_gap_ms > 100 || render_update_count % 30 == 0) {
-				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums",
-				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms);
+				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums, nv12=%d",
+				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms,
+				     ctx->decoded_frame_is_nv12);
 			}
 			last_render_update_time = now;
 
-			if (!ctx->output_texture ||
-			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
-			    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
-				if (ctx->output_texture)
-					gs_texture_destroy(ctx->output_texture);
-				ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
-									ctx->decoded_frame_height, GS_BGRA, 1, NULL,
-									GS_DYNAMIC);
-			}
+			if (ctx->decoded_frame_is_nv12 && ctx->nv12_y_data && ctx->nv12_uv_data) {
+				// NV12 GPU path - convert NV12 to RGB using shader
+				uint32_t w = ctx->decoded_frame_width;
+				uint32_t h = ctx->decoded_frame_height;
 
-			if (ctx->output_texture) {
-				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
-						     ctx->decoded_frame_width * 4, false);
-				output = ctx->output_texture;
+				// Create/update Y texture (full resolution, R8)
+				if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
+				    gs_texture_get_height(ctx->nv12_tex_y) != h) {
+					if (ctx->nv12_tex_y)
+						gs_texture_destroy(ctx->nv12_tex_y);
+					ctx->nv12_tex_y = gs_texture_create(w, h, GS_R8, 1, NULL, GS_DYNAMIC);
+					blog(LOG_INFO, "[NV12] Created Y texture: %ux%u", w, h);
+				}
+
+				// Create/update UV texture (half resolution, R8G8)
+				if (!ctx->nv12_tex_uv || gs_texture_get_width(ctx->nv12_tex_uv) != w / 2 ||
+				    gs_texture_get_height(ctx->nv12_tex_uv) != h / 2) {
+					if (ctx->nv12_tex_uv)
+						gs_texture_destroy(ctx->nv12_tex_uv);
+					ctx->nv12_tex_uv =
+						gs_texture_create(w / 2, h / 2, GS_R8G8, 1, NULL, GS_DYNAMIC);
+					blog(LOG_INFO, "[NV12] Created UV texture: %ux%u", w / 2, h / 2);
+				}
+
+				// Create texrender for NV12 conversion
+				if (!ctx->nv12_texrender) {
+					ctx->nv12_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+					blog(LOG_INFO, "[NV12] Created texrender for GPU conversion");
+				}
+
+				// Load NV12 effect if not loaded
+				if (!ctx->nv12_effect) {
+					char *effect_path = obs_module_file("nv12_to_rgb.effect");
+					if (effect_path) {
+						ctx->nv12_effect = gs_effect_create_from_file(effect_path, NULL);
+						if (ctx->nv12_effect) {
+							blog(LOG_INFO, "[NV12] GPU conversion effect loaded from %s",
+							     effect_path);
+						} else {
+							blog(LOG_ERROR, "[NV12] Failed to load effect from %s",
+							     effect_path);
+						}
+						bfree(effect_path);
+					} else {
+						blog(LOG_ERROR, "[NV12] Effect file not found");
+					}
+				}
+
+				// Upload Y and UV data to textures
+				if (ctx->nv12_tex_y && ctx->nv12_tex_uv) {
+					gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data, ctx->nv12_y_linesize,
+							     false);
+					gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data, ctx->nv12_uv_linesize,
+							     false);
+				}
+
+				// Render NV12 to RGB using effect shader
+				if (ctx->nv12_effect && ctx->nv12_tex_y && ctx->nv12_tex_uv && ctx->nv12_texrender) {
+					gs_texrender_reset(ctx->nv12_texrender);
+					if (gs_texrender_begin(ctx->nv12_texrender, w, h)) {
+						struct vec4 clear_color;
+						vec4_zero(&clear_color);
+						gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+						gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+
+						// Set effect parameters
+						gs_eparam_t *param_y =
+							gs_effect_get_param_by_name(ctx->nv12_effect, "image");
+						gs_eparam_t *param_uv =
+							gs_effect_get_param_by_name(ctx->nv12_effect, "image_uv");
+
+						if (param_y && param_uv) {
+							gs_effect_set_texture(param_y, ctx->nv12_tex_y);
+							gs_effect_set_texture(param_uv, ctx->nv12_tex_uv);
+
+							// Draw using the NV12 effect
+							gs_technique_t *tech =
+								gs_effect_get_technique(ctx->nv12_effect, "Draw");
+							gs_technique_begin(tech);
+							gs_technique_begin_pass(tech, 0);
+							gs_draw_sprite(ctx->nv12_tex_y, 0, w, h);
+							gs_technique_end_pass(tech);
+							gs_technique_end(tech);
+						}
+
+						gs_texrender_end(ctx->nv12_texrender);
+					}
+
+					// Get the converted RGB texture
+					gs_texture_t *rgb_tex = gs_texrender_get_texture(ctx->nv12_texrender);
+					if (rgb_tex) {
+						output = rgb_tex;
+					}
+				}
+			} else if (ctx->decoded_frame) {
+				// BGRA path (SW decoder fallback)
+				if (!ctx->output_texture ||
+				    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
+				    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
+					if (ctx->output_texture)
+						gs_texture_destroy(ctx->output_texture);
+					ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
+										ctx->decoded_frame_height, GS_BGRA, 1,
+										NULL, GS_DYNAMIC);
+				}
+
+				if (ctx->output_texture) {
+					gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
+							     ctx->decoded_frame_width * 4, false);
+					output = ctx->output_texture;
+				}
 			}
 		} else if (ctx->streaming) {
 			render_no_frame_count++;
