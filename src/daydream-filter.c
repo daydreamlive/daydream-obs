@@ -161,6 +161,15 @@ struct daydream_filter {
 	uint64_t interp_receive_b; // Receive time of frame B
 	bool interp_has_a;
 	bool interp_has_b;
+
+	// Burst pattern detection for proactive speed control
+	uint64_t last_frame_receive_ns; // When last frame was received
+	uint64_t burst_start_time_ns;   // When current burst started
+	int burst_frame_count;          // Frames in current burst
+	bool in_gap;                    // True if we're in a gap between bursts
+	double avg_gap_duration_ms;     // Average gap duration (learned)
+	double avg_burst_frames;        // Average frames per burst (learned)
+	int burst_count;                // Number of bursts seen (for learning)
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -443,6 +452,41 @@ static void *decode_thread_func(void *data)
 
 				ctx->jitter_count++;
 
+				// Burst pattern detection
+				uint64_t now_ns = os_gettime_ns();
+				uint64_t gap_ns =
+					(ctx->last_frame_receive_ns > 0) ? (now_ns - ctx->last_frame_receive_ns) : 0;
+				double gap_ms = (double)gap_ns / 1000000.0;
+
+				// Gap threshold: if > 100ms since last frame, we were in a gap
+				const double GAP_THRESHOLD_MS = 100.0;
+
+				if (gap_ms > GAP_THRESHOLD_MS && ctx->last_frame_receive_ns > 0) {
+					// We were in a gap, now a new burst is starting
+					if (ctx->burst_frame_count > 0) {
+						// Learn from the previous burst
+						ctx->burst_count++;
+						double alpha = (ctx->burst_count > 10) ? 0.1 : 0.3;
+						ctx->avg_burst_frames = ctx->avg_burst_frames * (1.0 - alpha) +
+									ctx->burst_frame_count * alpha;
+						ctx->avg_gap_duration_ms =
+							ctx->avg_gap_duration_ms * (1.0 - alpha) + gap_ms * alpha;
+
+						blog(LOG_INFO,
+						     "[Burst] New burst started. prev_burst=%d frames, gap=%.0fms, "
+						     "avg_burst=%.1f, avg_gap=%.0fms",
+						     ctx->burst_frame_count, gap_ms, ctx->avg_burst_frames,
+						     ctx->avg_gap_duration_ms);
+					}
+					ctx->burst_start_time_ns = now_ns;
+					ctx->burst_frame_count = 1;
+					ctx->in_gap = false;
+				} else {
+					// Continuing current burst
+					ctx->burst_frame_count++;
+				}
+				ctx->last_frame_receive_ns = now_ns;
+
 				// Log buffer state periodically
 				static int jitter_log_counter = 0;
 				if (jitter_log_counter++ % 30 == 0) {
@@ -621,6 +665,15 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->jitter_playback_started = false;
 	ctx->current_speed = 1.0f;
 
+	// Initialize burst detection
+	ctx->last_frame_receive_ns = 0;
+	ctx->burst_start_time_ns = 0;
+	ctx->burst_frame_count = 0;
+	ctx->in_gap = false;
+	ctx->avg_gap_duration_ms = 250.0; // Initial estimate: 250ms gaps
+	ctx->avg_burst_frames = 40.0;     // Initial estimate: ~2s @ 20fps = 40 frames per burst
+	ctx->burst_count = 0;
+
 	// Create Chrome-style jitter estimator and timestamp extrapolator
 	ctx->jitter_est = jitter_estimator_create();
 	ctx->ts_extrap = timestamp_extrapolator_create();
@@ -693,6 +746,13 @@ static void stop_streaming(struct daydream_filter *ctx)
 	// Reset jitter buffer
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
+
+	// Reset burst detection (keep learned values for faster adaptation on restart)
+	ctx->last_frame_receive_ns = 0;
+	ctx->burst_start_time_ns = 0;
+	ctx->burst_frame_count = 0;
+	ctx->in_gap = false;
+	// Keep avg_gap_duration_ms and avg_burst_frames from previous session
 
 	// Reset adaptive playback
 	ctx->last_render_time = 0;
@@ -938,13 +998,59 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		}
 
 		if (ctx->jitter_playback_started) {
-			// Calculate target speed based on buffer level
+			// Burst pattern detection: check if we're in a gap
+			uint64_t time_since_last_frame_ns = now - ctx->last_frame_receive_ns;
+			double time_since_last_frame_ms = (double)time_since_last_frame_ns / 1000000.0;
+			const double GAP_THRESHOLD_MS = 100.0;
+
+			bool in_gap = (ctx->last_frame_receive_ns > 0 && time_since_last_frame_ms > GAP_THRESHOLD_MS);
+
+			// Update gap state
+			if (in_gap && !ctx->in_gap) {
+				ctx->in_gap = true;
+				blog(LOG_INFO, "[Burst] Gap detected: no frames for %.0fms, buf=%d",
+				     time_since_last_frame_ms, ctx->jitter_count);
+			}
+
+			// Calculate target speed based on buffer level AND burst state
 			float target_speed;
 
 			if (ctx->jitter_count == 0) {
 				// Emergency: buffer empty - notify for target increase
 				jitter_estimator_notify_underrun(ctx->jitter_est);
 				target_speed = ctx->speed_min;
+			} else if (in_gap) {
+				// PROACTIVE: We're in a gap, slow down to conserve buffer
+				// Estimate how much longer the gap might last
+				double expected_gap_ms = (ctx->avg_gap_duration_ms > 0) ? ctx->avg_gap_duration_ms
+											: 250.0; // Default 250ms
+				double remaining_gap_ms = expected_gap_ms - time_since_last_frame_ms;
+				if (remaining_gap_ms < 0)
+					remaining_gap_ms = 0;
+
+				// Calculate how many frames we need to survive the remaining gap
+				double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
+				if (actual_fps < 10.0)
+					actual_fps = 20.0;
+				double frames_needed = (remaining_gap_ms / 1000.0) * actual_fps;
+
+				// If buffer might not last, slow down more aggressively
+				float buffer_margin = (float)ctx->jitter_count / (float)(frames_needed + 1.0);
+				if (buffer_margin < 1.0f) {
+					// Not enough buffer for the gap - slow down proportionally
+					target_speed = ctx->speed_min + buffer_margin * (0.8f - ctx->speed_min);
+				} else {
+					// Enough buffer, but still slow down a bit to be safe
+					target_speed = 0.8f;
+				}
+
+				static int gap_log_counter = 0;
+				if (gap_log_counter++ % 30 == 0) {
+					blog(LOG_INFO,
+					     "[Burst] In gap: %.0fms, remaining~%.0fms, need~%.1f frames, have=%d, speed=%.2f",
+					     time_since_last_frame_ms, remaining_gap_ms, frames_needed,
+					     ctx->jitter_count, target_speed);
+				}
 			} else if (ctx->jitter_count < ctx->buffer_target) {
 				// Below target: slow down proportionally
 				float ratio = (float)ctx->jitter_count / (float)ctx->buffer_target;
