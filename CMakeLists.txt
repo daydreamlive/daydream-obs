@@ -62,6 +62,7 @@ foreach(
         $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-error
         -Wno-shorten-64-to-32
         -Wno-unused-parameter
+        -Wno-unused-command-line-argument
         -fno-modules>
         $<$<C_COMPILER_ID:MSVC>:/WX-
         /wd4319
@@ -72,6 +73,7 @@ foreach(
         -Wno-shorten-64-to-32
         -Wno-unused-parameter
         -Wno-unreachable-code
+        -Wno-unused-command-line-argument
         -fno-modules>
         $<$<CXX_COMPILER_ID:MSVC>:/WX-
         /wd4319
@@ -121,6 +123,7 @@ target_sources(
     src/daydream-decoder.c
     src/daydream-whip.cpp
     src/daydream-whep.cpp
+    src/jitter-estimator.c
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)

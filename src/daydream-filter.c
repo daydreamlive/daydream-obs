@@ -5,6 +5,7 @@
 #include "daydream-decoder.h"
 #include "daydream-whip.h"
 #include "daydream-whep.h"
+#include "jitter-estimator.h"
 #include <obs-module.h>
 #include <graphics/graphics.h>
 #include <util/threading.h>
@@ -138,6 +139,10 @@ struct daydream_filter {
 	float current_speed; // Smoothed current speed
 	uint64_t last_render_time;
 	double accumulated_rtp; // Use double for precision
+
+	// Chrome-style jitter estimator
+	jitter_estimator_t *jitter_est;
+	uint64_t last_frame_time_us; // For frame delay calculation
 
 	// Frame interpolation
 	uint8_t *interp_frame_a;   // Previous frame for interpolation
@@ -325,6 +330,32 @@ static void *decode_thread_func(void *data)
 			if (ctx->smooth_mode) {
 				// Smooth mode: add to jitter buffer
 				pthread_mutex_lock(&ctx->jitter_mutex);
+
+				// Update jitter estimator
+				if (ctx->jitter_est) {
+					uint64_t now_us = receive_time_ns / 1000;
+					double frame_delay_ms = 0.0;
+					if (ctx->last_frame_time_us > 0) {
+						frame_delay_ms = (double)(now_us - ctx->last_frame_time_us) / 1000.0;
+						// Subtract expected frame interval (~33ms for 30fps)
+						frame_delay_ms -= 33.0;
+					}
+					ctx->last_frame_time_us = now_us;
+					jitter_estimator_update(ctx->jitter_est, frame_delay_ms, raw_size);
+
+					// Auto-adjust buffer target based on jitter estimate
+					double fps = jitter_estimator_get_fps(ctx->jitter_est);
+					if (fps > 0) {
+						int new_target =
+							jitter_estimator_get_buffer_target(ctx->jitter_est, fps);
+						if (new_target != ctx->buffer_target) {
+							blog(LOG_INFO,
+							     "[Jitter Est] New buffer target: %d (jitter=%.1fms, fps=%.1f)",
+							     new_target, jitter_estimator_get_ms(ctx->jitter_est), fps);
+							ctx->buffer_target = new_target;
+						}
+					}
+				}
 
 				if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
 					// Buffer full, drop oldest
@@ -515,6 +546,10 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->jitter_playback_started = false;
 	ctx->current_speed = 1.0f;
 
+	// Create Chrome-style jitter estimator
+	ctx->jitter_est = jitter_estimator_create();
+	ctx->last_frame_time_us = 0;
+
 	ctx->auth = daydream_auth_create();
 
 	daydream_filter_update(ctx, settings);
@@ -589,6 +624,12 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->accumulated_rtp = 0;
 	ctx->current_speed = 1.0f;
 
+	// Reset jitter estimator
+	if (ctx->jitter_est) {
+		jitter_estimator_reset(ctx->jitter_est);
+	}
+	ctx->last_frame_time_us = 0;
+
 	// Reset interpolation state (keep buffers allocated for reuse)
 	ctx->interp_has_a = false;
 	ctx->interp_has_b = false;
@@ -614,6 +655,9 @@ static void daydream_filter_destroy(void *data)
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
+
+	// Destroy jitter estimator
+	jitter_estimator_destroy(ctx->jitter_est);
 
 	bfree(ctx->prompt);
 	bfree(ctx->negative_prompt);
@@ -807,21 +851,26 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		}
 
 		if (ctx->jitter_playback_started) {
-			// Smart adaptive playback speed using proportional control
-			// Error = current buffer - target buffer
-			float buffer_error = (float)(ctx->jitter_count - ctx->buffer_target);
+			// Smart adaptive playback speed using non-linear control
+			// More aggressive when buffer is critically low
+			float target_speed;
 
-			// Proportional gain: how aggressively to correct
-			// Positive error (too many frames) -> speed up
-			// Negative error (too few frames) -> slow down
-			float gain = 0.03f; // Base gain factor
-			float target_speed = 1.0f + gain * buffer_error;
-
-			// Clamp to configured min/max
-			if (target_speed < ctx->speed_min)
+			if (ctx->jitter_count == 0) {
+				// Emergency: buffer empty, nearly pause
 				target_speed = ctx->speed_min;
-			if (target_speed > ctx->speed_max)
-				target_speed = ctx->speed_max;
+			} else if (ctx->jitter_count < ctx->buffer_target) {
+				// Below target: slow down proportionally
+				// Map [0, target) to [speed_min, 1.0)
+				float ratio = (float)ctx->jitter_count / (float)ctx->buffer_target;
+				target_speed = ctx->speed_min + ratio * (1.0f - ctx->speed_min);
+			} else {
+				// At or above target: speed up to catch up
+				float excess = (float)(ctx->jitter_count - ctx->buffer_target);
+				float gain = 0.1f; // Aggressive catchup
+				target_speed = 1.0f + gain * excess;
+				if (target_speed > ctx->speed_max)
+					target_speed = ctx->speed_max;
+			}
 
 			// Smooth speed transitions to avoid jerky playback
 			// adapt_speed controls how fast we converge (0.01=slow, 0.5=fast)
