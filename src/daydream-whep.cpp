@@ -26,8 +26,6 @@ struct daydream_whep {
 
 	std::atomic<bool> connected;
 	std::atomic<bool> gathering_done;
-
-	bool waiting_keyframe;
 };
 
 struct http_response {
@@ -175,7 +173,6 @@ struct daydream_whep *daydream_whep_create(const struct daydream_whep_config *co
 	whep->userdata = config->userdata;
 	whep->connected = false;
 	whep->gathering_done = false;
-	whep->waiting_keyframe = true;
 
 	return whep;
 }
@@ -291,11 +288,6 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 				}
 			}
 		}
-
-		if (whep->waiting_keyframe && !has_idr)
-			return;
-		if (has_idr)
-			whep->waiting_keyframe = false;
 
 		frame_count++;
 		uint64_t now = os_gettime_ns();

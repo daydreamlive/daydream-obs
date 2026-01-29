@@ -243,9 +243,3 @@ bool daydream_encoder_encode(struct daydream_encoder *encoder, const uint8_t *bg
 
 	return true;
 }
-
-void daydream_encoder_request_keyframe(struct daydream_encoder *encoder)
-{
-	if (encoder)
-		encoder->request_keyframe = true;
-}

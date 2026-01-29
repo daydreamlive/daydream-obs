@@ -22,26 +22,7 @@
 #define PROP_START "start"
 #define PROP_STOP "stop"
 
-#define FRAME_QUEUE_SIZE 16
 #define RAW_QUEUE_SIZE 32
-#define DEFAULT_FRAME_INTERVAL_NS (1000000000ULL / 20)
-
-typedef enum { JITTER_BUFFERING, JITTER_EMITTING } jitter_state_t;
-
-struct jitter_stats {
-	uint32_t underflow_count;
-	uint32_t overflow_count;
-	uint32_t frames_received;
-	uint32_t frames_played;
-};
-
-struct frame_entry {
-	uint8_t *data;
-	uint32_t width;
-	uint32_t height;
-	uint32_t linesize;
-	uint32_t rtp_timestamp;
-};
 
 struct raw_packet {
 	uint8_t *data;
@@ -60,8 +41,6 @@ struct daydream_filter {
 
 	gs_texrender_t *crop_texrender;
 	gs_stagesurf_t *crop_stagesurface;
-
-	gs_texrender_t *blur_texrender;
 
 	struct daydream_auth *auth;
 
@@ -113,21 +92,8 @@ struct daydream_filter {
 	uint32_t decoded_frame_height;
 	bool decoded_frame_ready;
 
-	struct frame_entry frame_queue[FRAME_QUEUE_SIZE];
-	int queue_head;
-	int queue_tail;
-	int queue_count;
-	uint64_t last_output_time;
-
-	jitter_state_t jitter_state;
-	uint16_t jitter_min_start;
-	uint16_t jitter_max_size;
-	struct jitter_stats jitter_stats;
-
-	uint32_t base_rtp_timestamp;
-	uint64_t base_wall_time;
-	uint64_t playout_delay_ns;
-	bool timestamp_initialized;
+	uint32_t frames_received;
+	uint32_t frames_played;
 
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
@@ -235,44 +201,21 @@ static void *decode_thread_func(void *data)
 			}
 			pthread_mutex_lock(&ctx->mutex);
 
-			ctx->jitter_stats.frames_received++;
+			ctx->frames_received++;
 
-			if (ctx->queue_count >= ctx->jitter_max_size) {
-				ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-				ctx->queue_count--;
-				ctx->jitter_stats.overflow_count++;
-			}
-
-			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_head];
+			// Directly copy decoded frame for immediate display (no jitter buffering)
 			size_t frame_size = decoded.linesize * decoded.height;
-
-			if (!entry->data || entry->width != decoded.width || entry->height != decoded.height) {
-				bfree(entry->data);
-				entry->data = bmalloc(frame_size);
+			if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+			    ctx->decoded_frame_height != decoded.height) {
+				bfree(ctx->decoded_frame);
+				ctx->decoded_frame = bmalloc(frame_size);
 			}
 
-			memcpy(entry->data, decoded.data, frame_size);
-			entry->width = decoded.width;
-			entry->height = decoded.height;
-			entry->linesize = decoded.linesize;
-			entry->rtp_timestamp = rtp_ts;
-
-			ctx->queue_head = (ctx->queue_head + 1) % FRAME_QUEUE_SIZE;
-			ctx->queue_count++;
-
-			if (ctx->jitter_state == JITTER_BUFFERING && ctx->queue_count >= ctx->jitter_min_start) {
-				ctx->jitter_state = JITTER_EMITTING;
-
-				struct frame_entry *first = &ctx->frame_queue[ctx->queue_tail];
-				ctx->base_rtp_timestamp = first->rtp_timestamp;
-				ctx->base_wall_time = os_gettime_ns();
-				ctx->playout_delay_ns = 500000000ULL;
-				ctx->timestamp_initialized = true;
-
-				blog(LOG_INFO,
-				     "[Daydream Jitter] State: BUFFERING -> EMITTING (buffered=%d, delay=500ms)",
-				     ctx->queue_count);
-			}
+			memcpy(ctx->decoded_frame, decoded.data, frame_size);
+			ctx->decoded_frame_width = decoded.width;
+			ctx->decoded_frame_height = decoded.height;
+			ctx->decoded_frame_ready = true;
+			ctx->frames_played++;
 
 			pthread_mutex_unlock(&ctx->mutex);
 		}
@@ -293,14 +236,6 @@ static void on_whep_state(bool connected, const char *error, void *userdata)
 		blog(LOG_INFO, "[Daydream] WHEP connected");
 	} else {
 		blog(LOG_INFO, "[Daydream] WHEP disconnected: %s", error ? error : "");
-	}
-}
-
-static void on_whip_keyframe_request(void *userdata)
-{
-	struct daydream_filter *ctx = userdata;
-	if (ctx && ctx->encoder) {
-		daydream_encoder_request_keyframe(ctx->encoder);
 	}
 }
 
@@ -419,12 +354,6 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_mutex_init(&ctx->raw_mutex, NULL);
 	pthread_cond_init(&ctx->raw_cond, NULL);
 
-	ctx->jitter_state = JITTER_BUFFERING;
-	ctx->jitter_min_start = 10;
-	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
-	ctx->playout_delay_ns = 500000000ULL;
-	ctx->timestamp_initialized = false;
-
 	ctx->auth = daydream_auth_create();
 
 	daydream_filter_update(ctx, settings);
@@ -482,22 +411,9 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	ctx->streaming = false;
 	ctx->stopping = false;
-
-	ctx->queue_head = 0;
-	ctx->queue_tail = 0;
-	ctx->queue_count = 0;
 	ctx->decoded_frame_ready = false;
-
-	ctx->jitter_state = JITTER_BUFFERING;
-	ctx->jitter_min_start = 10;
-	ctx->jitter_max_size = FRAME_QUEUE_SIZE;
-	ctx->last_output_time = 0;
-	memset(&ctx->jitter_stats, 0, sizeof(ctx->jitter_stats));
-
-	ctx->base_rtp_timestamp = 0;
-	ctx->base_wall_time = 0;
-	ctx->playout_delay_ns = 500000000ULL;
-	ctx->timestamp_initialized = false;
+	ctx->frames_received = 0;
+	ctx->frames_played = 0;
 
 	ctx->raw_queue_head = 0;
 	ctx->raw_queue_tail = 0;
@@ -521,8 +437,6 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->crop_texrender);
 	if (ctx->crop_stagesurface)
 		gs_stagesurface_destroy(ctx->crop_stagesurface);
-	if (ctx->blur_texrender)
-		gs_texrender_destroy(ctx->blur_texrender);
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
@@ -535,10 +449,6 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->whep_url);
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
-
-	for (int i = 0; i < FRAME_QUEUE_SIZE; i++) {
-		bfree(ctx->frame_queue[i].data);
-	}
 
 	for (int i = 0; i < RAW_QUEUE_SIZE; i++) {
 		bfree(ctx->raw_queue[i].data);
@@ -687,58 +597,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	static uint64_t last_queue_log = 0;
 	uint64_t now_ns = os_gettime_ns();
 	if (now_ns - last_queue_log > 1000000000ULL) {
-		const char *state_str = ctx->jitter_state == JITTER_BUFFERING ? "BUFF" : "EMIT";
-		blog(LOG_INFO, "[Daydream Jitter] state=%s count=%d rx=%u tx=%u under=%u over=%u", state_str,
-		     ctx->queue_count, ctx->jitter_stats.frames_received, ctx->jitter_stats.frames_played,
-		     ctx->jitter_stats.underflow_count, ctx->jitter_stats.overflow_count);
+		blog(LOG_INFO, "[Daydream] rx=%u tx=%u", ctx->frames_received, ctx->frames_played);
 		last_queue_log = now_ns;
-	}
-
-	if (ctx->jitter_state == JITTER_EMITTING && ctx->timestamp_initialized) {
-		uint64_t now = os_gettime_ns();
-
-		while (ctx->queue_count > 0) {
-			struct frame_entry *entry = &ctx->frame_queue[ctx->queue_tail];
-
-			uint32_t ts_diff = entry->rtp_timestamp - ctx->base_rtp_timestamp;
-			uint64_t scheduled_time = ctx->base_wall_time + ctx->playout_delay_ns +
-						  (uint64_t)ts_diff * 1000000000ULL / 90000ULL;
-
-			int64_t early_ms = (int64_t)(scheduled_time - now) / 1000000;
-			if (early_ms > 50) {
-				break;
-			}
-
-			size_t frame_size = entry->linesize * entry->height;
-			if (!ctx->decoded_frame || ctx->decoded_frame_width != entry->width ||
-			    ctx->decoded_frame_height != entry->height) {
-				bfree(ctx->decoded_frame);
-				ctx->decoded_frame = bmalloc(frame_size);
-			}
-
-			memcpy(ctx->decoded_frame, entry->data, frame_size);
-			ctx->decoded_frame_width = entry->width;
-			ctx->decoded_frame_height = entry->height;
-			ctx->decoded_frame_ready = true;
-
-			ctx->queue_tail = (ctx->queue_tail + 1) % FRAME_QUEUE_SIZE;
-			ctx->queue_count--;
-			ctx->last_output_time = now;
-			ctx->jitter_stats.frames_played++;
-
-			if (ctx->queue_count >= 10) {
-				continue;
-			}
-			break;
-		}
-
-		if (ctx->queue_count == 0) {
-			ctx->jitter_stats.underflow_count++;
-			ctx->jitter_state = JITTER_BUFFERING;
-			ctx->timestamp_initialized = false;
-			blog(LOG_WARNING, "[Daydream Jitter] State: EMITTING -> BUFFERING (underflow #%u)",
-			     ctx->jitter_stats.underflow_count);
-		}
 	}
 
 	uint64_t tex_start = os_gettime_ns();
@@ -956,7 +816,6 @@ static void *start_streaming_thread_func(void *data)
 		.height = STREAM_SIZE,
 		.fps = target_fps,
 		.on_state = on_whip_state,
-		.on_keyframe_request = on_whip_keyframe_request,
 		.userdata = ctx,
 	};
 	ctx->whip = daydream_whip_create(&whip_config);

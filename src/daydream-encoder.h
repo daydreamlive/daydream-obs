@@ -30,8 +30,6 @@ void daydream_encoder_destroy(struct daydream_encoder *encoder);
 bool daydream_encoder_encode(struct daydream_encoder *encoder, const uint8_t *bgra_data, uint32_t linesize,
 			     struct daydream_encoded_frame *out_frame);
 
-void daydream_encoder_request_keyframe(struct daydream_encoder *encoder);
-
 #ifdef __cplusplus
 }
 #endif
