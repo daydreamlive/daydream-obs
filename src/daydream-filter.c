@@ -22,6 +22,10 @@
 #define PROP_START "start"
 #define PROP_STOP "stop"
 #define PROP_SMOOTH_MODE "smooth_mode"
+#define PROP_BUFFER_TARGET "buffer_target"
+#define PROP_ADAPT_SPEED "adapt_speed"
+#define PROP_SPEED_MIN "speed_min"
+#define PROP_SPEED_MAX "speed_max"
 
 #define RAW_QUEUE_SIZE 32
 
@@ -126,7 +130,12 @@ struct daydream_filter {
 	bool jitter_playback_started;
 	pthread_mutex_t jitter_mutex;
 
-	// Adaptive playback rate
+	// Adaptive playback rate control
+	int buffer_target;   // Target buffer level (frames)
+	float adapt_speed;   // How fast to adapt (0.01-0.5)
+	float speed_min;     // Minimum playback speed
+	float speed_max;     // Maximum playback speed
+	float current_speed; // Smoothed current speed
 	uint64_t last_render_time;
 	double accumulated_rtp; // Use double for precision
 
@@ -165,6 +174,12 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->delta = (float)obs_data_get_double(settings, PROP_DELTA);
 	ctx->steps = (int)obs_data_get_int(settings, PROP_STEPS);
 	ctx->smooth_mode = obs_data_get_bool(settings, PROP_SMOOTH_MODE);
+
+	// Adaptive rate control parameters
+	ctx->buffer_target = (int)obs_data_get_int(settings, PROP_BUFFER_TARGET);
+	ctx->adapt_speed = (float)obs_data_get_double(settings, PROP_ADAPT_SPEED);
+	ctx->speed_min = (float)obs_data_get_double(settings, PROP_SPEED_MIN);
+	ctx->speed_max = (float)obs_data_get_double(settings, PROP_SPEED_MAX);
 
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -483,6 +498,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->jitter_tail = 0;
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
+	ctx->current_speed = 1.0f;
 
 	ctx->auth = daydream_auth_create();
 
@@ -556,6 +572,7 @@ static void stop_streaming(struct daydream_filter *ctx)
 	// Reset adaptive playback
 	ctx->last_render_time = 0;
 	ctx->accumulated_rtp = 0;
+	ctx->current_speed = 1.0f;
 
 	// Reset interpolation state (keep buffers allocated for reuse)
 	ctx->interp_has_a = false;
@@ -757,40 +774,50 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 		// Check if we have enough buffered frames to start playback
 		if (!ctx->jitter_playback_started) {
-			if (ctx->jitter_count >= 15) {
+			// Start playback when we have enough frames (use buffer_target as threshold)
+			if (ctx->jitter_count >= ctx->buffer_target) {
 				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
 				ctx->jitter_playback_started = true;
 				ctx->jitter_playback_start_time = now;
 				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
-				blog(LOG_INFO, "[Jitter] Playback started with %d frames", ctx->jitter_count);
+				ctx->current_speed = 1.0f;
+				blog(LOG_INFO, "[Jitter] Playback started with %d frames (target=%d)",
+				     ctx->jitter_count, ctx->buffer_target);
 			}
 		}
 
 		if (ctx->jitter_playback_started) {
-			// Adaptive playback speed based on buffer level
-			// Target: keep buffer around 15 frames
-			float speed = 1.0f;
-			if (ctx->jitter_count < 3) {
-				speed = 0.3f; // Very slow when almost empty
-			} else if (ctx->jitter_count < 8) {
-				speed = 0.6f; // Slow when low
-			} else if (ctx->jitter_count < 15) {
-				speed = 0.9f; // Slightly slow
-			} else if (ctx->jitter_count > 40) {
-				speed = 1.5f; // Speed up when too full
-			} else if (ctx->jitter_count > 25) {
-				speed = 1.2f; // Slightly fast
-			}
+			// Smart adaptive playback speed using proportional control
+			// Error = current buffer - target buffer
+			float buffer_error = (float)(ctx->jitter_count - ctx->buffer_target);
+
+			// Proportional gain: how aggressively to correct
+			// Positive error (too many frames) -> speed up
+			// Negative error (too few frames) -> slow down
+			float gain = 0.03f; // Base gain factor
+			float target_speed = 1.0f + gain * buffer_error;
+
+			// Clamp to configured min/max
+			if (target_speed < ctx->speed_min)
+				target_speed = ctx->speed_min;
+			if (target_speed > ctx->speed_max)
+				target_speed = ctx->speed_max;
+
+			// Smooth speed transitions to avoid jerky playback
+			// adapt_speed controls how fast we converge (0.01=slow, 0.5=fast)
+			ctx->current_speed =
+				ctx->current_speed * (1.0f - ctx->adapt_speed) + target_speed * ctx->adapt_speed;
 
 			// Calculate delta time since last render
 			uint64_t delta_ns = now - ctx->last_render_time;
 			if (ctx->last_render_time == 0) {
-				delta_ns = 0; // First frame
+				delta_ns = 0;              // First frame
+				ctx->current_speed = 1.0f; // Initialize speed
 			}
 			ctx->last_render_time = now;
 
 			// Accumulate RTP ticks with adaptive speed
-			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * 90.0 * speed;
+			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * 90.0 * ctx->current_speed;
 			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
 
 			// Ensure we have frame A (current frame)
@@ -894,8 +921,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 					static int log_counter = 0;
 					if (log_counter++ % 30 == 0) {
-						blog(LOG_INFO, "[Interp] alpha=%.2f, jitter_count=%d, speed=%.1f",
-						     alpha, ctx->jitter_count, speed);
+						blog(LOG_INFO, "[Interp] alpha=%.2f, buf=%d/%d, speed=%.2f", alpha,
+						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed);
 					}
 				} else {
 					// No frame B, just show frame A
@@ -1335,8 +1362,23 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *steps = obs_properties_add_int_slider(props, PROP_STEPS, "Steps", 1, 100, 1);
 	obs_property_set_enabled(steps, logged_in);
 
-	obs_property_t *smooth = obs_properties_add_bool(props, PROP_SMOOTH_MODE, "Smooth Mode (500ms latency)");
+	obs_property_t *smooth = obs_properties_add_bool(props, PROP_SMOOTH_MODE, "Smooth Mode");
 	obs_property_set_enabled(smooth, logged_in);
+
+	// Adaptive rate control parameters
+	obs_property_t *buffer_target =
+		obs_properties_add_int_slider(props, PROP_BUFFER_TARGET, "Buffer Target (frames)", 5, 30, 1);
+	obs_property_set_enabled(buffer_target, logged_in);
+
+	obs_property_t *adapt_speed =
+		obs_properties_add_float_slider(props, PROP_ADAPT_SPEED, "Adapt Speed", 0.01, 0.5, 0.01);
+	obs_property_set_enabled(adapt_speed, logged_in);
+
+	obs_property_t *speed_min = obs_properties_add_float_slider(props, PROP_SPEED_MIN, "Min Speed", 0.1, 1.0, 0.05);
+	obs_property_set_enabled(speed_min, logged_in);
+
+	obs_property_t *speed_max = obs_properties_add_float_slider(props, PROP_SPEED_MAX, "Max Speed", 1.0, 3.0, 0.1);
+	obs_property_set_enabled(speed_max, logged_in);
 
 	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
 	obs_property_set_enabled(start, logged_in && !ctx->streaming);
@@ -1356,6 +1398,12 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_DELTA, 0.7);
 	obs_data_set_default_int(settings, PROP_STEPS, 50);
 	obs_data_set_default_bool(settings, PROP_SMOOTH_MODE, false);
+
+	// Adaptive rate control defaults
+	obs_data_set_default_int(settings, PROP_BUFFER_TARGET, 10);    // Lower than before (was 15)
+	obs_data_set_default_double(settings, PROP_ADAPT_SPEED, 0.15); // Moderate adaptation
+	obs_data_set_default_double(settings, PROP_SPEED_MIN, 0.3);    // Allow significant slowdown
+	obs_data_set_default_double(settings, PROP_SPEED_MAX, 2.0);    // Allow 2x speedup
 }
 
 static struct obs_source_info daydream_filter_info = {
