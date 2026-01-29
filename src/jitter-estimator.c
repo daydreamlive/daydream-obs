@@ -54,7 +54,7 @@ typedef struct {
 #define BUFFER_TARGET_HYSTERESIS 3   // Require 3+ frame difference to change
 #define MIN_BUFFER_TARGET 4          // Never go below 4 frames
 #define MAX_BUFFER_TARGET 20         // Never go above 20 frames (~1s at 20fps)
-#define BUFFER_DECAY_INTERVAL 300    // Decay target every 300 frames (~15s at 20fps)
+#define BUFFER_DECAY_INTERVAL 600    // Decay target every 600 frames (~30s at 20fps)
 #define BUFFER_DECAY_AMOUNT 1        // Decay by 1 frame at a time
 
 struct jitter_estimator {
@@ -595,6 +595,7 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 	jitter_estimator_update(je, frame_delay_ms, frame_size);
 
 	// Buffer target decay: slowly reduce target if stable for a while
+	// Using longer interval (600 frames = ~30s) to avoid aggressive decay
 	je->frames_since_underrun++;
 	if (je->frames_since_underrun >= BUFFER_DECAY_INTERVAL) {
 		je->frames_since_underrun = 0;

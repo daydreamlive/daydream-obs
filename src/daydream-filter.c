@@ -43,7 +43,7 @@ struct jitter_frame {
 	uint32_t height;
 	uint32_t rtp_timestamp;
 	uint64_t receive_time_ns;
-	int pool_index;  // Index into frame pool (-1 if not from pool)
+	int pool_index; // Index into frame pool (-1 if not from pool)
 };
 
 struct daydream_filter {
@@ -196,8 +196,8 @@ static void frame_pool_init(struct daydream_filter *ctx)
 		ctx->frame_pool_used[i] = false;
 	}
 	ctx->frame_pool_initialized = true;
-	blog(LOG_INFO, "[Pool] Initialized %d frame buffers (%d MB total)",
-	     FRAME_POOL_SIZE, (FRAME_POOL_SIZE * MAX_FRAME_SIZE) / (1024 * 1024));
+	blog(LOG_INFO, "[Pool] Initialized %d frame buffers (%d MB total)", FRAME_POOL_SIZE,
+	     (FRAME_POOL_SIZE * MAX_FRAME_SIZE) / (1024 * 1024));
 }
 
 static void frame_pool_destroy(struct daydream_filter *ctx)
@@ -381,7 +381,8 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		} else {
 			// Pool exhausted, fallback to malloc
 			if (!jf->data || jf->size < frame_size) {
-				if (jf->pool_index < 0) bfree(jf->data);
+				if (jf->pool_index < 0)
+					bfree(jf->data);
 				jf->data = bmalloc(frame_size);
 				jf->pool_index = -1;
 			}
@@ -921,36 +922,38 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				jitter_estimator_notify_underrun(ctx->jitter_est);
 				target_speed = ctx->speed_min;
 			} else if (in_gap) {
-				// PROACTIVE: We're in a gap, slow down to conserve buffer
-				// Estimate how much longer the gap might last
-				double expected_gap_ms = (ctx->avg_gap_duration_ms > 0) ? ctx->avg_gap_duration_ms
-											: 250.0; // Default 250ms
-				double remaining_gap_ms = expected_gap_ms - time_since_last_frame_ms;
-				if (remaining_gap_ms < 0)
-					remaining_gap_ms = 0;
-
-				// Calculate how many frames we need to survive the remaining gap
-				double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
-				if (actual_fps < 10.0)
-					actual_fps = 20.0;
-				double frames_needed = (remaining_gap_ms / 1000.0) * actual_fps;
-
-				// If buffer might not last, slow down more aggressively
-				float buffer_margin = (float)ctx->jitter_count / (float)(frames_needed + 1.0);
-				if (buffer_margin < 1.0f) {
-					// Not enough buffer for the gap - slow down proportionally
-					target_speed = ctx->speed_min + buffer_margin * (0.8f - ctx->speed_min);
+				// PROACTIVE: We're in a gap
+				// Only slow down if buffer is below target
+				if (ctx->jitter_count >= ctx->buffer_target) {
+					// Buffer is healthy - keep normal speed
+					target_speed = 1.0f;
 				} else {
-					// Enough buffer, but still slow down a bit to be safe
-					target_speed = 0.8f;
-				}
+					// Buffer below target - slow down to conserve
+					double expected_gap_ms =
+						(ctx->avg_gap_duration_ms > 0) ? ctx->avg_gap_duration_ms : 250.0;
+					double remaining_gap_ms = expected_gap_ms - time_since_last_frame_ms;
+					if (remaining_gap_ms < 0)
+						remaining_gap_ms = 0;
 
-				static int gap_log_counter = 0;
-				if (gap_log_counter++ % 30 == 0) {
-					blog(LOG_INFO,
-					     "[Burst] In gap: %.0fms, remaining~%.0fms, need~%.1f frames, have=%d, speed=%.2f",
-					     time_since_last_frame_ms, remaining_gap_ms, frames_needed,
-					     ctx->jitter_count, target_speed);
+					double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
+					if (actual_fps < 10.0)
+						actual_fps = 20.0;
+					double frames_needed = (remaining_gap_ms / 1000.0) * actual_fps;
+
+					float buffer_margin = (float)ctx->jitter_count / (float)(frames_needed + 1.0);
+					if (buffer_margin < 1.0f) {
+						target_speed = ctx->speed_min + buffer_margin * (0.9f - ctx->speed_min);
+					} else {
+						target_speed = 0.9f;
+					}
+
+					static int gap_log_counter = 0;
+					if (gap_log_counter++ % 30 == 0) {
+						blog(LOG_INFO,
+						     "[Burst] In gap: %.0fms, remaining~%.0fms, need~%.1f frames, have=%d, speed=%.2f",
+						     time_since_last_frame_ms, remaining_gap_ms, frames_needed,
+						     ctx->jitter_count, target_speed);
+					}
 				}
 			} else if (ctx->jitter_count < ctx->buffer_target) {
 				// Below target: slow down proportionally
@@ -966,8 +969,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			}
 
 			// Frame skip for aggressive catch-up when buffer is way too full
-			// Skip threshold: if buffer > 2x target, skip frames to catch up faster
-			int skip_threshold = ctx->buffer_target * 2;
+			// Skip threshold: if buffer > 3x target, skip frames to catch up faster
+			int skip_threshold = ctx->buffer_target * 3;
 			if (ctx->jitter_count > skip_threshold) {
 				int frames_to_skip = ctx->jitter_count - ctx->buffer_target;
 				// Don't skip too many at once (max 50% of excess)
@@ -1013,8 +1016,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			}
 			double delta_s = (double)delta_ns / 1e9;
 
-			// Max speed change: 0.5 per second (smoother than instant)
-			float max_speed_change = 0.5f * (float)delta_s;
+			// Max speed change: 1.0 per second (faster response to burst patterns)
+			float max_speed_change = 1.0f * (float)delta_s;
 			float speed_diff = target_speed - ctx->current_speed;
 			if (speed_diff > max_speed_change)
 				speed_diff = max_speed_change;
