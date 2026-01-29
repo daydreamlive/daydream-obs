@@ -331,17 +331,12 @@ static void *decode_thread_func(void *data)
 				// Smooth mode: add to jitter buffer
 				pthread_mutex_lock(&ctx->jitter_mutex);
 
-				// Update jitter estimator
+				// Update jitter estimator with RTP timestamp (more accurate IFDV calculation)
 				if (ctx->jitter_est) {
 					uint64_t now_us = receive_time_ns / 1000;
-					double frame_delay_ms = 0.0;
-					if (ctx->last_frame_time_us > 0) {
-						frame_delay_ms = (double)(now_us - ctx->last_frame_time_us) / 1000.0;
-						// Subtract expected frame interval (~33ms for 30fps)
-						frame_delay_ms -= 33.0;
-					}
-					ctx->last_frame_time_us = now_us;
-					jitter_estimator_update(ctx->jitter_est, frame_delay_ms, raw_size);
+					// Use RTP-based update for proper inter-frame delay variation
+					// This accounts for actual frame timing from the source
+					jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, raw_size);
 
 					// Auto-adjust buffer target based on jitter estimate
 					double fps = jitter_estimator_get_fps(ctx->jitter_est);
@@ -350,8 +345,9 @@ static void *decode_thread_func(void *data)
 							jitter_estimator_get_buffer_target(ctx->jitter_est, fps);
 						if (new_target != ctx->buffer_target) {
 							blog(LOG_INFO,
-							     "[Jitter Est] New buffer target: %d (jitter=%.1fms, fps=%.1f)",
-							     new_target, jitter_estimator_get_ms(ctx->jitter_est), fps);
+							     "[Jitter Est] Buffer target: %d->%d (jitter=%.1fms, fps=%.1f)",
+							     ctx->buffer_target, new_target,
+							     jitter_estimator_get_ms(ctx->jitter_est), fps);
 							ctx->buffer_target = new_target;
 						}
 					}

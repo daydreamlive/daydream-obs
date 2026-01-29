@@ -25,10 +25,17 @@ void jitter_estimator_destroy(jitter_estimator_t *je);
 // Reset to initial state
 void jitter_estimator_reset(jitter_estimator_t *je);
 
-// Update with new frame measurement
+// Update with new frame measurement (simple version)
 // frame_delay_ms: delay since last frame (can be negative for early frames)
 // frame_size: size of current frame in bytes
 void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size_t frame_size);
+
+// Update with RTP timestamp (more accurate - uses inter-frame delay variation)
+// rtp_timestamp: RTP timestamp of current frame (90kHz clock)
+// receive_time_us: local receive time in microseconds
+// frame_size: size of current frame in bytes
+void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp, uint64_t receive_time_us,
+				 size_t frame_size);
 
 // Get current jitter estimate in milliseconds
 double jitter_estimator_get_ms(jitter_estimator_t *je);

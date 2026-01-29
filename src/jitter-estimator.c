@@ -4,6 +4,7 @@
  */
 
 #include "jitter-estimator.h"
+#include <obs-module.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -43,6 +44,11 @@ typedef struct {
 	double covariance;    // Covariance between slope and intercept
 } kalman_state_t;
 
+// CUSUM detection constants (from Chrome WebRTC timestamp_extrapolator.cc)
+#define CUSUM_ALARM_THRESHOLD 60000  // ~666ms in RTP ticks (90kHz)
+#define CUSUM_ACC_DRIFT 6600         // ~73ms acceptable drift per frame
+#define CUSUM_ACC_MAX_ERROR 7000     // ~77ms max single error
+
 struct jitter_estimator {
 	// Kalman filter
 	kalman_state_t kalman;
@@ -69,6 +75,16 @@ struct jitter_estimator {
 	int fps_index;
 	int fps_count;
 	uint64_t last_update_time_us;
+
+	// Inter-frame delay variation (IFDV) tracking
+	uint32_t prev_rtp_timestamp;
+	uint64_t prev_receive_time_us;
+	bool has_prev_rtp;
+
+	// CUSUM delay change detection
+	double cusum_pos;
+	double cusum_neg;
+	int cusum_alarm_count;
 };
 
 static uint64_t get_time_us(void)
@@ -185,6 +201,16 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->fps_index = 0;
 	je->fps_count = 0;
 	je->last_update_time_us = 0;
+
+	// Reset IFDV tracking
+	je->prev_rtp_timestamp = 0;
+	je->prev_receive_time_us = 0;
+	je->has_prev_rtp = false;
+
+	// Reset CUSUM detection
+	je->cusum_pos = 0.0;
+	je->cusum_neg = 0.0;
+	je->cusum_alarm_count = 0;
 }
 
 void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size_t frame_size)
@@ -364,4 +390,96 @@ double jitter_estimator_get_fps(jitter_estimator_t *je)
 	if (avg_ms <= 0)
 		return 0.0;
 	return 1000.0 / avg_ms;
+}
+
+// CUSUM detection for sudden delay changes (from Chrome WebRTC)
+// Returns true if a significant delay change is detected
+static bool cusum_delay_change_detection(jitter_estimator_t *je, double residual_ms)
+{
+	// Convert to RTP ticks for comparison with Chrome constants
+	double residual_ticks = residual_ms * 90.0;
+
+	// Clamp residual
+	double clamped = residual_ticks;
+	if (clamped > CUSUM_ACC_MAX_ERROR)
+		clamped = CUSUM_ACC_MAX_ERROR;
+	if (clamped < -CUSUM_ACC_MAX_ERROR)
+		clamped = -CUSUM_ACC_MAX_ERROR;
+
+	// Update CUSUM accumulators
+	je->cusum_pos = fmax(je->cusum_pos + clamped - CUSUM_ACC_DRIFT, 0.0);
+	je->cusum_neg = fmin(je->cusum_neg + clamped + CUSUM_ACC_DRIFT, 0.0);
+
+	// Check for alarm
+	if (je->cusum_pos > CUSUM_ALARM_THRESHOLD || je->cusum_neg < -CUSUM_ALARM_THRESHOLD) {
+		// Reset accumulators
+		double old_pos = je->cusum_pos;
+		double old_neg = je->cusum_neg;
+		je->cusum_pos = 0.0;
+		je->cusum_neg = 0.0;
+		je->cusum_alarm_count++;
+		blog(LOG_INFO, "[CUSUM] Delay change detected #%d (pos=%.0f, neg=%.0f, residual=%.1fms)",
+		     je->cusum_alarm_count, old_pos, old_neg, residual_ms);
+		return true;
+	}
+
+	return false;
+}
+
+void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp, uint64_t receive_time_us,
+				 size_t frame_size)
+{
+	if (!je || frame_size == 0)
+		return;
+
+	// Update FPS tracking using wall clock
+	if (je->last_update_time_us > 0) {
+		double delta_ms = (double)(receive_time_us - je->last_update_time_us) / 1000.0;
+		je->frame_times[je->fps_index] = delta_ms;
+		je->fps_index = (je->fps_index + 1) % FPS_WINDOW;
+		if (je->fps_count < FPS_WINDOW)
+			je->fps_count++;
+	}
+	je->last_update_time_us = receive_time_us;
+
+	// Calculate Inter-Frame Delay Variation (IFDV)
+	// IFDV = (wall_clock_delta) - (rtp_timestamp_delta / 90000)
+	// This is the key difference from simple wall clock delay
+	double frame_delay_ms = 0.0;
+
+	if (je->has_prev_rtp) {
+		// Wall clock delta in ms
+		double wall_delta_ms = (double)(receive_time_us - je->prev_receive_time_us) / 1000.0;
+
+		// RTP timestamp delta (handle wraparound)
+		int32_t rtp_delta = (int32_t)(rtp_timestamp - je->prev_rtp_timestamp);
+		double rtp_delta_ms = (double)rtp_delta / 90.0; // 90kHz clock
+
+		// IFDV: how much later/earlier than expected
+		frame_delay_ms = wall_delta_ms - rtp_delta_ms;
+	}
+
+	je->prev_rtp_timestamp = rtp_timestamp;
+	je->prev_receive_time_us = receive_time_us;
+	je->has_prev_rtp = true;
+
+	// Log IFDV periodically for debugging (every 30 frames)
+	static int ifdv_log_counter = 0;
+	if (je->has_prev_rtp && ifdv_log_counter++ % 30 == 0) {
+		blog(LOG_INFO, "[IFDV] delay_variation=%.1fms", frame_delay_ms);
+	}
+
+	// CUSUM detection for persistent delay changes
+	bool delay_change_detected = cusum_delay_change_detection(je, frame_delay_ms);
+
+	if (delay_change_detected) {
+		// Persistent delay change detected - soft reset the Kalman filter
+		// This allows faster adaptation to new network conditions
+		je->kalman.intercept_var = 1e10; // Increase uncertainty
+		je->alpha_count = 1;             // Reset noise filter
+		blog(LOG_INFO, "[IFDV] Kalman filter reset due to CUSUM alarm");
+	}
+
+	// Now call the regular update with the computed IFDV
+	jitter_estimator_update(je, frame_delay_ms, frame_size);
 }
