@@ -462,6 +462,21 @@ static void *encode_thread_func(void *data)
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
 				ctx->frame_count++;
+
+				// Debug: log WHIP send rate
+				static uint64_t last_whip_send_time = 0;
+				static uint64_t whip_send_count = 0;
+				uint64_t now_send = os_gettime_ns();
+				uint64_t send_gap_ms =
+					(last_whip_send_time > 0) ? (now_send - last_whip_send_time) / 1000000 : 0;
+				whip_send_count++;
+
+				if (send_gap_ms > 50 || whip_send_count % 30 == 0) {
+					blog(LOG_INFO, "[DEBUG WHIP Send] #%llu, gap=%llums, size=%zu, keyframe=%s",
+					     (unsigned long long)whip_send_count, (unsigned long long)send_gap_ms,
+					     encoded.size, encoded.is_keyframe ? "YES" : "no");
+				}
+				last_whip_send_time = now_send;
 			}
 		}
 
@@ -774,13 +789,18 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 		// Check if we have enough buffered frames to start playback
 		if (!ctx->jitter_playback_started) {
-			// Start playback when we have enough frames (use buffer_target as threshold)
-			if (ctx->jitter_count >= ctx->buffer_target) {
+			// Start playback early (at half of target) for lower latency
+			// Adaptive rate control will handle the low buffer
+			int start_threshold = ctx->buffer_target / 2;
+			if (start_threshold < 3)
+				start_threshold = 3;
+
+			if (ctx->jitter_count >= start_threshold) {
 				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
 				ctx->jitter_playback_started = true;
 				ctx->jitter_playback_start_time = now;
 				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
-				ctx->current_speed = 1.0f;
+				ctx->current_speed = 0.7f; // Start slow to let buffer build
 				blog(LOG_INFO, "[Jitter] Playback started with %d frames (target=%d)",
 				     ctx->jitter_count, ctx->buffer_target);
 			}
@@ -1399,11 +1419,11 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, PROP_STEPS, 50);
 	obs_data_set_default_bool(settings, PROP_SMOOTH_MODE, false);
 
-	// Adaptive rate control defaults
-	obs_data_set_default_int(settings, PROP_BUFFER_TARGET, 10);    // Lower than before (was 15)
-	obs_data_set_default_double(settings, PROP_ADAPT_SPEED, 0.15); // Moderate adaptation
-	obs_data_set_default_double(settings, PROP_SPEED_MIN, 0.3);    // Allow significant slowdown
-	obs_data_set_default_double(settings, PROP_SPEED_MAX, 2.0);    // Allow 2x speedup
+	// Adaptive rate control defaults - tuned for ultra low latency
+	obs_data_set_default_int(settings, PROP_BUFFER_TARGET, 4);    // Ultra low latency (~200ms)
+	obs_data_set_default_double(settings, PROP_ADAPT_SPEED, 0.3); // Very fast adaptation
+	obs_data_set_default_double(settings, PROP_SPEED_MIN, 0.1);   // Can almost pause
+	obs_data_set_default_double(settings, PROP_SPEED_MAX, 3.0);   // Very fast catchup
 }
 
 static struct obs_source_info daydream_filter_info = {
