@@ -282,8 +282,6 @@ static void *encode_thread_func(void *data)
 			continue;
 		}
 
-		uint32_t frame_width = ctx->pending_frame_width;
-		uint32_t frame_height = ctx->pending_frame_height;
 		uint8_t *frame_copy = bmalloc(ctx->pending_frame_linesize * ctx->pending_frame_height);
 		memcpy(frame_copy, ctx->pending_frame, ctx->pending_frame_linesize * ctx->pending_frame_height);
 		uint32_t frame_linesize = ctx->pending_frame_linesize;
