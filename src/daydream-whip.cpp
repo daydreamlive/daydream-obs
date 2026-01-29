@@ -251,6 +251,12 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 
 	whip->track = whip->pc->addTrack(videoMedia);
 
+	// Add dummy audio track - gateway expects both video and audio for faster connection
+	rtc::Description::Audio audioMedia("audio", rtc::Description::Direction::SendOnly);
+	audioMedia.addOpusCodec(111);
+	audioMedia.addSSRC(whip->ssrc + 1, "daydream-audio");
+	(void)whip->pc->addTrack(audioMedia);
+
 	whip->rtpConfig = std::make_shared<rtc::RtpPacketizationConfig>(whip->ssrc, "daydream", 96,
 									rtc::H264RtpPacketizer::defaultClockRate);
 

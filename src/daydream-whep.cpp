@@ -258,6 +258,11 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 
 	whep->track = whep->pc->addTrack(media);
 
+	// Add dummy audio track - gateway expects both video and audio for faster connection
+	rtc::Description::Audio audioMedia("audio", rtc::Description::Direction::RecvOnly);
+	audioMedia.addOpusCodec(111);
+	(void)whep->pc->addTrack(audioMedia);
+
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
 	whep->track->setMediaHandler(depacketizer);
 
