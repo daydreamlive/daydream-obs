@@ -157,10 +157,10 @@ struct daydream_filter {
 	uint8_t *interp_frame_out; // Blended output frame
 	uint32_t interp_width;
 	uint32_t interp_height;
-	uint32_t interp_rtp_a;        // PTS of frame A
-	uint32_t interp_rtp_b;        // PTS of frame B
-	uint64_t interp_receive_a;    // Receive time of frame A (for latency tracking)
-	uint64_t interp_receive_b;    // Receive time of frame B
+	uint32_t interp_rtp_a;     // PTS of frame A
+	uint32_t interp_rtp_b;     // PTS of frame B
+	uint64_t interp_receive_a; // Receive time of frame A (for latency tracking)
+	uint64_t interp_receive_b; // Receive time of frame B
 	bool interp_has_a;
 	bool interp_has_b;
 };
@@ -299,6 +299,13 @@ static void *decode_thread_func(void *data)
 		uint64_t receive_time_ns = pkt->receive_time_ns;
 		memcpy(raw_data, pkt->data, raw_size);
 
+		// Measure queue wait time
+		uint64_t queue_wait_ms = (os_gettime_ns() - receive_time_ns) / 1000000;
+		if (queue_wait_ms > 50) {
+			blog(LOG_INFO, "[Queue] Wait time: %llums, queue_depth=%d", (unsigned long long)queue_wait_ms,
+			     ctx->raw_queue_count);
+		}
+
 		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
 		ctx->raw_queue_count--;
 
@@ -344,8 +351,8 @@ static void *decode_thread_func(void *data)
 			uint64_t elapsed_ms = (now_ns - ctx->fps_measure_start) / 1000000;
 			if (elapsed_ms >= 5000) { // Report every 5 seconds
 				double actual_fps = (double)ctx->fps_frame_count * 1000.0 / (double)elapsed_ms;
-				blog(LOG_INFO, "[FPS] Server output: %.1f fps (%d frames in %llums)",
-				     actual_fps, ctx->fps_frame_count, (unsigned long long)elapsed_ms);
+				blog(LOG_INFO, "[FPS] Server output: %.1f fps (%d frames in %llums)", actual_fps,
+				     ctx->fps_frame_count, (unsigned long long)elapsed_ms);
 				ctx->fps_measure_start = now_ns;
 				ctx->fps_frame_count = 0;
 			}
@@ -960,6 +967,14 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				ctx->interp_receive_b = jf->receive_time_ns;
 				ctx->interp_has_b = true;
 
+				// Log RTP timestamp gap to understand server's timing
+				int32_t rtp_gap = (int32_t)(ctx->interp_rtp_b - ctx->interp_rtp_a);
+				double rtp_gap_ms = (double)rtp_gap / 90.0; // 90kHz clock
+				static int rtp_log_counter = 0;
+				if (rtp_log_counter++ % 30 == 0) {
+					blog(LOG_INFO, "[RTP] Frame gap: %.1fms (rtp_ticks=%d)", rtp_gap_ms, rtp_gap);
+				}
+
 				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
 				ctx->jitter_count--;
 			}
@@ -1027,8 +1042,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					if (log_counter++ % 30 == 0) {
 						// Calculate actual frame latency: time since frame A was received
 						uint64_t frame_age_ms = (now - ctx->interp_receive_a) / 1000000;
-						blog(LOG_INFO,
-						     "[Smooth] buf=%d/%d, speed=%.2f, frame_latency=%llums",
+						blog(LOG_INFO, "[Smooth] buf=%d/%d, speed=%.2f, frame_latency=%llums",
 						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed,
 						     (unsigned long long)frame_age_ms);
 					}
