@@ -126,6 +126,10 @@ struct daydream_filter {
 	bool jitter_playback_started;
 	pthread_mutex_t jitter_mutex;
 
+	// Adaptive playback rate
+	uint64_t last_render_time;
+	double accumulated_rtp; // Use double for precision
+
 	// Frame interpolation
 	uint8_t *interp_frame_a;   // Previous frame for interpolation
 	uint8_t *interp_frame_b;   // Next frame for interpolation
@@ -549,6 +553,10 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
 
+	// Reset adaptive playback
+	ctx->last_render_time = 0;
+	ctx->accumulated_rtp = 0;
+
 	// Reset interpolation state (keep buffers allocated for reuse)
 	ctx->interp_has_a = false;
 	ctx->interp_has_b = false;
@@ -759,10 +767,31 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		}
 
 		if (ctx->jitter_playback_started) {
-			// Calculate current playback PTS
-			uint64_t elapsed_ns = now - ctx->jitter_playback_start_time;
-			uint32_t elapsed_rtp = (uint32_t)((elapsed_ns / 1000000) * 90); // ms to 90kHz
-			uint32_t current_rtp = ctx->jitter_playback_start_rtp + elapsed_rtp;
+			// Adaptive playback speed based on buffer level
+			// Target: keep buffer around 15 frames
+			float speed = 1.0f;
+			if (ctx->jitter_count < 3) {
+				speed = 0.3f; // Very slow when almost empty
+			} else if (ctx->jitter_count < 8) {
+				speed = 0.6f; // Slow when low
+			} else if (ctx->jitter_count < 15) {
+				speed = 0.9f; // Slightly slow
+			} else if (ctx->jitter_count > 40) {
+				speed = 1.5f; // Speed up when too full
+			} else if (ctx->jitter_count > 25) {
+				speed = 1.2f; // Slightly fast
+			}
+
+			// Calculate delta time since last render
+			uint64_t delta_ns = now - ctx->last_render_time;
+			if (ctx->last_render_time == 0) {
+				delta_ns = 0; // First frame
+			}
+			ctx->last_render_time = now;
+
+			// Accumulate RTP ticks with adaptive speed
+			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * 90.0 * speed;
+			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
 
 			// Ensure we have frame A (current frame)
 			if (!ctx->interp_has_a && ctx->jitter_count > 0) {
@@ -865,8 +894,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 					static int log_counter = 0;
 					if (log_counter++ % 30 == 0) {
-						blog(LOG_INFO, "[Interp] alpha=%.2f, jitter_count=%d", alpha,
-						     ctx->jitter_count);
+						blog(LOG_INFO, "[Interp] alpha=%.2f, jitter_count=%d, speed=%.1f",
+						     alpha, ctx->jitter_count, speed);
 					}
 				} else {
 					// No frame B, just show frame A
