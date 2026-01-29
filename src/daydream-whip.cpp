@@ -293,8 +293,6 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 		return false;
 	}
 
-	whip->startTime = os_gettime_ns() / 1000;
-
 	return true;
 }
 
@@ -342,32 +340,9 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 		return false;
 
 	try {
-		static uint64_t total_sent = 0;
-		static uint64_t last_log_time = 0;
-		total_sent++;
-
-		if (total_sent <= 3) {
-			char hex[64];
-			int hex_len = 0;
-			for (size_t i = 0; i < size && i < 20; i++) {
-				hex_len += snprintf(hex + hex_len, sizeof(hex) - hex_len, "%02x ", h264_data[i]);
-			}
-			blog(LOG_INFO, "[Daydream WHIP] Frame #%llu: size=%zu, first bytes: %s",
-			     (unsigned long long)total_sent, size, hex);
-		}
-
 		uint32_t rtp_timestamp = static_cast<uint32_t>((timestamp_ms * 90ULL) % UINT32_MAX);
 		whip->rtpConfig->timestamp = rtp_timestamp;
-
 		whip->track->send(reinterpret_cast<const std::byte *>(h264_data), size);
-
-		uint64_t now = os_gettime_ns();
-		if (now - last_log_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHIP] Sent frame %zu bytes, ts=%u, total=%llu", size, rtp_timestamp,
-			     (unsigned long long)total_sent);
-			last_log_time = now;
-		}
-
 		return true;
 	} catch (const std::exception &e) {
 		blog(LOG_ERROR, "[Daydream WHIP] Failed to send frame: %s", e.what());

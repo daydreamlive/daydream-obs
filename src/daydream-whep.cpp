@@ -259,54 +259,17 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	whep->track = whep->pc->addTrack(media);
 
 	auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>();
-	depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
 	whep->track->setMediaHandler(depacketizer);
 
 	whep->track->onFrame([whep](rtc::binary data, rtc::FrameInfo info) {
-		static uint64_t frame_count = 0;
-		static uint64_t last_log_time = 0;
-		static uint64_t last_frame_time = 0;
-
 		int size = static_cast<int>(data.size());
 		if (size <= 4)
 			return;
 
 		const uint8_t *frame_data = reinterpret_cast<const uint8_t *>(data.data());
 
-		bool has_idr = false;
-		int scan_limit = size < 256 ? size : 256;
-		for (int i = 0; i + 4 < scan_limit; i++) {
-			if (frame_data[i] == 0 && frame_data[i + 1] == 0 && frame_data[i + 2] == 0 &&
-			    frame_data[i + 3] == 1) {
-				uint8_t nal_type = frame_data[i + 4] & 0x1F;
-				if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
-					has_idr = true;
-					break;
-				}
-				if (nal_type == 1) {
-					break;
-				}
-			}
-		}
-
-		frame_count++;
-		uint64_t now = os_gettime_ns();
-		uint64_t delta_ms = last_frame_time > 0 ? (now - last_frame_time) / 1000000 : 0;
-		last_frame_time = now;
-
-		if (delta_ms > 200) {
-			blog(LOG_WARNING, "[Daydream WHEP] Long gap: %llums between frames",
-			     (unsigned long long)delta_ms);
-		}
-
-		if (now - last_log_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream WHEP] Received %llu frames, last delta=%llums, size=%d",
-			     (unsigned long long)frame_count, (unsigned long long)delta_ms, size);
-			last_log_time = now;
-		}
-
 		if (whep->on_frame)
-			whep->on_frame(frame_data, size, info.timestamp, has_idr, whep->userdata);
+			whep->on_frame(frame_data, size, info.timestamp, false, whep->userdata);
 	});
 
 	whep->pc->setLocalDescription();

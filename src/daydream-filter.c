@@ -91,9 +91,6 @@ struct daydream_filter {
 	uint32_t decoded_frame_height;
 	bool decoded_frame_ready;
 
-	uint32_t frames_received;
-	uint32_t frames_played;
-
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
 
@@ -199,8 +196,6 @@ static void *decode_thread_func(void *data)
 			}
 			pthread_mutex_lock(&ctx->mutex);
 
-			ctx->frames_received++;
-
 			// Directly copy decoded frame for immediate display (no jitter buffering)
 			size_t frame_size = decoded.linesize * decoded.height;
 			if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
@@ -213,7 +208,6 @@ static void *decode_thread_func(void *data)
 			ctx->decoded_frame_width = decoded.width;
 			ctx->decoded_frame_height = decoded.height;
 			ctx->decoded_frame_ready = true;
-			ctx->frames_played++;
 
 			pthread_mutex_unlock(&ctx->mutex);
 		}
@@ -270,10 +264,6 @@ static void *encode_thread_func(void *data)
 	struct daydream_filter *ctx = data;
 
 	uint64_t frame_interval_ns = 1000000000ULL / ctx->target_fps;
-	uint64_t last_debug_time = 0;
-	uint64_t frames_sent = 0;
-
-	blog(LOG_INFO, "[Daydream Encode] Thread started, target_fps=%u", ctx->target_fps);
 
 	while (ctx->encode_thread_running) {
 		pthread_mutex_lock(&ctx->mutex);
@@ -312,28 +302,18 @@ static void *encode_thread_func(void *data)
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
 				ctx->frame_count++;
-				frames_sent++;
 			}
-		}
-
-		uint64_t now = os_gettime_ns();
-		if (now - last_debug_time > 1000000000ULL) {
-			blog(LOG_INFO, "[Daydream Encode] frame=%dx%d encoder=%d whip=%d connected=%d sent=%llu",
-			     frame_width, frame_height, has_encoder, has_whip, whip_connected,
-			     (unsigned long long)frames_sent);
-			last_debug_time = now;
 		}
 
 		bfree(frame_copy);
 
+		uint64_t now = os_gettime_ns();
 		uint64_t elapsed = now - ctx->last_encode_time;
 		if (elapsed < frame_interval_ns) {
 			os_sleepto_ns(ctx->last_encode_time + frame_interval_ns);
 		}
 		ctx->last_encode_time = os_gettime_ns();
 	}
-
-	blog(LOG_INFO, "[Daydream Encode] Thread stopped, total frames sent: %llu", (unsigned long long)frames_sent);
 
 	return NULL;
 }
@@ -410,8 +390,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->streaming = false;
 	ctx->stopping = false;
 	ctx->decoded_frame_ready = false;
-	ctx->frames_received = 0;
-	ctx->frames_played = 0;
 
 	ctx->raw_queue_head = 0;
 	ctx->raw_queue_tail = 0;
@@ -592,14 +570,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	static uint64_t last_queue_log = 0;
-	uint64_t now_ns = os_gettime_ns();
-	if (now_ns - last_queue_log > 1000000000ULL) {
-		blog(LOG_INFO, "[Daydream] rx=%u tx=%u", ctx->frames_received, ctx->frames_played);
-		last_queue_log = now_ns;
-	}
-
-	uint64_t tex_start = os_gettime_ns();
 	if (ctx->decoded_frame_ready && ctx->decoded_frame) {
 		if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
 		    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
@@ -616,13 +586,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		}
 	}
 	pthread_mutex_unlock(&ctx->mutex);
-
-	uint64_t tex_time = (os_gettime_ns() - tex_start) / 1000000;
-	static uint64_t last_tex_warn = 0;
-	if (tex_time > 10 && os_gettime_ns() - last_tex_warn > 500000000ULL) {
-		blog(LOG_WARNING, "[Daydream Render] Slow texture upload: %llums", (unsigned long long)tex_time);
-		last_tex_warn = os_gettime_ns();
-	}
 
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
