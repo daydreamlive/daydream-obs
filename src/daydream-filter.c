@@ -63,10 +63,13 @@ struct daydream_filter {
 	pthread_t start_thread;
 	bool start_thread_running;
 
-	uint8_t *pending_frame;
+	// Double buffer for zero-copy encode
+	uint8_t *pending_frame[2];
 	uint32_t pending_frame_width;
 	uint32_t pending_frame_height;
 	uint32_t pending_frame_linesize;
+	int pending_produce_idx; // Buffer index with ready data
+	int pending_consume_idx; // Buffer index encode is reading (-1 if idle)
 	bool pending_frame_ready;
 
 	uint8_t *decoded_frame;
@@ -217,8 +220,9 @@ static void *encode_thread_func(void *data)
 			continue;
 		}
 
-		uint8_t *frame_copy = bmalloc(ctx->pending_frame_linesize * ctx->pending_frame_height);
-		memcpy(frame_copy, ctx->pending_frame, ctx->pending_frame_linesize * ctx->pending_frame_height);
+		// Take ownership of the buffer - no copy needed!
+		ctx->pending_consume_idx = ctx->pending_produce_idx;
+		uint8_t *frame_data = ctx->pending_frame[ctx->pending_consume_idx];
 		uint32_t frame_linesize = ctx->pending_frame_linesize;
 		ctx->pending_frame_ready = false;
 
@@ -226,7 +230,7 @@ static void *encode_thread_func(void *data)
 
 		if (ctx->encoder && ctx->whip && daydream_whip_is_connected(ctx->whip)) {
 			struct daydream_encoded_frame encoded;
-			if (daydream_encoder_encode(ctx->encoder, frame_copy, frame_linesize, &encoded)) {
+			if (daydream_encoder_encode(ctx->encoder, frame_data, frame_linesize, &encoded)) {
 				uint32_t timestamp_ms = (uint32_t)(ctx->frame_count * 1000 / ctx->target_fps);
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
@@ -234,7 +238,10 @@ static void *encode_thread_func(void *data)
 			}
 		}
 
-		bfree(frame_copy);
+		// Release buffer ownership
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->pending_consume_idx = -1;
+		pthread_mutex_unlock(&ctx->mutex);
 
 		uint64_t now = os_gettime_ns();
 		uint64_t elapsed = now - ctx->last_encode_time;
@@ -255,6 +262,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->stopping = false;
 	ctx->target_fps = 30;
 	ctx->frame_count = 0;
+	ctx->pending_consume_idx = -1;
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
@@ -347,7 +355,8 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->stream_id);
 	bfree(ctx->whip_url);
 	bfree(ctx->whep_url);
-	bfree(ctx->pending_frame);
+	bfree(ctx->pending_frame[0]);
+	bfree(ctx->pending_frame[1]);
 	bfree(ctx->decoded_frame);
 	bfree(ctx->nv12_y_data);
 	bfree(ctx->nv12_uv_data);
@@ -459,16 +468,24 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				pthread_mutex_lock(&ctx->mutex);
 
 				size_t data_size = STREAM_SIZE * video_linesize;
-				if (!ctx->pending_frame || ctx->pending_frame_width != STREAM_SIZE ||
+
+				// Allocate double buffers if needed
+				if (!ctx->pending_frame[0] || ctx->pending_frame_width != STREAM_SIZE ||
 				    ctx->pending_frame_height != STREAM_SIZE) {
-					bfree(ctx->pending_frame);
-					ctx->pending_frame = bmalloc(data_size);
+					bfree(ctx->pending_frame[0]);
+					bfree(ctx->pending_frame[1]);
+					ctx->pending_frame[0] = bmalloc(data_size);
+					ctx->pending_frame[1] = bmalloc(data_size);
 					ctx->pending_frame_width = STREAM_SIZE;
 					ctx->pending_frame_height = STREAM_SIZE;
+					ctx->pending_consume_idx = -1;
 				}
 
-				memcpy(ctx->pending_frame, video_data, data_size);
+				// Write to buffer that encode isn't reading
+				int write_idx = (ctx->pending_consume_idx == 0) ? 1 : 0;
+				memcpy(ctx->pending_frame[write_idx], video_data, data_size);
 				ctx->pending_frame_linesize = video_linesize;
+				ctx->pending_produce_idx = write_idx;
 				ctx->pending_frame_ready = true;
 				pthread_cond_signal(&ctx->frame_cond);
 
