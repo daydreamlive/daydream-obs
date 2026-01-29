@@ -22,13 +22,7 @@ struct daydream_decoder {
 	uint32_t width;
 	uint32_t height;
 
-	// NV12 output buffers
-	uint8_t *y_buffer;
-	uint8_t *uv_buffer;
-	size_t y_buffer_size;
-	size_t uv_buffer_size;
-
-	// BGRA output buffer (for SW fallback)
+	// BGRA output buffer (for SW fallback only - sws_scale needs output buffer)
 	uint8_t *output_buffer;
 	size_t output_buffer_size;
 	uint32_t output_linesize;
@@ -185,10 +179,6 @@ void daydream_decoder_destroy(struct daydream_decoder *decoder)
 		avcodec_free_context(&decoder->codec_ctx);
 	if (decoder->output_buffer)
 		bfree(decoder->output_buffer);
-	if (decoder->y_buffer)
-		bfree(decoder->y_buffer);
-	if (decoder->uv_buffer)
-		bfree(decoder->uv_buffer);
 
 	bfree(decoder);
 }
@@ -313,31 +303,15 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 
 	if (is_nv12) {
 		// GPU path: output NV12 directly for GPU color conversion
+		// Return direct pointers to AVFrame data - no copy needed!
+		// Caller must copy before next decode call (which filter does)
 		decoder->output_nv12 = true;
-
-		// Reallocate buffers if size changed
-		size_t y_size = src_frame->linesize[0] * frame_height;
-		size_t uv_size = src_frame->linesize[1] * (frame_height / 2);
-
-		if (decoder->width != frame_width || decoder->height != frame_height) {
-			decoder->width = frame_width;
-			decoder->height = frame_height;
-			decoder->y_buffer = brealloc(decoder->y_buffer, y_size);
-			decoder->uv_buffer = brealloc(decoder->uv_buffer, uv_size);
-			decoder->y_buffer_size = y_size;
-			decoder->uv_buffer_size = uv_size;
-			blog(LOG_INFO, "[Daydream Decoder] NV12 output: %dx%d, Y=%zu bytes, UV=%zu bytes", frame_width,
-			     frame_height, y_size, uv_size);
-		}
-
-		// Copy Y plane
-		memcpy(decoder->y_buffer, src_frame->data[0], y_size);
-		// Copy UV plane
-		memcpy(decoder->uv_buffer, src_frame->data[1], uv_size);
+		decoder->width = frame_width;
+		decoder->height = frame_height;
 
 		out_frame->is_nv12 = true;
-		out_frame->y_data = decoder->y_buffer;
-		out_frame->uv_data = decoder->uv_buffer;
+		out_frame->y_data = src_frame->data[0];
+		out_frame->uv_data = src_frame->data[1];
 		out_frame->y_linesize = src_frame->linesize[0];
 		out_frame->uv_linesize = src_frame->linesize[1];
 		out_frame->bgra_data = NULL;
