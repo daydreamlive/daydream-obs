@@ -962,7 +962,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			} else {
 				// At or above target: speed up to reduce latency
 				float excess = (float)(ctx->jitter_count - ctx->buffer_target);
-				float gain = 0.1f;
+				float gain = 0.2f; // More aggressive speed-up for bursty patterns
 				target_speed = 1.0f + gain * excess;
 				if (target_speed > ctx->speed_max)
 					target_speed = ctx->speed_max;

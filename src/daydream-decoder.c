@@ -15,6 +15,8 @@ struct daydream_decoder {
 	AVBufferRef *hw_device_ctx;
 	enum AVPixelFormat hw_pix_fmt;
 	bool using_hw;
+	bool hw_failed;           // HW decode permanently failed, using SW
+	int consecutive_failures; // Track decode failures for fallback
 
 	uint32_t width;
 	uint32_t height;
@@ -101,8 +103,10 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	decoder->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	decoder->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
 
-	decoder->using_hw = false; // Disabled: HW decoder too sensitive to corrupted data
-	// decoder->using_hw = init_hw_decoder(decoder, codec);
+	// Try hardware decoder first, will fallback to SW on repeated failures
+	decoder->using_hw = init_hw_decoder(decoder, codec);
+	decoder->hw_failed = false;
+	decoder->consecutive_failures = 0;
 
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to open codec");
@@ -177,6 +181,66 @@ void daydream_decoder_destroy(struct daydream_decoder *decoder)
 	bfree(decoder);
 }
 
+// Fallback from HW to SW decoder after repeated failures
+static bool fallback_to_sw_decoder(struct daydream_decoder *decoder)
+{
+	if (!decoder->using_hw || decoder->hw_failed)
+		return false;
+
+	blog(LOG_WARNING, "[Daydream Decoder] HW decode failed repeatedly, falling back to software");
+
+	// Free HW resources
+	if (decoder->hw_device_ctx) {
+		av_buffer_unref(&decoder->hw_device_ctx);
+		decoder->hw_device_ctx = NULL;
+	}
+	if (decoder->sw_frame) {
+		av_frame_free(&decoder->sw_frame);
+		decoder->sw_frame = NULL;
+	}
+
+	// Flush and close current codec
+	avcodec_flush_buffers(decoder->codec_ctx);
+	avcodec_free_context(&decoder->codec_ctx);
+
+	// Reinitialize as software decoder
+	const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	if (!codec) {
+		blog(LOG_ERROR, "[Daydream Decoder] Failed to find H264 decoder for fallback");
+		return false;
+	}
+
+	decoder->codec_ctx = avcodec_alloc_context3(codec);
+	if (!decoder->codec_ctx) {
+		blog(LOG_ERROR, "[Daydream Decoder] Failed to allocate codec context for fallback");
+		return false;
+	}
+
+	decoder->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+	decoder->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+
+	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
+		blog(LOG_ERROR, "[Daydream Decoder] Failed to open SW codec for fallback");
+		avcodec_free_context(&decoder->codec_ctx);
+		return false;
+	}
+
+	// Reset sws context (format might change)
+	if (decoder->sws_ctx) {
+		sws_freeContext(decoder->sws_ctx);
+		decoder->sws_ctx = NULL;
+	}
+
+	decoder->using_hw = false;
+	decoder->hw_failed = true;
+	decoder->consecutive_failures = 0;
+
+	blog(LOG_INFO, "[Daydream Decoder] Successfully fell back to software decoder");
+	return true;
+}
+
+#define HW_FAILURE_THRESHOLD 5 // Fallback after 5 consecutive failures
+
 bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h264_data, size_t size,
 			     struct daydream_decoded_frame *out_frame)
 {
@@ -187,12 +251,28 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	decoder->packet->size = (int)size;
 
 	int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
-	if (ret < 0 && ret != AVERROR(EAGAIN))
+	if (ret < 0 && ret != AVERROR(EAGAIN)) {
+		// Track failures for HW fallback
+		if (decoder->using_hw && !decoder->hw_failed) {
+			decoder->consecutive_failures++;
+			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
+				fallback_to_sw_decoder(decoder);
+			}
+		}
 		return false;
+	}
 
 	ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
-	if (ret < 0)
+	if (ret < 0) {
+		// Track failures for HW fallback
+		if (decoder->using_hw && !decoder->hw_failed && ret != AVERROR(EAGAIN)) {
+			decoder->consecutive_failures++;
+			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
+				fallback_to_sw_decoder(decoder);
+			}
+		}
 		return false;
+	}
 
 	AVFrame *src_frame = decoder->frame;
 
@@ -200,10 +280,18 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 		ret = av_hwframe_transfer_data(decoder->sw_frame, decoder->frame, 0);
 		if (ret < 0) {
 			blog(LOG_ERROR, "[Daydream Decoder] Failed to transfer HW frame to CPU");
+			// Track failures for HW fallback
+			decoder->consecutive_failures++;
+			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
+				fallback_to_sw_decoder(decoder);
+			}
 			return false;
 		}
 		src_frame = decoder->sw_frame;
 	}
+
+	// Successful decode - reset failure counter
+	decoder->consecutive_failures = 0;
 
 	uint32_t frame_width = src_frame->width;
 	uint32_t frame_height = src_frame->height;
