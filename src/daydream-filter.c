@@ -147,14 +147,20 @@ struct daydream_filter {
 	uint64_t last_frame_time_us; // For frame delay calculation
 	double current_delay_ms;     // Current playout delay (jitter buffer delay)
 
+	// FPS measurement
+	uint64_t fps_measure_start;
+	int fps_frame_count;
+
 	// Frame interpolation
 	uint8_t *interp_frame_a;   // Previous frame for interpolation
 	uint8_t *interp_frame_b;   // Next frame for interpolation
 	uint8_t *interp_frame_out; // Blended output frame
 	uint32_t interp_width;
 	uint32_t interp_height;
-	uint32_t interp_rtp_a; // PTS of frame A
-	uint32_t interp_rtp_b; // PTS of frame B
+	uint32_t interp_rtp_a;        // PTS of frame A
+	uint32_t interp_rtp_b;        // PTS of frame B
+	uint64_t interp_receive_a;    // Receive time of frame A (for latency tracking)
+	uint64_t interp_receive_b;    // Receive time of frame B
 	bool interp_has_a;
 	bool interp_has_b;
 };
@@ -327,6 +333,22 @@ static void *decode_thread_func(void *data)
 			}
 
 			last_decode_time = os_gettime_ns();
+
+			// Measure actual FPS from server
+			uint64_t now_ns = os_gettime_ns();
+			if (ctx->fps_measure_start == 0) {
+				ctx->fps_measure_start = now_ns;
+				ctx->fps_frame_count = 0;
+			}
+			ctx->fps_frame_count++;
+			uint64_t elapsed_ms = (now_ns - ctx->fps_measure_start) / 1000000;
+			if (elapsed_ms >= 5000) { // Report every 5 seconds
+				double actual_fps = (double)ctx->fps_frame_count * 1000.0 / (double)elapsed_ms;
+				blog(LOG_INFO, "[FPS] Server output: %.1f fps (%d frames in %llums)",
+				     actual_fps, ctx->fps_frame_count, (unsigned long long)elapsed_ms);
+				ctx->fps_measure_start = now_ns;
+				ctx->fps_frame_count = 0;
+			}
 
 			size_t frame_size = decoded.linesize * decoded.height;
 
@@ -634,6 +656,10 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->last_frame_time_us = 0;
 	ctx->current_delay_ms = 100.0;
 
+	// Reset FPS measurement
+	ctx->fps_measure_start = 0;
+	ctx->fps_frame_count = 0;
+
 	// Reset interpolation state (keep buffers allocated for reuse)
 	ctx->interp_has_a = false;
 	ctx->interp_has_b = false;
@@ -849,8 +875,12 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				ctx->jitter_playback_start_time = now;
 				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
 				ctx->current_speed = 1.0f;
-				blog(LOG_INFO, "[Smooth] Playback started with %d frames (target=%d)",
-				     ctx->jitter_count, ctx->buffer_target);
+
+				// Calculate initial latency: time since oldest frame was received
+				uint64_t oldest_age_ms = (now - oldest->receive_time_ns) / 1000000;
+				blog(LOG_INFO,
+				     "[Smooth] Playback started with %d frames (target=%d), oldest_frame_age=%llums",
+				     ctx->jitter_count, ctx->buffer_target, (unsigned long long)oldest_age_ms);
 			}
 		}
 
@@ -916,6 +946,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 				memcpy(ctx->interp_frame_a, jf->data, frame_size);
 				ctx->interp_rtp_a = jf->rtp_timestamp;
+				ctx->interp_receive_a = jf->receive_time_ns;
 				ctx->interp_has_a = true;
 
 				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
@@ -926,6 +957,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
 				memcpy(ctx->interp_frame_b, jf->data, jf->size);
 				ctx->interp_rtp_b = jf->rtp_timestamp;
+				ctx->interp_receive_b = jf->receive_time_ns;
 				ctx->interp_has_b = true;
 
 				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
@@ -940,12 +972,14 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					memcpy(ctx->interp_frame_a, ctx->interp_frame_b,
 					       ctx->interp_width * ctx->interp_height * 4);
 					ctx->interp_rtp_a = ctx->interp_rtp_b;
+					ctx->interp_receive_a = ctx->interp_receive_b;
 					ctx->interp_has_b = false;
 
 					if (ctx->jitter_count > 0) {
 						struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
 						memcpy(ctx->interp_frame_b, jf->data, jf->size);
 						ctx->interp_rtp_b = jf->rtp_timestamp;
+						ctx->interp_receive_b = jf->receive_time_ns;
 						ctx->interp_has_b = true;
 						ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
 						ctx->jitter_count--;
@@ -991,8 +1025,12 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 					static int log_counter = 0;
 					if (log_counter++ % 30 == 0) {
-						blog(LOG_INFO, "[Smooth] buf=%d/%d, speed=%.2f, alpha=%.2f",
-						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed, alpha);
+						// Calculate actual frame latency: time since frame A was received
+						uint64_t frame_age_ms = (now - ctx->interp_receive_a) / 1000000;
+						blog(LOG_INFO,
+						     "[Smooth] buf=%d/%d, speed=%.2f, frame_latency=%llums",
+						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed,
+						     (unsigned long long)frame_age_ms);
 					}
 				} else {
 					memcpy(ctx->decoded_frame, ctx->interp_frame_a, frame_size);
