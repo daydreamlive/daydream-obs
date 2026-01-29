@@ -5,10 +5,18 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <string.h>
+#include <pthread.h>
 
 #if defined(__APPLE__)
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_videotoolbox.h>
+#include <VideoToolbox/VideoToolbox.h>
+#include <CoreMedia/CoreMedia.h>
+#endif
+
+// Forward declarations
+#if defined(__APPLE__)
+static bool init_zerocopy_encoder(struct daydream_encoder *encoder, uint32_t bitrate);
 #endif
 
 struct daydream_encoder {
@@ -24,11 +32,25 @@ struct daydream_encoder {
 
 	bool request_keyframe;
 	bool using_hw;
+	bool using_zerocopy;
 
 #if defined(__APPLE__)
 	AVBufferRef *hw_device_ctx;
 	AVBufferRef *hw_frames_ctx;
 	CVPixelBufferPoolRef pixel_buffer_pool;
+
+	// Zero-copy path (direct VideoToolbox)
+	VTCompressionSessionRef vt_session;
+	IOSurfaceRef iosurface;
+	CVPixelBufferRef pixel_buffer;
+
+	// Encoded output (from VT callback)
+	uint8_t *vt_output_data;
+	size_t vt_output_size;
+	bool vt_is_keyframe;
+	bool vt_frame_ready;
+	pthread_mutex_t vt_mutex;
+	pthread_cond_t vt_cond;
 #endif
 
 	uint8_t *output_buffer;
@@ -139,6 +161,23 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->frame_count = 0;
 	encoder->request_keyframe = true;
 	encoder->using_hw = false;
+	encoder->using_zerocopy = false;
+
+#if defined(__APPLE__)
+	// Try zero-copy path first on macOS
+	if (config->use_zerocopy) {
+		uint32_t bitrate = config->bitrate > 0 ? config->bitrate : 2000000;
+		if (init_zerocopy_encoder(encoder, bitrate)) {
+			encoder->using_zerocopy = true;
+			encoder->output_buffer_size = config->width * config->height * 2;
+			encoder->output_buffer = bmalloc(encoder->output_buffer_size);
+			blog(LOG_INFO, "[Daydream Encoder] Created %dx%d @ %d fps, %d kbps (zero-copy)", config->width,
+			     config->height, encoder->fps, bitrate / 1000);
+			return encoder;
+		}
+		blog(LOG_INFO, "[Daydream Encoder] Zero-copy init failed, falling back to FFmpeg path");
+	}
+#endif
 
 	const AVCodec *codec = find_best_h264_encoder();
 	if (!codec) {
@@ -278,6 +317,21 @@ void daydream_encoder_destroy(struct daydream_encoder *encoder)
 {
 	if (!encoder)
 		return;
+
+#if defined(__APPLE__)
+	if (encoder->using_zerocopy) {
+		if (encoder->vt_session) {
+			VTCompressionSessionInvalidate(encoder->vt_session);
+			CFRelease(encoder->vt_session);
+		}
+		if (encoder->pixel_buffer)
+			CVPixelBufferRelease(encoder->pixel_buffer);
+		if (encoder->iosurface)
+			CFRelease(encoder->iosurface);
+		pthread_mutex_destroy(&encoder->vt_mutex);
+		pthread_cond_destroy(&encoder->vt_cond);
+	}
+#endif
 
 	if (encoder->sws_ctx)
 		sws_freeContext(encoder->sws_ctx);
@@ -425,3 +479,306 @@ bool daydream_encoder_encode(struct daydream_encoder *encoder, const uint8_t *bg
 
 	return true;
 }
+
+#if defined(__APPLE__)
+// VideoToolbox compression callback
+static void vt_compression_callback(void *outputCallbackRefCon, void *sourceFrameRefCon, OSStatus status,
+				    VTEncodeInfoFlags infoFlags, CMSampleBufferRef sampleBuffer)
+{
+	UNUSED_PARAMETER(sourceFrameRefCon);
+	UNUSED_PARAMETER(infoFlags);
+
+	struct daydream_encoder *encoder = outputCallbackRefCon;
+
+	pthread_mutex_lock(&encoder->vt_mutex);
+
+	if (status != noErr || !sampleBuffer) {
+		encoder->vt_frame_ready = false;
+		pthread_cond_signal(&encoder->vt_cond);
+		pthread_mutex_unlock(&encoder->vt_mutex);
+		return;
+	}
+
+	// Check if keyframe
+	CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+	encoder->vt_is_keyframe = false;
+	if (attachments && CFArrayGetCount(attachments) > 0) {
+		CFDictionaryRef attachment = CFArrayGetValueAtIndex(attachments, 0);
+		CFBooleanRef notSync = CFDictionaryGetValue(attachment, kCMSampleAttachmentKey_NotSync);
+		encoder->vt_is_keyframe = !notSync || !CFBooleanGetValue(notSync);
+	}
+
+	// Get H.264 data
+	CMBlockBufferRef blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer);
+	size_t totalLength = 0;
+	char *dataPointer = NULL;
+	CMBlockBufferGetDataPointer(blockBuffer, 0, NULL, &totalLength, &dataPointer);
+
+	// Get format description for SPS/PPS if keyframe
+	CMFormatDescriptionRef formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer);
+
+	size_t totalSize = totalLength;
+	if (encoder->vt_is_keyframe && formatDesc) {
+		// Add space for SPS and PPS with start codes
+		size_t spsSize, ppsSize;
+		const uint8_t *sps, *pps;
+		CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, 0, &sps, &spsSize, NULL, NULL);
+		CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, 1, &pps, &ppsSize, NULL, NULL);
+		totalSize += 4 + spsSize + 4 + ppsSize; // start codes + data
+	}
+
+	// Reallocate if needed
+	if (totalSize > encoder->output_buffer_size) {
+		encoder->output_buffer_size = totalSize * 2;
+		encoder->output_buffer = brealloc(encoder->output_buffer, encoder->output_buffer_size);
+	}
+
+	uint8_t *outPtr = encoder->output_buffer;
+
+	// Write SPS/PPS for keyframes
+	if (encoder->vt_is_keyframe && formatDesc) {
+		size_t spsSize, ppsSize;
+		const uint8_t *sps, *pps;
+		CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, 0, &sps, &spsSize, NULL, NULL);
+		CMVideoFormatDescriptionGetH264ParameterSetAtIndex(formatDesc, 1, &pps, &ppsSize, NULL, NULL);
+
+		// SPS with start code
+		outPtr[0] = 0x00;
+		outPtr[1] = 0x00;
+		outPtr[2] = 0x00;
+		outPtr[3] = 0x01;
+		memcpy(outPtr + 4, sps, spsSize);
+		outPtr += 4 + spsSize;
+
+		// PPS with start code
+		outPtr[0] = 0x00;
+		outPtr[1] = 0x00;
+		outPtr[2] = 0x00;
+		outPtr[3] = 0x01;
+		memcpy(outPtr + 4, pps, ppsSize);
+		outPtr += 4 + ppsSize;
+	}
+
+	// Convert AVCC format to Annex B (length prefix → start code)
+	size_t offset = 0;
+	while (offset < totalLength) {
+		uint32_t naluLength = 0;
+		memcpy(&naluLength, dataPointer + offset, 4);
+		naluLength = CFSwapInt32BigToHost(naluLength);
+		offset += 4;
+
+		// Write start code
+		outPtr[0] = 0x00;
+		outPtr[1] = 0x00;
+		outPtr[2] = 0x00;
+		outPtr[3] = 0x01;
+		memcpy(outPtr + 4, dataPointer + offset, naluLength);
+		outPtr += 4 + naluLength;
+		offset += naluLength;
+	}
+
+	encoder->vt_output_data = encoder->output_buffer;
+	encoder->vt_output_size = outPtr - encoder->output_buffer;
+	encoder->vt_frame_ready = true;
+
+	pthread_cond_signal(&encoder->vt_cond);
+	pthread_mutex_unlock(&encoder->vt_mutex);
+}
+
+static bool init_zerocopy_encoder(struct daydream_encoder *encoder, uint32_t bitrate)
+{
+	// Create IOSurface
+	CFMutableDictionaryRef properties = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+	int32_t width = encoder->width;
+	int32_t height = encoder->height;
+	int32_t bytesPerElement = 4;
+	int32_t bytesPerRow = width * bytesPerElement;
+	int32_t allocSize = bytesPerRow * height;
+
+	CFNumberRef widthNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &width);
+	CFNumberRef heightNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &height);
+	CFNumberRef bytesPerElementNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bytesPerElement);
+	CFNumberRef bytesPerRowNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bytesPerRow);
+	CFNumberRef allocSizeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &allocSize);
+
+	int32_t pixelFormat = kCVPixelFormatType_32BGRA;
+	CFNumberRef pixelFormatNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pixelFormat);
+
+	CFDictionarySetValue(properties, kIOSurfaceWidth, widthNum);
+	CFDictionarySetValue(properties, kIOSurfaceHeight, heightNum);
+	CFDictionarySetValue(properties, kIOSurfaceBytesPerElement, bytesPerElementNum);
+	CFDictionarySetValue(properties, kIOSurfaceBytesPerRow, bytesPerRowNum);
+	CFDictionarySetValue(properties, kIOSurfaceAllocSize, allocSizeNum);
+	CFDictionarySetValue(properties, kIOSurfacePixelFormat, pixelFormatNum);
+
+	encoder->iosurface = IOSurfaceCreate(properties);
+
+	CFRelease(widthNum);
+	CFRelease(heightNum);
+	CFRelease(bytesPerElementNum);
+	CFRelease(bytesPerRowNum);
+	CFRelease(allocSizeNum);
+	CFRelease(pixelFormatNum);
+	CFRelease(properties);
+
+	if (!encoder->iosurface) {
+		blog(LOG_ERROR, "[Daydream Encoder] Failed to create IOSurface");
+		return false;
+	}
+
+	// Create CVPixelBuffer from IOSurface
+	CVReturn cvRet =
+		CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, encoder->iosurface, NULL, &encoder->pixel_buffer);
+	if (cvRet != kCVReturnSuccess) {
+		blog(LOG_ERROR, "[Daydream Encoder] Failed to create CVPixelBuffer from IOSurface: %d", cvRet);
+		CFRelease(encoder->iosurface);
+		encoder->iosurface = NULL;
+		return false;
+	}
+
+	// Create VTCompressionSession
+	CFMutableDictionaryRef encoderSpec = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
+			     kCFBooleanTrue);
+	CFDictionarySetValue(encoderSpec, kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
+			     kCFBooleanTrue);
+
+	OSStatus status =
+		VTCompressionSessionCreate(kCFAllocatorDefault, width, height, kCMVideoCodecType_H264, encoderSpec,
+					   NULL, // sourceImageBufferAttributes
+					   kCFAllocatorDefault, vt_compression_callback, encoder, &encoder->vt_session);
+
+	CFRelease(encoderSpec);
+
+	if (status != noErr) {
+		blog(LOG_ERROR, "[Daydream Encoder] Failed to create VTCompressionSession: %d", (int)status);
+		CVPixelBufferRelease(encoder->pixel_buffer);
+		CFRelease(encoder->iosurface);
+		encoder->pixel_buffer = NULL;
+		encoder->iosurface = NULL;
+		return false;
+	}
+
+	// Configure session for realtime low-latency
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_ProfileLevel,
+			     kVTProfileLevel_H264_Baseline_AutoLevel);
+
+	// Set bitrate
+	CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bitrate);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
+	CFRelease(bitrateNum);
+
+	// Set framerate
+	int32_t fps = encoder->fps;
+	CFNumberRef fpsNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &fps);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_ExpectedFrameRate, fpsNum);
+	CFRelease(fpsNum);
+
+	// Set keyframe interval
+	int32_t keyframeInterval = encoder->fps;
+	CFNumberRef keyframeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &keyframeInterval);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, keyframeNum);
+	CFRelease(keyframeNum);
+
+	// Prepare to encode
+	status = VTCompressionSessionPrepareToEncodeFrames(encoder->vt_session);
+	if (status != noErr) {
+		blog(LOG_ERROR, "[Daydream Encoder] Failed to prepare VTCompressionSession: %d", (int)status);
+		VTCompressionSessionInvalidate(encoder->vt_session);
+		CFRelease(encoder->vt_session);
+		CVPixelBufferRelease(encoder->pixel_buffer);
+		CFRelease(encoder->iosurface);
+		encoder->vt_session = NULL;
+		encoder->pixel_buffer = NULL;
+		encoder->iosurface = NULL;
+		return false;
+	}
+
+	pthread_mutex_init(&encoder->vt_mutex, NULL);
+	pthread_cond_init(&encoder->vt_cond, NULL);
+
+	blog(LOG_INFO, "[Daydream Encoder] Zero-copy VideoToolbox encoder initialized (%dx%d)", width, height);
+	return true;
+}
+
+IOSurfaceRef daydream_encoder_get_iosurface(struct daydream_encoder *encoder)
+{
+	if (!encoder || !encoder->using_zerocopy)
+		return NULL;
+	return encoder->iosurface;
+}
+
+bool daydream_encoder_is_zerocopy(struct daydream_encoder *encoder)
+{
+	return encoder && encoder->using_zerocopy;
+}
+
+bool daydream_encoder_encode_iosurface(struct daydream_encoder *encoder, struct daydream_encoded_frame *out_frame)
+{
+	if (!encoder || !encoder->using_zerocopy || !encoder->vt_session || !out_frame)
+		return false;
+
+	CMTime pts = CMTimeMake(encoder->frame_count, encoder->fps);
+
+	CFMutableDictionaryRef frameProps = NULL;
+	if (encoder->request_keyframe) {
+		frameProps = CFDictionaryCreateMutable(kCFAllocatorDefault, 1, &kCFTypeDictionaryKeyCallBacks,
+						       &kCFTypeDictionaryValueCallBacks);
+		CFDictionarySetValue(frameProps, kVTEncodeFrameOptionKey_ForceKeyFrame, kCFBooleanTrue);
+		encoder->request_keyframe = false;
+	}
+
+	pthread_mutex_lock(&encoder->vt_mutex);
+	encoder->vt_frame_ready = false;
+	pthread_mutex_unlock(&encoder->vt_mutex);
+
+	OSStatus status = VTCompressionSessionEncodeFrame(encoder->vt_session, encoder->pixel_buffer, pts,
+							  kCMTimeInvalid, frameProps, NULL, NULL);
+
+	if (frameProps)
+		CFRelease(frameProps);
+
+	if (status != noErr) {
+		blog(LOG_ERROR, "[Daydream Encoder] VTCompressionSessionEncodeFrame failed: %d", (int)status);
+		return false;
+	}
+
+	// Force synchronous output
+	VTCompressionSessionCompleteFrames(encoder->vt_session, kCMTimeInvalid);
+
+	// Wait for callback
+	pthread_mutex_lock(&encoder->vt_mutex);
+	while (!encoder->vt_frame_ready) {
+		struct timespec ts;
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_nsec += 100000000; // 100ms timeout
+		if (ts.tv_nsec >= 1000000000) {
+			ts.tv_sec++;
+			ts.tv_nsec -= 1000000000;
+		}
+		int ret = pthread_cond_timedwait(&encoder->vt_cond, &encoder->vt_mutex, &ts);
+		if (ret != 0)
+			break;
+	}
+
+	if (!encoder->vt_frame_ready) {
+		pthread_mutex_unlock(&encoder->vt_mutex);
+		return false;
+	}
+
+	out_frame->data = encoder->vt_output_data;
+	out_frame->size = encoder->vt_output_size;
+	out_frame->is_keyframe = encoder->vt_is_keyframe;
+	out_frame->pts = encoder->frame_count;
+
+	pthread_mutex_unlock(&encoder->vt_mutex);
+
+	encoder->frame_count++;
+	return true;
+}
+#endif

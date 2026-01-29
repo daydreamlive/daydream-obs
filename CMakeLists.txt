@@ -94,6 +94,18 @@ target_link_libraries(
   PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
 )
 
+# macOS frameworks for zero-copy encoding
+if(OS_MACOS)
+  find_library(VIDEOTOOLBOX_FRAMEWORK VideoToolbox)
+  find_library(COREMEDIA_FRAMEWORK CoreMedia)
+  find_library(COREVIDEO_FRAMEWORK CoreVideo)
+  find_library(IOSURFACE_FRAMEWORK IOSurface)
+  target_link_libraries(
+    ${CMAKE_PROJECT_NAME}
+    PRIVATE ${VIDEOTOOLBOX_FRAMEWORK} ${COREMEDIA_FRAMEWORK} ${COREVIDEO_FRAMEWORK} ${IOSURFACE_FRAMEWORK}
+  )
+endif()
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
