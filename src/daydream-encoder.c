@@ -9,9 +9,6 @@
 #if defined(__APPLE__)
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_videotoolbox.h>
-#include <CoreFoundation/CoreFoundation.h>
-#include <CoreVideo/CoreVideo.h>
-#include <VideoToolbox/VideoToolbox.h>
 #endif
 
 struct daydream_encoder {
@@ -305,53 +302,37 @@ void daydream_encoder_destroy(struct daydream_encoder *encoder)
 #if defined(__APPLE__)
 static bool encode_hw_frame(struct daydream_encoder *encoder, const uint8_t *bgra_data, uint32_t linesize)
 {
-	// Create CVPixelBuffer from BGRA data
-	CVPixelBufferRef pixel_buffer = NULL;
-
-	// Create pixel buffer attributes (pure C)
-	CFMutableDictionaryRef pixel_buffer_attrs = CFDictionaryCreateMutable(
-		kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-
-	CFDictionaryRef empty_dict = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0, NULL, NULL);
-	CFDictionarySetValue(pixel_buffer_attrs, kCVPixelBufferIOSurfacePropertiesKey, empty_dict);
-	CFRelease(empty_dict);
-
-	CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, encoder->width, encoder->height,
-					      kCVPixelFormatType_32BGRA, pixel_buffer_attrs, &pixel_buffer);
-
-	CFRelease(pixel_buffer_attrs);
-
-	if (status != kCVReturnSuccess || !pixel_buffer) {
-		blog(LOG_ERROR, "[Daydream Encoder] Failed to create CVPixelBuffer: %d", status);
+	// Create software frame pointing to BGRA data
+	AVFrame *sw_frame = av_frame_alloc();
+	if (!sw_frame)
 		return false;
-	}
 
-	// Lock and copy BGRA data
-	CVPixelBufferLockBaseAddress(pixel_buffer, 0);
-	uint8_t *dst = CVPixelBufferGetBaseAddress(pixel_buffer);
-	size_t dst_stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
+	sw_frame->format = AV_PIX_FMT_BGRA;
+	sw_frame->width = encoder->width;
+	sw_frame->height = encoder->height;
+	sw_frame->data[0] = (uint8_t *)bgra_data;
+	sw_frame->linesize[0] = (int)linesize;
 
-	if (dst_stride == linesize) {
-		memcpy(dst, bgra_data, linesize * encoder->height);
-	} else {
-		// Copy row by row if strides don't match
-		for (uint32_t y = 0; y < encoder->height; y++) {
-			memcpy(dst + y * dst_stride, bgra_data + y * linesize, encoder->width * 4);
-		}
-	}
-	CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
-
-	// Create AVFrame and attach CVPixelBuffer
+	// Get hardware frame from pool
 	AVFrame *hw_frame = av_frame_alloc();
 	if (!hw_frame) {
-		CVPixelBufferRelease(pixel_buffer);
+		av_frame_free(&sw_frame);
 		return false;
 	}
 
-	hw_frame->format = AV_PIX_FMT_VIDEOTOOLBOX;
-	hw_frame->width = encoder->width;
-	hw_frame->height = encoder->height;
-	hw_frame->data[3] = (uint8_t *)pixel_buffer; // VideoToolbox expects CVPixelBuffer in data[3]
+	if (av_hwframe_get_buffer(encoder->hw_frames_ctx, hw_frame, 0) < 0) {
+		av_frame_free(&sw_frame);
+		av_frame_free(&hw_frame);
+		return false;
+	}
+
+	// Upload software frame to hardware
+	if (av_hwframe_transfer_data(hw_frame, sw_frame, 0) < 0) {
+		av_frame_free(&sw_frame);
+		av_frame_free(&hw_frame);
+		return false;
+	}
+
 	hw_frame->pts = encoder->frame_count;
 
 	if (encoder->request_keyframe) {
@@ -362,8 +343,9 @@ static bool encode_hw_frame(struct daydream_encoder *encoder, const uint8_t *bgr
 	}
 
 	int ret = avcodec_send_frame(encoder->codec_ctx, hw_frame);
+
+	av_frame_free(&sw_frame);
 	av_frame_free(&hw_frame);
-	CVPixelBufferRelease(pixel_buffer);
 
 	return ret >= 0;
 }
