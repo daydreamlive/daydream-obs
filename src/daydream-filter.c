@@ -784,7 +784,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_technique_begin(tech);
 	gs_technique_begin_pass(tech, 0);
 
-	if (ctx->streaming && output != tex && ctx->decoded_frame_ready) {
+	if (ctx->streaming && output != tex) {
 		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
 							     : (float)STREAM_SIZE / (float)parent_height;
 		float render_size = STREAM_SIZE / scale;
