@@ -380,49 +380,33 @@ double jitter_estimator_get_ms(jitter_estimator_t *je)
 
 int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 {
+	// Hybrid approach: fixed target, only increase on emergency
+	// - Good networks: stable ~270ms latency
+	// - Bad networks: auto-increase to survive
+	// - No oscillation: never auto-decrease
+	(void)fps; // Not used in hybrid approach
+
 	if (!je)
 		return MIN_BUFFER_TARGET;
 
-	// Sanity check: need valid FPS and gap data
-	if (fps < 5.0 || fps > 120.0 || je->gap_count < 5) {
-		return je->last_buffer_target; // Not enough data yet
+	return je->last_buffer_target;
+}
+
+// Call this when buffer hits 0 (emergency)
+void jitter_estimator_notify_underrun(jitter_estimator_t *je)
+{
+	if (!je)
+		return;
+
+	// Increase target by 2 frames on each underrun
+	int new_target = je->last_buffer_target + 2;
+	if (new_target > MAX_BUFFER_TARGET)
+		new_target = MAX_BUFFER_TARGET;
+
+	if (new_target != je->last_buffer_target) {
+		blog(LOG_WARNING, "[Buffer] Underrun! target %d->%d", je->last_buffer_target, new_target);
+		je->last_buffer_target = new_target;
 	}
-
-	// Sanity check: smoothed_max_gap should be reasonable (1ms to 2000ms)
-	double max_gap = je->smoothed_max_gap_ms;
-	if (max_gap < 1.0 || max_gap > 2000.0) {
-		return je->last_buffer_target; // Invalid data
-	}
-
-	// For bursty AI video, use max-gap based approach
-	double frame_duration_ms = 1000.0 / fps;
-
-	// Calculate target: enough buffer to survive the longest gap
-	int target = (int)ceil(max_gap / frame_duration_ms) + 2; // +2 safety margin
-
-	// Clamp to reasonable range
-	if (target < MIN_BUFFER_TARGET)
-		target = MIN_BUFFER_TARGET;
-	if (target > MAX_BUFFER_TARGET)
-		target = MAX_BUFFER_TARGET;
-
-	// Apply hysteresis: only change if difference is significant
-	int diff = target - je->last_buffer_target;
-	if (diff > 0 && diff < BUFFER_TARGET_HYSTERESIS) {
-		return je->last_buffer_target; // Don't increase for small changes
-	}
-	if (diff < 0 && diff > -BUFFER_TARGET_HYSTERESIS) {
-		return je->last_buffer_target; // Don't decrease for small changes
-	}
-
-	// Log target changes
-	if (target != je->last_buffer_target) {
-		blog(LOG_INFO, "[Buffer] target %d->%d (max_gap=%.0fms, fps=%.1f)", je->last_buffer_target, target,
-		     max_gap, fps);
-	}
-
-	je->last_buffer_target = target;
-	return target;
 }
 
 double jitter_estimator_get_fps(jitter_estimator_t *je)

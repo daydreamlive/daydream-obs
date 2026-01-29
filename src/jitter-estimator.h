@@ -46,6 +46,9 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps);
 // Get current estimated frame rate
 double jitter_estimator_get_fps(jitter_estimator_t *je);
 
+// Notify underrun (buffer hit 0) - triggers target increase
+void jitter_estimator_notify_underrun(jitter_estimator_t *je);
+
 #ifdef __cplusplus
 }
 #endif

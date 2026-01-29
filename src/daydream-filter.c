@@ -348,9 +348,8 @@ static void *decode_thread_func(void *data)
 					// This accounts for actual frame timing from the source
 					jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, raw_size);
 
-					// Auto-adjust buffer target based on max-gap estimate
-					double fps = jitter_estimator_get_fps(ctx->jitter_est);
-					int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, fps);
+					// Sync buffer target from jitter estimator (may increase on underruns)
+					int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, 0);
 					if (new_target != ctx->buffer_target) {
 						ctx->buffer_target = new_target;
 					}
@@ -860,7 +859,8 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			float target_speed;
 
 			if (ctx->jitter_count == 0) {
-				// Emergency: buffer empty
+				// Emergency: buffer empty - notify for target increase
+				jitter_estimator_notify_underrun(ctx->jitter_est);
 				target_speed = ctx->speed_min;
 			} else if (ctx->jitter_count < ctx->buffer_target) {
 				// Below target: slow down proportionally
