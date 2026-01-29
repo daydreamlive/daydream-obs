@@ -362,3 +362,20 @@ const char *daydream_whip_get_whep_url(struct daydream_whip *whip)
 		return nullptr;
 	return whip->whep_url.c_str();
 }
+
+int32_t daydream_whip_get_rtt_ms(struct daydream_whip *whip)
+{
+	if (!whip || !whip->pc || !whip->connected)
+		return -1;
+
+	try {
+		auto rtt = whip->pc->rtt();
+		if (rtt.has_value()) {
+			return static_cast<int32_t>(rtt->count());
+		}
+	} catch (...) {
+		// Ignore exceptions
+	}
+
+	return -1;
+}

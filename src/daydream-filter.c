@@ -103,6 +103,14 @@ struct daydream_filter {
 	uint64_t frame_count;
 	uint64_t last_encode_time;
 	uint32_t target_fps;
+
+	// Adaptive bitrate control
+	uint32_t current_bitrate;
+	uint32_t min_bitrate;
+	uint32_t max_bitrate;
+	int32_t last_rtt_ms;
+	int32_t avg_rtt_ms;
+	uint64_t last_bitrate_check;
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -277,6 +285,57 @@ static void *encode_thread_func(void *data)
 				daydream_whip_send_frame(ctx->whip, encoded.data, encoded.size, timestamp_ms,
 							 encoded.is_keyframe);
 				ctx->frame_count++;
+			}
+
+			// Adaptive bitrate: check RTT every second
+			uint64_t now_ns = os_gettime_ns();
+			if (now_ns - ctx->last_bitrate_check > 1000000000ULL) {
+				ctx->last_bitrate_check = now_ns;
+
+				int32_t rtt_ms = daydream_whip_get_rtt_ms(ctx->whip);
+				if (rtt_ms > 0) {
+					// Exponential moving average of RTT
+					if (ctx->avg_rtt_ms <= 0) {
+						ctx->avg_rtt_ms = rtt_ms;
+					} else {
+						ctx->avg_rtt_ms = (ctx->avg_rtt_ms * 7 + rtt_ms) / 8;
+					}
+
+					uint32_t new_bitrate = ctx->current_bitrate;
+
+					// RTT thresholds for bitrate adjustment
+					if (ctx->avg_rtt_ms > 300) {
+						// High latency: reduce bitrate by 20%
+						new_bitrate = ctx->current_bitrate * 80 / 100;
+						blog(LOG_INFO, "[Daydream] High RTT (%d ms), reducing bitrate",
+						     ctx->avg_rtt_ms);
+					} else if (ctx->avg_rtt_ms > 150) {
+						// Medium latency: reduce bitrate by 10%
+						new_bitrate = ctx->current_bitrate * 90 / 100;
+					} else if (ctx->avg_rtt_ms < 50 && ctx->last_rtt_ms < 50) {
+						// Low latency for 2 checks: increase bitrate by 5%
+						new_bitrate = ctx->current_bitrate * 105 / 100;
+					}
+
+					// Clamp to min/max
+					if (new_bitrate < ctx->min_bitrate)
+						new_bitrate = ctx->min_bitrate;
+					if (new_bitrate > ctx->max_bitrate)
+						new_bitrate = ctx->max_bitrate;
+
+					// Apply new bitrate if changed significantly (>5%)
+					if (new_bitrate != ctx->current_bitrate) {
+						int diff = (int)new_bitrate - (int)ctx->current_bitrate;
+						if (diff < 0)
+							diff = -diff;
+						if (diff > (int)(ctx->current_bitrate / 20)) {
+							daydream_encoder_set_bitrate(ctx->encoder, new_bitrate);
+							ctx->current_bitrate = new_bitrate;
+						}
+					}
+
+					ctx->last_rtt_ms = rtt_ms;
+				}
 			}
 		}
 
@@ -844,7 +903,8 @@ static void *start_streaming_thread_func(void *data)
 		.fps = target_fps,
 		.bitrate = 500000,
 #if defined(__APPLE__)
-		.use_zerocopy = true, // Try zero-copy path on macOS
+		// Zero-copy requires Metal backend (OBS 31+), disabled for now due to OpenGL render target issues
+		.use_zerocopy = false,
 #endif
 	};
 	ctx->encoder = daydream_encoder_create(&enc_config);
@@ -911,6 +971,14 @@ static void *start_streaming_thread_func(void *data)
 	ctx->stopping = false;
 	ctx->frame_count = 0;
 	ctx->last_encode_time = os_gettime_ns();
+
+	// Initialize adaptive bitrate control
+	ctx->current_bitrate = 500000; // Start at 500kbps
+	ctx->min_bitrate = 200000;     // Min 200kbps
+	ctx->max_bitrate = 2000000;    // Max 2Mbps
+	ctx->last_rtt_ms = -1;
+	ctx->avg_rtt_ms = -1;
+	ctx->last_bitrate_check = os_gettime_ns();
 
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);

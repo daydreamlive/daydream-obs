@@ -34,6 +34,10 @@ bool daydream_whip_send_frame(struct daydream_whip *whip, const uint8_t *h264_da
 
 const char *daydream_whip_get_whep_url(struct daydream_whip *whip);
 
+// Network statistics for adaptive bitrate
+// Returns RTT in milliseconds, or -1 if not available
+int32_t daydream_whip_get_rtt_ms(struct daydream_whip *whip);
+
 #ifdef __cplusplus
 }
 #endif

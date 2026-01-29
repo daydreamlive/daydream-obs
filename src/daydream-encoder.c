@@ -28,6 +28,7 @@ struct daydream_encoder {
 	uint32_t width;
 	uint32_t height;
 	uint32_t fps;
+	uint32_t bitrate;
 	int64_t frame_count;
 
 	bool request_keyframe;
@@ -158,6 +159,7 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->width = config->width;
 	encoder->height = config->height;
 	encoder->fps = config->fps > 0 ? config->fps : 30;
+	encoder->bitrate = config->bitrate > 0 ? config->bitrate : 2000000;
 	encoder->frame_count = 0;
 	encoder->request_keyframe = true;
 	encoder->using_hw = false;
@@ -782,3 +784,61 @@ bool daydream_encoder_encode_iosurface(struct daydream_encoder *encoder, struct 
 	return true;
 }
 #endif
+
+// Adaptive bitrate control functions
+bool daydream_encoder_set_bitrate(struct daydream_encoder *encoder, uint32_t bitrate)
+{
+	if (!encoder || bitrate == 0)
+		return false;
+
+	// Clamp bitrate to reasonable range (100kbps - 10Mbps)
+	if (bitrate < 100000)
+		bitrate = 100000;
+	if (bitrate > 10000000)
+		bitrate = 10000000;
+
+	if (encoder->bitrate == bitrate)
+		return true;
+
+	encoder->bitrate = bitrate;
+
+#if defined(__APPLE__)
+	if (encoder->using_zerocopy && encoder->vt_session) {
+		// Update VideoToolbox session bitrate
+		CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bitrate);
+		OSStatus status =
+			VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_AverageBitRate, bitrateNum);
+		CFRelease(bitrateNum);
+
+		if (status != noErr) {
+			blog(LOG_WARNING, "[Daydream Encoder] Failed to set VT bitrate: %d", (int)status);
+			return false;
+		}
+
+		blog(LOG_INFO, "[Daydream Encoder] VT bitrate changed to %d kbps", bitrate / 1000);
+		return true;
+	}
+#endif
+
+	if (encoder->codec_ctx) {
+		encoder->codec_ctx->bit_rate = bitrate;
+		encoder->codec_ctx->rc_max_rate = bitrate;
+		encoder->codec_ctx->rc_buffer_size = bitrate / 2;
+		blog(LOG_INFO, "[Daydream Encoder] FFmpeg bitrate changed to %d kbps", bitrate / 1000);
+	}
+
+	return true;
+}
+
+uint32_t daydream_encoder_get_bitrate(struct daydream_encoder *encoder)
+{
+	if (!encoder)
+		return 0;
+	return encoder->bitrate;
+}
+
+void daydream_encoder_request_keyframe(struct daydream_encoder *encoder)
+{
+	if (encoder)
+		encoder->request_keyframe = true;
+}
