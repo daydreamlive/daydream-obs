@@ -29,8 +29,6 @@
 #define PROP_SPEED_MIN "speed_min"
 #define PROP_SPEED_MAX "speed_max"
 
-#define RAW_QUEUE_SIZE 32
-
 // Jitter buffer for smooth playback
 #define JITTER_BUFFER_SIZE 60          // ~2 seconds @ 30fps
 #define JITTER_DELAY_MS 500            // 500ms buffering delay
@@ -41,13 +39,6 @@ struct jitter_frame {
 	size_t size;
 	uint32_t width;
 	uint32_t height;
-	uint32_t rtp_timestamp;
-	uint64_t receive_time_ns;
-};
-
-struct raw_packet {
-	uint8_t *data;
-	size_t size;
 	uint32_t rtp_timestamp;
 	uint64_t receive_time_ns;
 };
@@ -87,21 +78,11 @@ struct daydream_filter {
 	pthread_t encode_thread;
 	bool encode_thread_running;
 
-	pthread_t decode_thread;
-	bool decode_thread_running;
-
 	pthread_t whep_thread;
 	bool whep_thread_running;
 
 	pthread_t start_thread;
 	bool start_thread_running;
-
-	struct raw_packet raw_queue[RAW_QUEUE_SIZE];
-	int raw_queue_head;
-	int raw_queue_tail;
-	int raw_queue_count;
-	pthread_mutex_t raw_mutex;
-	pthread_cond_t raw_cond;
 
 	uint8_t *pending_frame;
 	uint32_t pending_frame_width;
@@ -205,332 +186,197 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	pthread_mutex_unlock(&ctx->mutex);
 }
 
-static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, bool is_keyframe, void *userdata)
+static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timestamp, bool is_keyframe, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(is_keyframe);
 	uint64_t receive_time_ns = os_gettime_ns();
 
-	if (!ctx)
+	if (!ctx || !ctx->decoder || ctx->stopping)
 		return;
 
-	// === DEBUG: Hypothesis 1,2 - frame receive interval and keyframe detection ===
+	// === DEBUG: frame receive logging ===
 	static uint64_t last_whep_frame_time = 0;
-	static uint64_t last_keyframe_time = 0;
 	static uint64_t whep_frame_count = 0;
 	uint64_t now = os_gettime_ns();
-
-	// H264 keyframe detection (NAL unit type 5 = IDR, type 7 = SPS)
-	bool detected_keyframe = false;
-	if (size > 4) {
-		// Check for start code (0x00000001 or 0x000001)
-		const uint8_t *p = data;
-		if ((p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) || (p[0] == 0 && p[1] == 0 && p[2] == 1)) {
-			int offset = (p[2] == 1) ? 3 : 4;
-			uint8_t nal_type = p[offset] & 0x1F;
-			detected_keyframe = (nal_type == 5 || nal_type == 7);
-		}
-	}
-
 	uint64_t gap_ms = (last_whep_frame_time > 0) ? (now - last_whep_frame_time) / 1000000 : 0;
 
-	// Log if gap > 100ms, otherwise every 30 frames
 	if (gap_ms > 100 || whep_frame_count % 30 == 0) {
-		blog(LOG_INFO, "[DEBUG WHEP] frame #%llu, gap=%llums, size=%zu, keyframe=%s",
-		     (unsigned long long)whep_frame_count, (unsigned long long)gap_ms, size,
-		     detected_keyframe ? "YES" : "no");
+		blog(LOG_INFO, "[WHEP] frame #%llu, gap=%llums, size=%zu", (unsigned long long)whep_frame_count,
+		     (unsigned long long)gap_ms, size);
 	}
-
-	if (detected_keyframe) {
-		uint64_t keyframe_gap_ms = (last_keyframe_time > 0) ? (now - last_keyframe_time) / 1000000 : 0;
-		blog(LOG_INFO, "[DEBUG WHEP] === KEYFRAME === gap since last keyframe: %llums",
-		     (unsigned long long)keyframe_gap_ms);
-		last_keyframe_time = now;
-	}
-
 	last_whep_frame_time = now;
 	whep_frame_count++;
-	// === END DEBUG ===
 
-	pthread_mutex_lock(&ctx->raw_mutex);
+	// Inline decode - no queue needed
+	static uint64_t decode_success_count = 0;
+	static uint64_t decode_fail_count = 0;
 
-	// === DEBUG: Hypothesis 5 - queue overflow ===
-	if (ctx->raw_queue_count >= RAW_QUEUE_SIZE) {
-		blog(LOG_WARNING, "[DEBUG WHEP] Queue overflow! Dropping oldest frame. queue_count=%d",
-		     ctx->raw_queue_count);
-		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
-		ctx->raw_queue_count--;
+	uint64_t decode_start = os_gettime_ns();
+	struct daydream_decoded_frame decoded;
+	bool decode_success = daydream_decoder_decode(ctx->decoder, data, size, &decoded);
+
+	if (!decode_success) {
+		decode_fail_count++;
+		if (decode_fail_count % 10 == 1) {
+			blog(LOG_WARNING, "[Decode] FAILED! total_fails=%llu, size=%zu",
+			     (unsigned long long)decode_fail_count, size);
+		}
+		return;
 	}
 
-	struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_head];
+	decode_success_count++;
+	uint64_t decode_time_ms = (os_gettime_ns() - decode_start) / 1000000;
 
-	if (!pkt->data || pkt->size < size) {
-		bfree(pkt->data);
-		pkt->data = bmalloc(size);
+	if (decode_time_ms > 10) {
+		blog(LOG_INFO, "[Decode] Slow: %llums, size=%zu", (unsigned long long)decode_time_ms, size);
 	}
 
-	memcpy(pkt->data, data, size);
-	pkt->size = size;
-	pkt->rtp_timestamp = timestamp;
-	pkt->receive_time_ns = receive_time_ns;
+	// FPS measurement
+	if (ctx->fps_measure_start == 0) {
+		ctx->fps_measure_start = now;
+		ctx->fps_frame_count = 0;
+	}
+	ctx->fps_frame_count++;
+	uint64_t elapsed_ms = (now - ctx->fps_measure_start) / 1000000;
+	if (elapsed_ms >= 5000) {
+		double actual_fps = (double)ctx->fps_frame_count * 1000.0 / (double)elapsed_ms;
+		blog(LOG_INFO, "[FPS] Server: %.1f fps (%d frames in %llums)", actual_fps, ctx->fps_frame_count,
+		     (unsigned long long)elapsed_ms);
+		ctx->fps_measure_start = now;
+		ctx->fps_frame_count = 0;
+	}
 
-	ctx->raw_queue_head = (ctx->raw_queue_head + 1) % RAW_QUEUE_SIZE;
-	ctx->raw_queue_count++;
+	size_t frame_size = decoded.linesize * decoded.height;
 
-	pthread_cond_signal(&ctx->raw_cond);
-	pthread_mutex_unlock(&ctx->raw_mutex);
-}
+	if (ctx->smooth_mode) {
+		// Smooth mode: add to jitter buffer
+		pthread_mutex_lock(&ctx->jitter_mutex);
 
-static void *decode_thread_func(void *data)
-{
-	struct daydream_filter *ctx = data;
+		uint64_t now_us = receive_time_ns / 1000;
 
-	blog(LOG_INFO, "[Daydream Decode] Thread started");
-
-	while (ctx->decode_thread_running) {
-		pthread_mutex_lock(&ctx->raw_mutex);
-
-		while (ctx->raw_queue_count == 0 && ctx->decode_thread_running && !ctx->stopping) {
-			pthread_cond_wait(&ctx->raw_cond, &ctx->raw_mutex);
+		// Update timestamp extrapolator
+		if (ctx->ts_extrap) {
+			timestamp_extrapolator_update(ctx->ts_extrap, now_us, rtp_timestamp);
 		}
 
-		if (!ctx->decode_thread_running || ctx->stopping) {
-			pthread_mutex_unlock(&ctx->raw_mutex);
-			break;
+		// Update jitter estimator
+		if (ctx->jitter_est) {
+			jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, size);
+			int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, 0);
+			if (new_target != ctx->buffer_target) {
+				ctx->buffer_target = new_target;
+			}
 		}
 
-		struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_tail];
-		uint8_t *raw_data = bmalloc(pkt->size);
-		size_t raw_size = pkt->size;
-		uint32_t rtp_timestamp = pkt->rtp_timestamp;
-		uint64_t receive_time_ns = pkt->receive_time_ns;
-		memcpy(raw_data, pkt->data, raw_size);
-
-		// Measure queue wait time
-		uint64_t queue_wait_ms = (os_gettime_ns() - receive_time_ns) / 1000000;
-		if (queue_wait_ms > 50) {
-			blog(LOG_INFO, "[Queue] Wait time: %llums, queue_depth=%d", (unsigned long long)queue_wait_ms,
-			     ctx->raw_queue_count);
+		// Buffer full handling
+		if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
+			bfree(ctx->jitter_buffer[0].data);
+			ctx->jitter_buffer[0].data = NULL;
+			for (int i = 0; i < ctx->jitter_count - 1; i++) {
+				ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
+			}
+			ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
+			ctx->jitter_count--;
 		}
 
-		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
-		ctx->raw_queue_count--;
-
-		pthread_mutex_unlock(&ctx->raw_mutex);
-
-		// === DEBUG: Hypothesis 3 - decode interval and success rate ===
-		static uint64_t last_decode_time = 0;
-		static uint64_t decode_success_count = 0;
-		static uint64_t decode_fail_count = 0;
-
-		uint64_t decode_start = os_gettime_ns();
-		uint64_t decode_gap_ms = (last_decode_time > 0) ? (decode_start - last_decode_time) / 1000000 : 0;
-
-		struct daydream_decoded_frame decoded;
-		bool decode_success = ctx->decoder &&
-				      daydream_decoder_decode(ctx->decoder, raw_data, raw_size, &decoded);
-
-		if (decode_success) {
-			decode_success_count++;
-			uint64_t decode_time = (os_gettime_ns() - decode_start) / 1000000;
-
-			// Log if gap > 100ms or every 30 frames
-			if (decode_gap_ms > 100 || decode_success_count % 30 == 0) {
-				blog(LOG_INFO, "[DEBUG Decode] #%llu, gap=%llums, decode_time=%llums, size=%zu",
-				     (unsigned long long)decode_success_count, (unsigned long long)decode_gap_ms,
-				     (unsigned long long)decode_time, raw_size);
-			}
-
-			if (decode_time > 15) {
-				blog(LOG_WARNING, "[DEBUG Decode] Slow decode: %llums, size=%zu",
-				     (unsigned long long)decode_time, raw_size);
-			}
-
-			last_decode_time = os_gettime_ns();
-
-			// Measure actual FPS from server
-			uint64_t now_ns = os_gettime_ns();
-			if (ctx->fps_measure_start == 0) {
-				ctx->fps_measure_start = now_ns;
-				ctx->fps_frame_count = 0;
-			}
-			ctx->fps_frame_count++;
-			uint64_t elapsed_ms = (now_ns - ctx->fps_measure_start) / 1000000;
-			if (elapsed_ms >= 5000) { // Report every 5 seconds
-				double actual_fps = (double)ctx->fps_frame_count * 1000.0 / (double)elapsed_ms;
-				blog(LOG_INFO, "[FPS] Server output: %.1f fps (%d frames in %llums)", actual_fps,
-				     ctx->fps_frame_count, (unsigned long long)elapsed_ms);
-				ctx->fps_measure_start = now_ns;
-				ctx->fps_frame_count = 0;
-			}
-
-			size_t frame_size = decoded.linesize * decoded.height;
-
-			if (ctx->smooth_mode) {
-				// Smooth mode: add to jitter buffer
-				pthread_mutex_lock(&ctx->jitter_mutex);
-
-				// Update timestamp extrapolator and jitter estimator
-				uint64_t now_us = receive_time_ns / 1000;
-
-				// Update timestamp extrapolator (RLS filter for RTP->local time mapping)
-				if (ctx->ts_extrap) {
-					timestamp_extrapolator_update(ctx->ts_extrap, now_us, rtp_timestamp);
-				}
-
-				// Update jitter estimator with RTP timestamp (more accurate IFDV calculation)
-				if (ctx->jitter_est) {
-					// Use RTP-based update for proper inter-frame delay variation
-					// This accounts for actual frame timing from the source
-					jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, raw_size);
-
-					// Sync buffer target from jitter estimator (may increase on underruns)
-					int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, 0);
-					if (new_target != ctx->buffer_target) {
-						ctx->buffer_target = new_target;
-					}
-				}
-
-				if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
-					// Buffer full, drop oldest (index 0)
-					bfree(ctx->jitter_buffer[0].data);
-					ctx->jitter_buffer[0].data = NULL;
-					// Shift all frames down
-					for (int i = 0; i < ctx->jitter_count - 1; i++) {
-						ctx->jitter_buffer[i] = ctx->jitter_buffer[i + 1];
-					}
-					ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
-					ctx->jitter_count--;
-				}
-
-				// Find sorted insertion position by RTP timestamp
-				// Use signed comparison to handle RTP wraparound
-				int insert_pos = ctx->jitter_count; // Default: append at end
-				for (int i = ctx->jitter_count - 1; i >= 0; i--) {
-					int32_t diff = (int32_t)(rtp_timestamp - ctx->jitter_buffer[i].rtp_timestamp);
-					if (diff > 0) {
-						// New frame is after frame[i], insert after it
-						insert_pos = i + 1;
-						break;
-					} else if (diff == 0) {
-						// Duplicate timestamp, skip
-						blog(LOG_WARNING, "[Jitter] Duplicate RTP timestamp %u, skipping",
-						     rtp_timestamp);
-						pthread_mutex_unlock(&ctx->jitter_mutex);
-						goto skip_jitter_insert;
-					}
-					insert_pos = i; // New frame is before frame[i]
-				}
-
-				// Log out-of-order insertions
-				bool out_of_order = (insert_pos < ctx->jitter_count);
-				if (out_of_order) {
-					blog(LOG_INFO, "[Jitter] Out-of-order frame: rtp=%u inserted at pos %d/%d",
-					     rtp_timestamp, insert_pos, ctx->jitter_count);
-				}
-
-				// Shift frames to make room for insertion
-				if (insert_pos < ctx->jitter_count) {
-					for (int i = ctx->jitter_count; i > insert_pos; i--) {
-						ctx->jitter_buffer[i] = ctx->jitter_buffer[i - 1];
-					}
-					ctx->jitter_buffer[insert_pos].data = NULL; // Clear moved pointer
-				}
-
-				// Insert the new frame
-				struct jitter_frame *jf = &ctx->jitter_buffer[insert_pos];
-				if (!jf->data || jf->size < frame_size) {
-					bfree(jf->data);
-					jf->data = bmalloc(frame_size);
-				}
-				memcpy(jf->data, decoded.data, frame_size);
-				jf->size = frame_size;
-				jf->width = decoded.width;
-				jf->height = decoded.height;
-				jf->rtp_timestamp = rtp_timestamp;
-				jf->receive_time_ns = receive_time_ns;
-
-				ctx->jitter_count++;
-
-				// Burst pattern detection
-				uint64_t now_ns = os_gettime_ns();
-				uint64_t gap_ns =
-					(ctx->last_frame_receive_ns > 0) ? (now_ns - ctx->last_frame_receive_ns) : 0;
-				double gap_ms = (double)gap_ns / 1000000.0;
-
-				// Gap threshold: if > 100ms since last frame, we were in a gap
-				const double GAP_THRESHOLD_MS = 100.0;
-
-				if (gap_ms > GAP_THRESHOLD_MS && ctx->last_frame_receive_ns > 0) {
-					// We were in a gap, now a new burst is starting
-					if (ctx->burst_frame_count > 0) {
-						// Learn from the previous burst
-						ctx->burst_count++;
-						double alpha = (ctx->burst_count > 10) ? 0.1 : 0.3;
-						ctx->avg_burst_frames = ctx->avg_burst_frames * (1.0 - alpha) +
-									ctx->burst_frame_count * alpha;
-						ctx->avg_gap_duration_ms =
-							ctx->avg_gap_duration_ms * (1.0 - alpha) + gap_ms * alpha;
-
-						blog(LOG_INFO,
-						     "[Burst] New burst started. prev_burst=%d frames, gap=%.0fms, "
-						     "avg_burst=%.1f, avg_gap=%.0fms",
-						     ctx->burst_frame_count, gap_ms, ctx->avg_burst_frames,
-						     ctx->avg_gap_duration_ms);
-					}
-					ctx->burst_start_time_ns = now_ns;
-					ctx->burst_frame_count = 1;
-					ctx->in_gap = false;
-				} else {
-					// Continuing current burst
-					ctx->burst_frame_count++;
-				}
-				ctx->last_frame_receive_ns = now_ns;
-
-				// Log buffer state periodically
-				static int jitter_log_counter = 0;
-				if (jitter_log_counter++ % 30 == 0) {
-					uint32_t oldest_rtp = ctx->jitter_buffer[0].rtp_timestamp;
-					uint32_t newest_rtp = ctx->jitter_buffer[ctx->jitter_count - 1].rtp_timestamp;
-					int32_t rtp_span = (int32_t)(newest_rtp - oldest_rtp);
-					double span_ms = (double)rtp_span / 90.0;
-					blog(LOG_INFO,
-					     "[Jitter] Buffer: count=%d, rtp_span=%.1fms (oldest=%u, newest=%u)",
-					     ctx->jitter_count, span_ms, oldest_rtp, newest_rtp);
-				}
-
+		// Find sorted insertion position by RTP timestamp
+		int insert_pos = ctx->jitter_count;
+		for (int i = ctx->jitter_count - 1; i >= 0; i--) {
+			int32_t diff = (int32_t)(rtp_timestamp - ctx->jitter_buffer[i].rtp_timestamp);
+			if (diff > 0) {
+				insert_pos = i + 1;
+				break;
+			} else if (diff == 0) {
+				blog(LOG_WARNING, "[Jitter] Duplicate RTP %u, skipping", rtp_timestamp);
 				pthread_mutex_unlock(&ctx->jitter_mutex);
-			} else if (0) {
-			skip_jitter_insert:; // Label requires a statement
-			} else {
-				// Normal mode: directly copy to decoded_frame
-				pthread_mutex_lock(&ctx->mutex);
-
-				if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
-				    ctx->decoded_frame_height != decoded.height) {
-					bfree(ctx->decoded_frame);
-					ctx->decoded_frame = bmalloc(frame_size);
-				}
-
-				memcpy(ctx->decoded_frame, decoded.data, frame_size);
-				ctx->decoded_frame_width = decoded.width;
-				ctx->decoded_frame_height = decoded.height;
-				ctx->decoded_frame_ready = true;
-
-				pthread_mutex_unlock(&ctx->mutex);
+				return;
 			}
-		} else {
-			// === DEBUG: Decode failed ===
-			decode_fail_count++;
-			blog(LOG_WARNING, "[DEBUG Decode] FAILED! total_fails=%llu, size=%zu",
-			     (unsigned long long)decode_fail_count, raw_size);
+			insert_pos = i;
 		}
 
-		bfree(raw_data);
-	}
+		// Log out-of-order
+		if (insert_pos < ctx->jitter_count) {
+			blog(LOG_INFO, "[Jitter] Out-of-order: rtp=%u at pos %d/%d", rtp_timestamp, insert_pos,
+			     ctx->jitter_count);
+		}
 
-	blog(LOG_INFO, "[Daydream Decode] Thread stopped");
-	return NULL;
+		// Shift frames for insertion
+		if (insert_pos < ctx->jitter_count) {
+			for (int i = ctx->jitter_count; i > insert_pos; i--) {
+				ctx->jitter_buffer[i] = ctx->jitter_buffer[i - 1];
+			}
+			ctx->jitter_buffer[insert_pos].data = NULL;
+		}
+
+		// Insert frame
+		struct jitter_frame *jf = &ctx->jitter_buffer[insert_pos];
+		if (!jf->data || jf->size < frame_size) {
+			bfree(jf->data);
+			jf->data = bmalloc(frame_size);
+		}
+		memcpy(jf->data, decoded.data, frame_size);
+		jf->size = frame_size;
+		jf->width = decoded.width;
+		jf->height = decoded.height;
+		jf->rtp_timestamp = rtp_timestamp;
+		jf->receive_time_ns = receive_time_ns;
+		ctx->jitter_count++;
+
+		// Burst pattern detection
+		uint64_t burst_gap_ns = (ctx->last_frame_receive_ns > 0) ? (now - ctx->last_frame_receive_ns) : 0;
+		double burst_gap_ms = (double)burst_gap_ns / 1000000.0;
+		const double GAP_THRESHOLD_MS = 100.0;
+
+		if (burst_gap_ms > GAP_THRESHOLD_MS && ctx->last_frame_receive_ns > 0) {
+			if (ctx->burst_frame_count > 0) {
+				ctx->burst_count++;
+				double alpha = (ctx->burst_count > 10) ? 0.1 : 0.3;
+				ctx->avg_burst_frames =
+					ctx->avg_burst_frames * (1.0 - alpha) + ctx->burst_frame_count * alpha;
+				ctx->avg_gap_duration_ms =
+					ctx->avg_gap_duration_ms * (1.0 - alpha) + burst_gap_ms * alpha;
+				blog(LOG_INFO,
+				     "[Burst] New burst: prev=%d frames, gap=%.0fms, avg_burst=%.1f, avg_gap=%.0fms",
+				     ctx->burst_frame_count, burst_gap_ms, ctx->avg_burst_frames,
+				     ctx->avg_gap_duration_ms);
+			}
+			ctx->burst_start_time_ns = now;
+			ctx->burst_frame_count = 1;
+			ctx->in_gap = false;
+		} else {
+			ctx->burst_frame_count++;
+		}
+		ctx->last_frame_receive_ns = now;
+
+		// Periodic buffer state log
+		static int jitter_log_counter = 0;
+		if (jitter_log_counter++ % 30 == 0 && ctx->jitter_count > 0) {
+			uint32_t oldest_rtp = ctx->jitter_buffer[0].rtp_timestamp;
+			uint32_t newest_rtp = ctx->jitter_buffer[ctx->jitter_count - 1].rtp_timestamp;
+			int32_t rtp_span = (int32_t)(newest_rtp - oldest_rtp);
+			blog(LOG_INFO, "[Jitter] Buffer: count=%d, span=%.1fms", ctx->jitter_count,
+			     (double)rtp_span / 90.0);
+		}
+
+		pthread_mutex_unlock(&ctx->jitter_mutex);
+	} else {
+		// Normal mode: direct to decoded_frame
+		pthread_mutex_lock(&ctx->mutex);
+
+		if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+		    ctx->decoded_frame_height != decoded.height) {
+			bfree(ctx->decoded_frame);
+			ctx->decoded_frame = bmalloc(frame_size);
+		}
+
+		memcpy(ctx->decoded_frame, decoded.data, frame_size);
+		ctx->decoded_frame_width = decoded.width;
+		ctx->decoded_frame_height = decoded.height;
+		ctx->decoded_frame_ready = true;
+
+		pthread_mutex_unlock(&ctx->mutex);
+	}
 }
 
 static void on_whep_state(bool connected, const char *error, void *userdata)
@@ -656,8 +502,6 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
-	pthread_mutex_init(&ctx->raw_mutex, NULL);
-	pthread_cond_init(&ctx->raw_cond, NULL);
 	pthread_mutex_init(&ctx->jitter_mutex, NULL);
 
 	// Initialize jitter buffer (sorted by RTP timestamp)
@@ -697,12 +541,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 		pthread_join(ctx->encode_thread, NULL);
 	}
 
-	if (ctx->decode_thread_running) {
-		ctx->decode_thread_running = false;
-		pthread_cond_signal(&ctx->raw_cond);
-		pthread_join(ctx->decode_thread, NULL);
-	}
-
 	if (ctx->whep_thread_running) {
 		pthread_join(ctx->whep_thread, NULL);
 		ctx->whep_thread_running = false;
@@ -738,10 +576,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->streaming = false;
 	ctx->stopping = false;
 	ctx->decoded_frame_ready = false;
-
-	ctx->raw_queue_head = 0;
-	ctx->raw_queue_tail = 0;
-	ctx->raw_queue_count = 0;
 
 	// Reset jitter buffer
 	ctx->jitter_count = 0;
@@ -817,18 +651,12 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->interp_frame_b);
 	bfree(ctx->interp_frame_out);
 
-	for (int i = 0; i < RAW_QUEUE_SIZE; i++) {
-		bfree(ctx->raw_queue[i].data);
-	}
-
 	for (int i = 0; i < JITTER_BUFFER_SIZE; i++) {
 		bfree(ctx->jitter_buffer[i].data);
 	}
 
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
-	pthread_cond_destroy(&ctx->raw_cond);
-	pthread_mutex_destroy(&ctx->raw_mutex);
 	pthread_mutex_destroy(&ctx->jitter_mutex);
 
 	bfree(ctx);
@@ -1062,6 +890,44 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				target_speed = 1.0f + gain * excess;
 				if (target_speed > ctx->speed_max)
 					target_speed = ctx->speed_max;
+			}
+
+			// Frame skip for aggressive catch-up when buffer is way too full
+			// Skip threshold: if buffer > 2x target, skip frames to catch up faster
+			int skip_threshold = ctx->buffer_target * 2;
+			if (ctx->jitter_count > skip_threshold) {
+				int frames_to_skip = ctx->jitter_count - ctx->buffer_target;
+				// Don't skip too many at once (max 50% of excess)
+				if (frames_to_skip > (ctx->jitter_count - ctx->buffer_target) / 2) {
+					frames_to_skip = (ctx->jitter_count - ctx->buffer_target) / 2;
+				}
+				// Minimum 1 frame skip
+				if (frames_to_skip < 1)
+					frames_to_skip = 1;
+
+				blog(LOG_INFO, "[Skip] Buffer overflow: %d frames (target=%d), skipping %d frames",
+				     ctx->jitter_count, ctx->buffer_target, frames_to_skip);
+
+				// Skip frames by removing oldest ones
+				for (int i = 0; i < frames_to_skip && ctx->jitter_count > ctx->buffer_target; i++) {
+					bfree(ctx->jitter_buffer[0].data);
+					ctx->jitter_buffer[0].data = NULL;
+					for (int j = 0; j < ctx->jitter_count - 1; j++) {
+						ctx->jitter_buffer[j] = ctx->jitter_buffer[j + 1];
+					}
+					ctx->jitter_buffer[ctx->jitter_count - 1].data = NULL;
+					ctx->jitter_count--;
+				}
+
+				// Reset interpolation state since we skipped frames
+				ctx->interp_has_a = false;
+				ctx->interp_has_b = false;
+
+				// Also reset RTP accumulator to current oldest frame
+				if (ctx->jitter_count > 0) {
+					ctx->jitter_playback_start_rtp = ctx->jitter_buffer[0].rtp_timestamp;
+					ctx->accumulated_rtp = 0;
+				}
 			}
 
 			// Chrome-inspired gradual speed change (prevents jerky playback)
@@ -1514,9 +1380,6 @@ static void *start_streaming_thread_func(void *data)
 
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
-
-	ctx->decode_thread_running = true;
-	pthread_create(&ctx->decode_thread, NULL, decode_thread_func, ctx);
 
 	blog(LOG_INFO, "[Daydream] WHIP streaming started, connecting WHEP in background...");
 
