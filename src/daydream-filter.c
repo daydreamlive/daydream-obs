@@ -27,7 +27,6 @@
 struct raw_packet {
 	uint8_t *data;
 	size_t size;
-	uint32_t rtp_timestamp;
 };
 
 struct daydream_filter {
@@ -132,6 +131,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, bool is_keyframe, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
+	UNUSED_PARAMETER(timestamp);
 	UNUSED_PARAMETER(is_keyframe);
 
 	if (!ctx)
@@ -153,7 +153,6 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 
 	memcpy(pkt->data, data, size);
 	pkt->size = size;
-	pkt->rtp_timestamp = timestamp;
 
 	ctx->raw_queue_head = (ctx->raw_queue_head + 1) % RAW_QUEUE_SIZE;
 	ctx->raw_queue_count++;
@@ -183,7 +182,6 @@ static void *decode_thread_func(void *data)
 		struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_tail];
 		uint8_t *raw_data = bmalloc(pkt->size);
 		size_t raw_size = pkt->size;
-		uint32_t rtp_ts = pkt->rtp_timestamp;
 		memcpy(raw_data, pkt->data, raw_size);
 
 		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
