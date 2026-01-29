@@ -21,12 +21,29 @@
 #define PROP_STEPS "steps"
 #define PROP_START "start"
 #define PROP_STOP "stop"
+#define PROP_SMOOTH_MODE "smooth_mode"
 
 #define RAW_QUEUE_SIZE 32
+
+// Jitter buffer for smooth playback
+#define JITTER_BUFFER_SIZE 60          // ~2 seconds @ 30fps
+#define JITTER_DELAY_MS 500            // 500ms buffering delay
+#define RTP_CLOCK_RATE 90000           // H264 RTP clock rate
+
+struct jitter_frame {
+	uint8_t *data;
+	size_t size;
+	uint32_t width;
+	uint32_t height;
+	uint32_t rtp_timestamp;
+	uint64_t receive_time_ns;
+};
 
 struct raw_packet {
 	uint8_t *data;
 	size_t size;
+	uint32_t rtp_timestamp;
+	uint64_t receive_time_ns;
 };
 
 struct daydream_filter {
@@ -97,6 +114,17 @@ struct daydream_filter {
 	uint64_t frame_count;
 	uint64_t last_encode_time;
 	uint32_t target_fps;
+
+	// Jitter buffer for smooth playback
+	bool smooth_mode;
+	struct jitter_frame jitter_buffer[JITTER_BUFFER_SIZE];
+	int jitter_head;
+	int jitter_tail;
+	int jitter_count;
+	uint64_t jitter_playback_start_time;
+	uint32_t jitter_playback_start_rtp;
+	bool jitter_playback_started;
+	pthread_mutex_t jitter_mutex;
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -121,6 +149,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->guidance = (float)obs_data_get_double(settings, PROP_GUIDANCE);
 	ctx->delta = (float)obs_data_get_double(settings, PROP_DELTA);
 	ctx->steps = (int)obs_data_get_int(settings, PROP_STEPS);
+	ctx->smooth_mode = obs_data_get_bool(settings, PROP_SMOOTH_MODE);
 
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -128,15 +157,56 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, bool is_keyframe, void *userdata)
 {
 	struct daydream_filter *ctx = userdata;
-	UNUSED_PARAMETER(timestamp);
 	UNUSED_PARAMETER(is_keyframe);
+	uint64_t receive_time_ns = os_gettime_ns();
 
 	if (!ctx)
 		return;
 
+	// === DEBUG: Hypothesis 1,2 - frame receive interval and keyframe detection ===
+	static uint64_t last_whep_frame_time = 0;
+	static uint64_t last_keyframe_time = 0;
+	static uint64_t whep_frame_count = 0;
+	uint64_t now = os_gettime_ns();
+
+	// H264 keyframe detection (NAL unit type 5 = IDR, type 7 = SPS)
+	bool detected_keyframe = false;
+	if (size > 4) {
+		// Check for start code (0x00000001 or 0x000001)
+		const uint8_t *p = data;
+		if ((p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) || (p[0] == 0 && p[1] == 0 && p[2] == 1)) {
+			int offset = (p[2] == 1) ? 3 : 4;
+			uint8_t nal_type = p[offset] & 0x1F;
+			detected_keyframe = (nal_type == 5 || nal_type == 7);
+		}
+	}
+
+	uint64_t gap_ms = (last_whep_frame_time > 0) ? (now - last_whep_frame_time) / 1000000 : 0;
+
+	// Log if gap > 100ms, otherwise every 30 frames
+	if (gap_ms > 100 || whep_frame_count % 30 == 0) {
+		blog(LOG_INFO, "[DEBUG WHEP] frame #%llu, gap=%llums, size=%zu, keyframe=%s",
+		     (unsigned long long)whep_frame_count, (unsigned long long)gap_ms, size,
+		     detected_keyframe ? "YES" : "no");
+	}
+
+	if (detected_keyframe) {
+		uint64_t keyframe_gap_ms = (last_keyframe_time > 0) ? (now - last_keyframe_time) / 1000000 : 0;
+		blog(LOG_INFO, "[DEBUG WHEP] === KEYFRAME === gap since last keyframe: %llums",
+		     (unsigned long long)keyframe_gap_ms);
+		last_keyframe_time = now;
+	}
+
+	last_whep_frame_time = now;
+	whep_frame_count++;
+	// === END DEBUG ===
+
 	pthread_mutex_lock(&ctx->raw_mutex);
 
+	// === DEBUG: Hypothesis 5 - queue overflow ===
 	if (ctx->raw_queue_count >= RAW_QUEUE_SIZE) {
+		blog(LOG_WARNING, "[DEBUG WHEP] Queue overflow! Dropping oldest frame. queue_count=%d",
+		     ctx->raw_queue_count);
 		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
 		ctx->raw_queue_count--;
 	}
@@ -150,6 +220,8 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t timestamp, 
 
 	memcpy(pkt->data, data, size);
 	pkt->size = size;
+	pkt->rtp_timestamp = timestamp;
+	pkt->receive_time_ns = receive_time_ns;
 
 	ctx->raw_queue_head = (ctx->raw_queue_head + 1) % RAW_QUEUE_SIZE;
 	ctx->raw_queue_count++;
@@ -179,6 +251,8 @@ static void *decode_thread_func(void *data)
 		struct raw_packet *pkt = &ctx->raw_queue[ctx->raw_queue_tail];
 		uint8_t *raw_data = bmalloc(pkt->size);
 		size_t raw_size = pkt->size;
+		uint32_t rtp_timestamp = pkt->rtp_timestamp;
+		uint64_t receive_time_ns = pkt->receive_time_ns;
 		memcpy(raw_data, pkt->data, raw_size);
 
 		ctx->raw_queue_tail = (ctx->raw_queue_tail + 1) % RAW_QUEUE_SIZE;
@@ -186,30 +260,88 @@ static void *decode_thread_func(void *data)
 
 		pthread_mutex_unlock(&ctx->raw_mutex);
 
+		// === DEBUG: Hypothesis 3 - decode interval and success rate ===
+		static uint64_t last_decode_time = 0;
+		static uint64_t decode_success_count = 0;
+		static uint64_t decode_fail_count = 0;
+
 		uint64_t decode_start = os_gettime_ns();
+		uint64_t decode_gap_ms = (last_decode_time > 0) ? (decode_start - last_decode_time) / 1000000 : 0;
+
 		struct daydream_decoded_frame decoded;
-		if (ctx->decoder && daydream_decoder_decode(ctx->decoder, raw_data, raw_size, &decoded)) {
+		bool decode_success = ctx->decoder &&
+				      daydream_decoder_decode(ctx->decoder, raw_data, raw_size, &decoded);
+
+		if (decode_success) {
+			decode_success_count++;
 			uint64_t decode_time = (os_gettime_ns() - decode_start) / 1000000;
-			if (decode_time > 15) {
-				blog(LOG_WARNING, "[Daydream Decode] Slow decode: %llums, size=%zu",
+
+			// Log if gap > 100ms or every 30 frames
+			if (decode_gap_ms > 100 || decode_success_count % 30 == 0) {
+				blog(LOG_INFO, "[DEBUG Decode] #%llu, gap=%llums, decode_time=%llums, size=%zu",
+				     (unsigned long long)decode_success_count, (unsigned long long)decode_gap_ms,
 				     (unsigned long long)decode_time, raw_size);
 			}
-			pthread_mutex_lock(&ctx->mutex);
 
-			// Directly copy decoded frame for immediate display (no jitter buffering)
-			size_t frame_size = decoded.linesize * decoded.height;
-			if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
-			    ctx->decoded_frame_height != decoded.height) {
-				bfree(ctx->decoded_frame);
-				ctx->decoded_frame = bmalloc(frame_size);
+			if (decode_time > 15) {
+				blog(LOG_WARNING, "[DEBUG Decode] Slow decode: %llums, size=%zu",
+				     (unsigned long long)decode_time, raw_size);
 			}
 
-			memcpy(ctx->decoded_frame, decoded.data, frame_size);
-			ctx->decoded_frame_width = decoded.width;
-			ctx->decoded_frame_height = decoded.height;
-			ctx->decoded_frame_ready = true;
+			last_decode_time = os_gettime_ns();
 
-			pthread_mutex_unlock(&ctx->mutex);
+			size_t frame_size = decoded.linesize * decoded.height;
+
+			if (ctx->smooth_mode) {
+				// Smooth mode: add to jitter buffer
+				pthread_mutex_lock(&ctx->jitter_mutex);
+
+				if (ctx->jitter_count >= JITTER_BUFFER_SIZE) {
+					// Buffer full, drop oldest
+					bfree(ctx->jitter_buffer[ctx->jitter_tail].data);
+					ctx->jitter_buffer[ctx->jitter_tail].data = NULL;
+					ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+					ctx->jitter_count--;
+				}
+
+				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_head];
+				if (!jf->data || jf->size < frame_size) {
+					bfree(jf->data);
+					jf->data = bmalloc(frame_size);
+				}
+				memcpy(jf->data, decoded.data, frame_size);
+				jf->size = frame_size;
+				jf->width = decoded.width;
+				jf->height = decoded.height;
+				jf->rtp_timestamp = rtp_timestamp;
+				jf->receive_time_ns = receive_time_ns;
+
+				ctx->jitter_head = (ctx->jitter_head + 1) % JITTER_BUFFER_SIZE;
+				ctx->jitter_count++;
+
+				pthread_mutex_unlock(&ctx->jitter_mutex);
+			} else {
+				// Normal mode: directly copy to decoded_frame
+				pthread_mutex_lock(&ctx->mutex);
+
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+				    ctx->decoded_frame_height != decoded.height) {
+					bfree(ctx->decoded_frame);
+					ctx->decoded_frame = bmalloc(frame_size);
+				}
+
+				memcpy(ctx->decoded_frame, decoded.data, frame_size);
+				ctx->decoded_frame_width = decoded.width;
+				ctx->decoded_frame_height = decoded.height;
+				ctx->decoded_frame_ready = true;
+
+				pthread_mutex_unlock(&ctx->mutex);
+			}
+		} else {
+			// === DEBUG: Decode failed ===
+			decode_fail_count++;
+			blog(LOG_WARNING, "[DEBUG Decode] FAILED! total_fails=%llu, size=%zu",
+			     (unsigned long long)decode_fail_count, raw_size);
 		}
 
 		bfree(raw_data);
@@ -329,6 +461,13 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_cond_init(&ctx->frame_cond, NULL);
 	pthread_mutex_init(&ctx->raw_mutex, NULL);
 	pthread_cond_init(&ctx->raw_cond, NULL);
+	pthread_mutex_init(&ctx->jitter_mutex, NULL);
+
+	// Initialize jitter buffer
+	ctx->jitter_head = 0;
+	ctx->jitter_tail = 0;
+	ctx->jitter_count = 0;
+	ctx->jitter_playback_started = false;
 
 	ctx->auth = daydream_auth_create();
 
@@ -392,6 +531,12 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->raw_queue_head = 0;
 	ctx->raw_queue_tail = 0;
 	ctx->raw_queue_count = 0;
+
+	// Reset jitter buffer
+	ctx->jitter_head = 0;
+	ctx->jitter_tail = 0;
+	ctx->jitter_count = 0;
+	ctx->jitter_playback_started = false;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -428,10 +573,15 @@ static void daydream_filter_destroy(void *data)
 		bfree(ctx->raw_queue[i].data);
 	}
 
+	for (int i = 0; i < JITTER_BUFFER_SIZE; i++) {
+		bfree(ctx->jitter_buffer[i].data);
+	}
+
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
 	pthread_cond_destroy(&ctx->raw_cond);
 	pthread_mutex_destroy(&ctx->raw_mutex);
+	pthread_mutex_destroy(&ctx->jitter_mutex);
 
 	bfree(ctx);
 }
@@ -566,24 +716,147 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	gs_texture_t *output = tex;
 
-	pthread_mutex_lock(&ctx->mutex);
+	// === DEBUG: Hypothesis 4 - render frame update interval ===
+	static uint64_t last_render_update_time = 0;
+	static uint64_t render_update_count = 0;
+	static uint64_t render_no_frame_count = 0;
 
-	if (ctx->decoded_frame_ready && ctx->decoded_frame) {
-		if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
-		    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
-			if (ctx->output_texture)
-				gs_texture_destroy(ctx->output_texture);
-			ctx->output_texture = gs_texture_create(ctx->decoded_frame_width, ctx->decoded_frame_height,
-								GS_BGRA, 1, NULL, GS_DYNAMIC);
+	if (ctx->smooth_mode) {
+		// Smooth mode: get frame from jitter buffer
+		pthread_mutex_lock(&ctx->jitter_mutex);
+
+		uint64_t now = os_gettime_ns();
+		bool has_frame = false;
+
+		// Check if we have enough buffered frames to start playback
+		if (!ctx->jitter_playback_started) {
+			// Need at least JITTER_DELAY_MS worth of frames
+			if (ctx->jitter_count > 0) {
+				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
+				struct jitter_frame *newest =
+					&ctx->jitter_buffer[(ctx->jitter_head - 1 + JITTER_BUFFER_SIZE) %
+							    JITTER_BUFFER_SIZE];
+				uint64_t buffer_duration_ms =
+					(newest->receive_time_ns - oldest->receive_time_ns) / 1000000;
+
+				if (buffer_duration_ms >= JITTER_DELAY_MS || ctx->jitter_count >= 15) {
+					ctx->jitter_playback_started = true;
+					ctx->jitter_playback_start_time = now;
+					ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
+					blog(LOG_INFO, "[Jitter] Playback started, buffered %llums (%d frames)",
+					     (unsigned long long)buffer_duration_ms, ctx->jitter_count);
+				}
+			}
 		}
 
-		if (ctx->output_texture) {
-			gs_texture_set_image(ctx->output_texture, ctx->decoded_frame, ctx->decoded_frame_width * 4,
-					     false);
-			output = ctx->output_texture;
+		if (ctx->jitter_playback_started && ctx->jitter_count > 0) {
+			// Calculate which frame to display based on elapsed time
+			uint64_t elapsed_ns = now - ctx->jitter_playback_start_time;
+			uint32_t elapsed_rtp = (uint32_t)((elapsed_ns / 1000000) * 90); // ms to 90kHz
+
+			struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+
+			// Check if it's time to display this frame
+			int32_t rtp_diff = (int32_t)(jf->rtp_timestamp - ctx->jitter_playback_start_rtp);
+			if (rtp_diff <= (int32_t)elapsed_rtp) {
+				// Time to show this frame
+				pthread_mutex_lock(&ctx->mutex);
+
+				size_t frame_size = jf->size;
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != jf->width ||
+				    ctx->decoded_frame_height != jf->height) {
+					bfree(ctx->decoded_frame);
+					ctx->decoded_frame = bmalloc(frame_size);
+				}
+
+				memcpy(ctx->decoded_frame, jf->data, frame_size);
+				ctx->decoded_frame_width = jf->width;
+				ctx->decoded_frame_height = jf->height;
+				ctx->decoded_frame_ready = true;
+
+				pthread_mutex_unlock(&ctx->mutex);
+
+				// Remove from jitter buffer
+				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+				ctx->jitter_count--;
+				has_frame = true;
+			}
 		}
+
+		pthread_mutex_unlock(&ctx->jitter_mutex);
+
+		// Now render the frame
+		pthread_mutex_lock(&ctx->mutex);
+		if (ctx->decoded_frame_ready && ctx->decoded_frame) {
+			render_update_count++;
+			uint64_t render_gap_ms =
+				(last_render_update_time > 0) ? (now - last_render_update_time) / 1000000 : 0;
+
+			if (render_gap_ms > 100 || render_update_count % 30 == 0) {
+				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums, jitter_count=%d",
+				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms,
+				     ctx->jitter_count);
+			}
+			last_render_update_time = now;
+
+			if (!ctx->output_texture ||
+			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
+			    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
+				if (ctx->output_texture)
+					gs_texture_destroy(ctx->output_texture);
+				ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
+									ctx->decoded_frame_height, GS_BGRA, 1, NULL,
+									GS_DYNAMIC);
+			}
+
+			if (ctx->output_texture) {
+				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
+						     ctx->decoded_frame_width * 4, false);
+				output = ctx->output_texture;
+			}
+		}
+		pthread_mutex_unlock(&ctx->mutex);
+	} else {
+		// Normal mode: use decoded_frame directly
+		pthread_mutex_lock(&ctx->mutex);
+
+		if (ctx->decoded_frame_ready && ctx->decoded_frame) {
+			render_update_count++;
+			uint64_t now = os_gettime_ns();
+			uint64_t render_gap_ms =
+				(last_render_update_time > 0) ? (now - last_render_update_time) / 1000000 : 0;
+
+			if (render_gap_ms > 100 || render_update_count % 30 == 0) {
+				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums",
+				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms);
+			}
+			last_render_update_time = now;
+
+			if (!ctx->output_texture ||
+			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
+			    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
+				if (ctx->output_texture)
+					gs_texture_destroy(ctx->output_texture);
+				ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
+									ctx->decoded_frame_height, GS_BGRA, 1, NULL,
+									GS_DYNAMIC);
+			}
+
+			if (ctx->output_texture) {
+				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
+						     ctx->decoded_frame_width * 4, false);
+				output = ctx->output_texture;
+			}
+		} else if (ctx->streaming) {
+			render_no_frame_count++;
+			if (render_no_frame_count % 100 == 0) {
+				blog(LOG_INFO, "[DEBUG Render] No frame available (count=%llu)",
+				     (unsigned long long)render_no_frame_count);
+			}
+		}
+		pthread_mutex_unlock(&ctx->mutex);
 	}
-	pthread_mutex_unlock(&ctx->mutex);
+	// === END DEBUG ===
 
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
@@ -946,6 +1219,9 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *steps = obs_properties_add_int_slider(props, PROP_STEPS, "Steps", 1, 100, 1);
 	obs_property_set_enabled(steps, logged_in);
 
+	obs_property_t *smooth = obs_properties_add_bool(props, PROP_SMOOTH_MODE, "Smooth Mode (500ms latency)");
+	obs_property_set_enabled(smooth, logged_in);
+
 	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
 	obs_property_set_enabled(start, logged_in && !ctx->streaming);
 
@@ -963,6 +1239,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_GUIDANCE, 1.0);
 	obs_data_set_default_double(settings, PROP_DELTA, 0.7);
 	obs_data_set_default_int(settings, PROP_STEPS, 50);
+	obs_data_set_default_bool(settings, PROP_SMOOTH_MODE, false);
 }
 
 static struct obs_source_info daydream_filter_info = {
