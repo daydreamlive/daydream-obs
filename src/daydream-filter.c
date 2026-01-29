@@ -125,6 +125,17 @@ struct daydream_filter {
 	uint32_t jitter_playback_start_rtp;
 	bool jitter_playback_started;
 	pthread_mutex_t jitter_mutex;
+
+	// Frame interpolation
+	uint8_t *interp_frame_a;   // Previous frame for interpolation
+	uint8_t *interp_frame_b;   // Next frame for interpolation
+	uint8_t *interp_frame_out; // Blended output frame
+	uint32_t interp_width;
+	uint32_t interp_height;
+	uint32_t interp_rtp_a; // PTS of frame A
+	uint32_t interp_rtp_b; // PTS of frame B
+	bool interp_has_a;
+	bool interp_has_b;
 };
 
 static const char *daydream_filter_get_name(void *unused)
@@ -537,6 +548,10 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->jitter_tail = 0;
 	ctx->jitter_count = 0;
 	ctx->jitter_playback_started = false;
+
+	// Reset interpolation state (keep buffers allocated for reuse)
+	ctx->interp_has_a = false;
+	ctx->interp_has_b = false;
 }
 
 static void daydream_filter_destroy(void *data)
@@ -568,6 +583,11 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->whep_url);
 	bfree(ctx->pending_frame);
 	bfree(ctx->decoded_frame);
+
+	// Free interpolation buffers
+	bfree(ctx->interp_frame_a);
+	bfree(ctx->interp_frame_b);
+	bfree(ctx->interp_frame_out);
 
 	for (int i = 0; i < RAW_QUEUE_SIZE; i++) {
 		bfree(ctx->raw_queue[i].data);
@@ -722,65 +742,141 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	static uint64_t render_no_frame_count = 0;
 
 	if (ctx->smooth_mode) {
-		// Smooth mode: get frame from jitter buffer
+		// Smooth mode: PTS-based playback with frame interpolation
 		pthread_mutex_lock(&ctx->jitter_mutex);
 
 		uint64_t now = os_gettime_ns();
-		bool has_frame = false;
 
 		// Check if we have enough buffered frames to start playback
 		if (!ctx->jitter_playback_started) {
-			// Need at least JITTER_DELAY_MS worth of frames
-			if (ctx->jitter_count > 0) {
+			if (ctx->jitter_count >= 15) {
 				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
-				struct jitter_frame *newest =
-					&ctx->jitter_buffer[(ctx->jitter_head - 1 + JITTER_BUFFER_SIZE) %
-							    JITTER_BUFFER_SIZE];
-				uint64_t buffer_duration_ms =
-					(newest->receive_time_ns - oldest->receive_time_ns) / 1000000;
-
-				if (buffer_duration_ms >= JITTER_DELAY_MS || ctx->jitter_count >= 15) {
-					ctx->jitter_playback_started = true;
-					ctx->jitter_playback_start_time = now;
-					ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
-					blog(LOG_INFO, "[Jitter] Playback started, buffered %llums (%d frames)",
-					     (unsigned long long)buffer_duration_ms, ctx->jitter_count);
-				}
+				ctx->jitter_playback_started = true;
+				ctx->jitter_playback_start_time = now;
+				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
+				blog(LOG_INFO, "[Jitter] Playback started with %d frames", ctx->jitter_count);
 			}
 		}
 
-		if (ctx->jitter_playback_started && ctx->jitter_count > 0) {
-			// Calculate which frame to display based on elapsed time
+		if (ctx->jitter_playback_started) {
+			// Calculate current playback PTS
 			uint64_t elapsed_ns = now - ctx->jitter_playback_start_time;
 			uint32_t elapsed_rtp = (uint32_t)((elapsed_ns / 1000000) * 90); // ms to 90kHz
+			uint32_t current_rtp = ctx->jitter_playback_start_rtp + elapsed_rtp;
 
-			struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
-
-			// Check if it's time to display this frame
-			int32_t rtp_diff = (int32_t)(jf->rtp_timestamp - ctx->jitter_playback_start_rtp);
-			if (rtp_diff <= (int32_t)elapsed_rtp) {
-				// Time to show this frame
-				pthread_mutex_lock(&ctx->mutex);
-
+			// Ensure we have frame A (current frame)
+			if (!ctx->interp_has_a && ctx->jitter_count > 0) {
+				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
 				size_t frame_size = jf->size;
-				if (!ctx->decoded_frame || ctx->decoded_frame_width != jf->width ||
-				    ctx->decoded_frame_height != jf->height) {
-					bfree(ctx->decoded_frame);
-					ctx->decoded_frame = bmalloc(frame_size);
+
+				if (!ctx->interp_frame_a || ctx->interp_width != jf->width ||
+				    ctx->interp_height != jf->height) {
+					bfree(ctx->interp_frame_a);
+					bfree(ctx->interp_frame_b);
+					bfree(ctx->interp_frame_out);
+					ctx->interp_frame_a = bmalloc(frame_size);
+					ctx->interp_frame_b = bmalloc(frame_size);
+					ctx->interp_frame_out = bmalloc(frame_size);
+					ctx->interp_width = jf->width;
+					ctx->interp_height = jf->height;
 				}
 
-				memcpy(ctx->decoded_frame, jf->data, frame_size);
-				ctx->decoded_frame_width = jf->width;
-				ctx->decoded_frame_height = jf->height;
-				ctx->decoded_frame_ready = true;
+				memcpy(ctx->interp_frame_a, jf->data, frame_size);
+				ctx->interp_rtp_a = jf->rtp_timestamp;
+				ctx->interp_has_a = true;
 
-				pthread_mutex_unlock(&ctx->mutex);
-
-				// Remove from jitter buffer
 				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
 				ctx->jitter_count--;
-				has_frame = true;
 			}
+
+			// Ensure we have frame B (next frame)
+			if (ctx->interp_has_a && !ctx->interp_has_b && ctx->jitter_count > 0) {
+				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+				size_t frame_size = jf->size;
+
+				memcpy(ctx->interp_frame_b, jf->data, frame_size);
+				ctx->interp_rtp_b = jf->rtp_timestamp;
+				ctx->interp_has_b = true;
+
+				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+				ctx->jitter_count--;
+			}
+
+			// Check if we need to advance to next frame pair
+			if (ctx->interp_has_a && ctx->interp_has_b) {
+				int32_t diff_to_b = (int32_t)(ctx->interp_rtp_b - current_rtp);
+
+				if (diff_to_b <= 0) {
+					// Current time passed frame B, shift frames
+					memcpy(ctx->interp_frame_a, ctx->interp_frame_b,
+					       ctx->interp_width * ctx->interp_height * 4);
+					ctx->interp_rtp_a = ctx->interp_rtp_b;
+					ctx->interp_has_b = false;
+
+					// Try to get new frame B
+					if (ctx->jitter_count > 0) {
+						struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+						memcpy(ctx->interp_frame_b, jf->data, jf->size);
+						ctx->interp_rtp_b = jf->rtp_timestamp;
+						ctx->interp_has_b = true;
+						ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+						ctx->jitter_count--;
+					}
+				}
+			}
+
+			// Perform interpolation
+			pthread_mutex_lock(&ctx->mutex);
+
+			if (ctx->interp_has_a) {
+				size_t frame_size = ctx->interp_width * ctx->interp_height * 4;
+
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != ctx->interp_width ||
+				    ctx->decoded_frame_height != ctx->interp_height) {
+					bfree(ctx->decoded_frame);
+					ctx->decoded_frame = bmalloc(frame_size);
+					ctx->decoded_frame_width = ctx->interp_width;
+					ctx->decoded_frame_height = ctx->interp_height;
+				}
+
+				if (ctx->interp_has_b) {
+					// Linear interpolation between A and B
+					int32_t rtp_range = (int32_t)(ctx->interp_rtp_b - ctx->interp_rtp_a);
+					int32_t rtp_pos = (int32_t)(current_rtp - ctx->interp_rtp_a);
+
+					float alpha = 0.0f;
+					if (rtp_range > 0) {
+						alpha = (float)rtp_pos / (float)rtp_range;
+						if (alpha < 0.0f)
+							alpha = 0.0f;
+						if (alpha > 1.0f)
+							alpha = 1.0f;
+					}
+
+					// Blend pixels: out = A * (1-alpha) + B * alpha
+					uint8_t *a = ctx->interp_frame_a;
+					uint8_t *b = ctx->interp_frame_b;
+					uint8_t *out = ctx->decoded_frame;
+					size_t pixel_count = ctx->interp_width * ctx->interp_height * 4;
+
+					for (size_t i = 0; i < pixel_count; i++) {
+						out[i] = (uint8_t)((float)a[i] * (1.0f - alpha) + (float)b[i] * alpha);
+					}
+
+					static int log_counter = 0;
+					if (log_counter++ % 30 == 0) {
+						blog(LOG_INFO, "[Interp] alpha=%.2f, jitter_count=%d", alpha,
+						     ctx->jitter_count);
+					}
+				} else {
+					// No frame B, just show frame A
+					memcpy(ctx->decoded_frame, ctx->interp_frame_a, frame_size);
+				}
+
+				ctx->decoded_frame_ready = true;
+			}
+
+			pthread_mutex_unlock(&ctx->mutex);
 		}
 
 		pthread_mutex_unlock(&ctx->jitter_mutex);
@@ -789,15 +885,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		pthread_mutex_lock(&ctx->mutex);
 		if (ctx->decoded_frame_ready && ctx->decoded_frame) {
 			render_update_count++;
-			uint64_t render_gap_ms =
-				(last_render_update_time > 0) ? (now - last_render_update_time) / 1000000 : 0;
-
-			if (render_gap_ms > 100 || render_update_count % 30 == 0) {
-				blog(LOG_INFO, "[DEBUG Render] Frame update #%llu, gap=%llums, jitter_count=%d",
-				     (unsigned long long)render_update_count, (unsigned long long)render_gap_ms,
-				     ctx->jitter_count);
-			}
-			last_render_update_time = now;
 
 			if (!ctx->output_texture ||
 			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
