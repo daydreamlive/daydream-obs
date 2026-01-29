@@ -72,9 +72,16 @@ struct daydream_filter {
 	int pending_consume_idx; // Buffer index encode is reading (-1 if idle)
 	bool pending_frame_ready;
 
-	uint8_t *decoded_frame;
+	// Double buffer for decode output
+	uint8_t *decoded_frame[2]; // BGRA fallback
+	uint8_t *nv12_y_data[2];   // NV12 Y plane
+	uint8_t *nv12_uv_data[2];  // NV12 UV plane
 	uint32_t decoded_frame_width;
 	uint32_t decoded_frame_height;
+	uint32_t nv12_y_linesize;
+	uint32_t nv12_uv_linesize;
+	int decode_produce_idx; // Buffer index with ready data
+	int decode_consume_idx; // Buffer index render is reading (-1 if idle)
 	bool decoded_frame_ready;
 	bool decoded_frame_is_nv12;
 
@@ -83,10 +90,6 @@ struct daydream_filter {
 	gs_texture_t *nv12_tex_uv;
 	gs_effect_t *nv12_effect;
 	gs_texrender_t *nv12_texrender;
-	uint8_t *nv12_y_data;
-	uint8_t *nv12_uv_data;
-	uint32_t nv12_y_linesize;
-	uint32_t nv12_uv_linesize;
 
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
@@ -137,38 +140,50 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 
 	pthread_mutex_lock(&ctx->mutex);
 
+	// Write to buffer that render isn't reading
+	int write_idx = (ctx->decode_consume_idx == 0) ? 1 : 0;
+
 	if (decoded.is_nv12) {
 		size_t y_size = decoded.y_linesize * decoded.height;
 		size_t uv_size = decoded.uv_linesize * (decoded.height / 2);
 
-		if (!ctx->nv12_y_data || ctx->decoded_frame_width != decoded.width ||
+		// Allocate double buffers if needed
+		if (!ctx->nv12_y_data[0] || ctx->decoded_frame_width != decoded.width ||
 		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->nv12_y_data);
-			bfree(ctx->nv12_uv_data);
-			ctx->nv12_y_data = bmalloc(y_size);
-			ctx->nv12_uv_data = bmalloc(uv_size);
+			bfree(ctx->nv12_y_data[0]);
+			bfree(ctx->nv12_y_data[1]);
+			bfree(ctx->nv12_uv_data[0]);
+			bfree(ctx->nv12_uv_data[1]);
+			ctx->nv12_y_data[0] = bmalloc(y_size);
+			ctx->nv12_y_data[1] = bmalloc(y_size);
+			ctx->nv12_uv_data[0] = bmalloc(uv_size);
+			ctx->nv12_uv_data[1] = bmalloc(uv_size);
 		}
 
-		memcpy(ctx->nv12_y_data, decoded.y_data, y_size);
-		memcpy(ctx->nv12_uv_data, decoded.uv_data, uv_size);
+		memcpy(ctx->nv12_y_data[write_idx], decoded.y_data, y_size);
+		memcpy(ctx->nv12_uv_data[write_idx], decoded.uv_data, uv_size);
 		ctx->nv12_y_linesize = decoded.y_linesize;
 		ctx->nv12_uv_linesize = decoded.uv_linesize;
 		ctx->decoded_frame_is_nv12 = true;
 	} else {
 		size_t frame_size = decoded.bgra_linesize * decoded.height;
 
-		if (!ctx->decoded_frame || ctx->decoded_frame_width != decoded.width ||
+		// Allocate double buffers if needed
+		if (!ctx->decoded_frame[0] || ctx->decoded_frame_width != decoded.width ||
 		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->decoded_frame);
-			ctx->decoded_frame = bmalloc(frame_size);
+			bfree(ctx->decoded_frame[0]);
+			bfree(ctx->decoded_frame[1]);
+			ctx->decoded_frame[0] = bmalloc(frame_size);
+			ctx->decoded_frame[1] = bmalloc(frame_size);
 		}
 
-		memcpy(ctx->decoded_frame, decoded.bgra_data, frame_size);
+		memcpy(ctx->decoded_frame[write_idx], decoded.bgra_data, frame_size);
 		ctx->decoded_frame_is_nv12 = false;
 	}
 
 	ctx->decoded_frame_width = decoded.width;
 	ctx->decoded_frame_height = decoded.height;
+	ctx->decode_produce_idx = write_idx;
 	ctx->decoded_frame_ready = true;
 
 	pthread_mutex_unlock(&ctx->mutex);
@@ -263,6 +278,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->target_fps = 30;
 	ctx->frame_count = 0;
 	ctx->pending_consume_idx = -1;
+	ctx->decode_consume_idx = -1;
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
@@ -357,9 +373,12 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->whep_url);
 	bfree(ctx->pending_frame[0]);
 	bfree(ctx->pending_frame[1]);
-	bfree(ctx->decoded_frame);
-	bfree(ctx->nv12_y_data);
-	bfree(ctx->nv12_uv_data);
+	bfree(ctx->decoded_frame[0]);
+	bfree(ctx->decoded_frame[1]);
+	bfree(ctx->nv12_y_data[0]);
+	bfree(ctx->nv12_y_data[1]);
+	bfree(ctx->nv12_uv_data[0]);
+	bfree(ctx->nv12_uv_data[1]);
 
 	pthread_cond_destroy(&ctx->frame_cond);
 	pthread_mutex_destroy(&ctx->mutex);
@@ -497,14 +516,27 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	gs_texture_t *output = tex;
 
-	// Render decoded frame
+	// Render decoded frame with double-buffer
 	pthread_mutex_lock(&ctx->mutex);
 
-	if (ctx->decoded_frame_ready) {
-		if (ctx->decoded_frame_is_nv12 && ctx->nv12_y_data && ctx->nv12_uv_data) {
-			uint32_t w = ctx->decoded_frame_width;
-			uint32_t h = ctx->decoded_frame_height;
+	bool has_decoded_frame = ctx->decoded_frame_ready;
+	bool is_nv12 = ctx->decoded_frame_is_nv12;
+	uint32_t w = ctx->decoded_frame_width;
+	uint32_t h = ctx->decoded_frame_height;
+	int read_idx = -1;
 
+	if (has_decoded_frame) {
+		// Take ownership of the buffer
+		ctx->decode_consume_idx = ctx->decode_produce_idx;
+		read_idx = ctx->decode_consume_idx;
+		ctx->decoded_frame_ready = false;
+	}
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	// Process outside mutex - WHEP can write to other buffer now
+	if (has_decoded_frame && read_idx >= 0) {
+		if (is_nv12 && ctx->nv12_y_data[read_idx] && ctx->nv12_uv_data[read_idx]) {
 			// Create Y texture
 			if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
 			    gs_texture_get_height(ctx->nv12_tex_y) != h) {
@@ -534,10 +566,12 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				}
 			}
 
-			// Upload textures
+			// Upload textures from double-buffer
 			if (ctx->nv12_tex_y && ctx->nv12_tex_uv) {
-				gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data, ctx->nv12_y_linesize, false);
-				gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data, ctx->nv12_uv_linesize, false);
+				gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data[read_idx], ctx->nv12_y_linesize,
+						     false);
+				gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data[read_idx],
+						     ctx->nv12_uv_linesize, false);
 			}
 
 			// Render NV12 to RGB
@@ -573,25 +607,25 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				if (rgb_tex)
 					output = rgb_tex;
 			}
-		} else if (ctx->decoded_frame) {
-			if (!ctx->output_texture ||
-			    gs_texture_get_width(ctx->output_texture) != ctx->decoded_frame_width ||
-			    gs_texture_get_height(ctx->output_texture) != ctx->decoded_frame_height) {
+		} else if (ctx->decoded_frame[read_idx]) {
+			if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != w ||
+			    gs_texture_get_height(ctx->output_texture) != h) {
 				if (ctx->output_texture)
 					gs_texture_destroy(ctx->output_texture);
-				ctx->output_texture = gs_texture_create(ctx->decoded_frame_width,
-									ctx->decoded_frame_height, GS_BGRA, 1, NULL,
-									GS_DYNAMIC);
+				ctx->output_texture = gs_texture_create(w, h, GS_BGRA, 1, NULL, GS_DYNAMIC);
 			}
 
 			if (ctx->output_texture) {
-				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame,
-						     ctx->decoded_frame_width * 4, false);
+				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame[read_idx], w * 4, false);
 				output = ctx->output_texture;
 			}
 		}
+
+		// Release buffer ownership
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->decode_consume_idx = -1;
+		pthread_mutex_unlock(&ctx->mutex);
 	}
-	pthread_mutex_unlock(&ctx->mutex);
 
 	// Final render
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
