@@ -931,7 +931,16 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			ctx->last_render_time = now;
 
 			// Accumulate RTP ticks based on current speed
-			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * 90.0 * ctx->current_speed;
+			// Problem: Server RTP timestamps assume 30fps (3000 ticks/frame)
+			//          But actual frame delivery is ~20fps
+			// Solution: Scale playback rate to match actual arrival fps
+			double actual_fps = jitter_estimator_get_fps(ctx->jitter_est);
+			if (actual_fps < 10.0)
+				actual_fps = 20.0; // Default to 20fps if not yet estimated
+
+			// At 30fps: 90 ticks/ms. At 20fps: 60 ticks/ms
+			double ticks_per_ms = 90.0 * (actual_fps / 30.0);
+			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * ticks_per_ms * ctx->current_speed;
 			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
 
 			// Frame management with interpolation
@@ -1042,9 +1051,11 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					if (log_counter++ % 30 == 0) {
 						// Calculate actual frame latency: time since frame A was received
 						uint64_t frame_age_ms = (now - ctx->interp_receive_a) / 1000000;
-						blog(LOG_INFO, "[Smooth] buf=%d/%d, speed=%.2f, frame_latency=%llums",
+						double est_fps = jitter_estimator_get_fps(ctx->jitter_est);
+						blog(LOG_INFO,
+						     "[Smooth] buf=%d/%d, speed=%.2f, latency=%llums, est_fps=%.1f",
 						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed,
-						     (unsigned long long)frame_age_ms);
+						     (unsigned long long)frame_age_ms, est_fps);
 					}
 				} else {
 					memcpy(ctx->decoded_frame, ctx->interp_frame_a, frame_size);

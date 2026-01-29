@@ -53,7 +53,9 @@ typedef struct {
 #define MAX_GAP_WINDOW 30            // Track max gap over last N frames
 #define BUFFER_TARGET_HYSTERESIS 3   // Require 3+ frame difference to change
 #define MIN_BUFFER_TARGET 4          // Never go below 4 frames
-#define MAX_BUFFER_TARGET 30         // Never go above 30 frames
+#define MAX_BUFFER_TARGET 20         // Never go above 20 frames (~1s at 20fps)
+#define BUFFER_DECAY_INTERVAL 300    // Decay target every 300 frames (~15s at 20fps)
+#define BUFFER_DECAY_AMOUNT 1        // Decay by 1 frame at a time
 
 struct jitter_estimator {
 	// Kalman filter
@@ -99,6 +101,9 @@ struct jitter_estimator {
 	double max_gap_ms;          // Current max gap in window
 	double smoothed_max_gap_ms; // EMA smoothed max gap
 	int last_buffer_target;     // For hysteresis
+
+	// Buffer target decay (to recover from temporary hiccups)
+	int frames_since_underrun; // Counter for decay timing
 };
 
 static uint64_t get_time_us(void)
@@ -232,7 +237,8 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->gap_count = 0;
 	je->max_gap_ms = 0.0;
 	je->smoothed_max_gap_ms = 100.0; // Start conservative
-	je->last_buffer_target = 8;      // Start with reasonable default (~250ms at 30fps)
+	je->last_buffer_target = 5;      // Start low (~250ms at 20fps), increase if needed
+	je->frames_since_underrun = 0;
 }
 
 void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size_t frame_size)
@@ -398,8 +404,8 @@ void jitter_estimator_notify_underrun(jitter_estimator_t *je)
 	if (!je)
 		return;
 
-	// Increase target by 2 frames on each underrun
-	int new_target = je->last_buffer_target + 2;
+	// Increase target by 1 frame on each underrun (less aggressive)
+	int new_target = je->last_buffer_target + 1;
 	if (new_target > MAX_BUFFER_TARGET)
 		new_target = MAX_BUFFER_TARGET;
 
@@ -407,6 +413,9 @@ void jitter_estimator_notify_underrun(jitter_estimator_t *je)
 		blog(LOG_WARNING, "[Buffer] Underrun! target %d->%d", je->last_buffer_target, new_target);
 		je->last_buffer_target = new_target;
 	}
+
+	// Reset decay counter - we just had an underrun, don't decay yet
+	je->frames_since_underrun = 0;
 }
 
 double jitter_estimator_get_fps(jitter_estimator_t *je)
@@ -536,4 +545,16 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 
 	// Now call the regular update with the computed IFDV
 	jitter_estimator_update(je, frame_delay_ms, frame_size);
+
+	// Buffer target decay: slowly reduce target if stable for a while
+	je->frames_since_underrun++;
+	if (je->frames_since_underrun >= BUFFER_DECAY_INTERVAL) {
+		je->frames_since_underrun = 0;
+		if (je->last_buffer_target > MIN_BUFFER_TARGET) {
+			int old_target = je->last_buffer_target;
+			je->last_buffer_target -= BUFFER_DECAY_AMOUNT;
+			blog(LOG_INFO, "[Buffer] Decay: target %d->%d (stable for %d frames)", old_target,
+			     je->last_buffer_target, BUFFER_DECAY_INTERVAL);
+		}
+	}
 }
