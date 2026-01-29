@@ -348,18 +348,11 @@ static void *decode_thread_func(void *data)
 					// This accounts for actual frame timing from the source
 					jitter_estimator_update_rtp(ctx->jitter_est, rtp_timestamp, now_us, raw_size);
 
-					// Auto-adjust buffer target based on jitter estimate
+					// Auto-adjust buffer target based on max-gap estimate
 					double fps = jitter_estimator_get_fps(ctx->jitter_est);
-					if (fps > 0) {
-						int new_target =
-							jitter_estimator_get_buffer_target(ctx->jitter_est, fps);
-						if (new_target != ctx->buffer_target) {
-							blog(LOG_INFO,
-							     "[Jitter Est] Buffer target: %d->%d (jitter=%.1fms, fps=%.1f)",
-							     ctx->buffer_target, new_target,
-							     jitter_estimator_get_ms(ctx->jitter_est), fps);
-							ctx->buffer_target = new_target;
-						}
+					int new_target = jitter_estimator_get_buffer_target(ctx->jitter_est, fps);
+					if (new_target != ctx->buffer_target) {
+						ctx->buffer_target = new_target;
 					}
 				}
 

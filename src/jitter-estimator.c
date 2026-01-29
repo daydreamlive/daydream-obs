@@ -231,8 +231,8 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->gap_index = 0;
 	je->gap_count = 0;
 	je->max_gap_ms = 0.0;
-	je->smoothed_max_gap_ms = 200.0; // Start with reasonable default
-	je->last_buffer_target = MIN_BUFFER_TARGET;
+	je->smoothed_max_gap_ms = 100.0; // Start conservative
+	je->last_buffer_target = 8;      // Start with reasonable default (~250ms at 30fps)
 }
 
 void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size_t frame_size)
@@ -383,17 +383,22 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 	if (!je)
 		return MIN_BUFFER_TARGET;
 
-	// For bursty AI video, use max-gap based approach
-	// This handles the "burst of frames, then pause" pattern
-
-	double frame_duration_ms = 33.3; // Default to 30fps
-	if (fps > 5.0) {
-		frame_duration_ms = 1000.0 / fps;
+	// Sanity check: need valid FPS and gap data
+	if (fps < 5.0 || fps > 120.0 || je->gap_count < 5) {
+		return je->last_buffer_target; // Not enough data yet
 	}
 
-	// Calculate target based on smoothed max gap
-	// We need enough buffer to survive the longest observed gap
-	int target = (int)ceil(je->smoothed_max_gap_ms / frame_duration_ms) + 2; // +2 safety margin
+	// Sanity check: smoothed_max_gap should be reasonable (1ms to 2000ms)
+	double max_gap = je->smoothed_max_gap_ms;
+	if (max_gap < 1.0 || max_gap > 2000.0) {
+		return je->last_buffer_target; // Invalid data
+	}
+
+	// For bursty AI video, use max-gap based approach
+	double frame_duration_ms = 1000.0 / fps;
+
+	// Calculate target: enough buffer to survive the longest gap
+	int target = (int)ceil(max_gap / frame_duration_ms) + 2; // +2 safety margin
 
 	// Clamp to reasonable range
 	if (target < MIN_BUFFER_TARGET)
@@ -413,7 +418,7 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 	// Log target changes
 	if (target != je->last_buffer_target) {
 		blog(LOG_INFO, "[Buffer] target %d->%d (max_gap=%.0fms, fps=%.1f)", je->last_buffer_target, target,
-		     je->smoothed_max_gap_ms, fps);
+		     max_gap, fps);
 	}
 
 	je->last_buffer_target = target;
@@ -477,31 +482,33 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 		return;
 
 	// Update FPS and max-gap tracking using wall clock
-	if (je->last_update_time_us > 0) {
+	if (je->last_update_time_us > 0 && receive_time_us > je->last_update_time_us) {
 		double delta_ms = (double)(receive_time_us - je->last_update_time_us) / 1000.0;
 
-		// FPS tracking
-		je->frame_times[je->fps_index] = delta_ms;
-		je->fps_index = (je->fps_index + 1) % FPS_WINDOW;
-		if (je->fps_count < FPS_WINDOW)
-			je->fps_count++;
+		// Sanity check: delta should be reasonable (0.1ms to 5000ms)
+		if (delta_ms > 0.1 && delta_ms < 5000.0) {
+			// FPS tracking
+			je->frame_times[je->fps_index] = delta_ms;
+			je->fps_index = (je->fps_index + 1) % FPS_WINDOW;
+			if (je->fps_count < FPS_WINDOW)
+				je->fps_count++;
 
-		// Max-gap tracking (key for bursty AI video)
-		je->gap_history[je->gap_index] = delta_ms;
-		je->gap_index = (je->gap_index + 1) % MAX_GAP_WINDOW;
-		if (je->gap_count < MAX_GAP_WINDOW)
-			je->gap_count++;
+			// Max-gap tracking (key for bursty AI video)
+			je->gap_history[je->gap_index] = delta_ms;
+			je->gap_index = (je->gap_index + 1) % MAX_GAP_WINDOW;
+			if (je->gap_count < MAX_GAP_WINDOW)
+				je->gap_count++;
 
-		// Find max gap in window
-		je->max_gap_ms = 0.0;
-		for (int i = 0; i < je->gap_count; i++) {
-			if (je->gap_history[i] > je->max_gap_ms)
-				je->max_gap_ms = je->gap_history[i];
+			// Find max gap in window
+			je->max_gap_ms = 0.0;
+			for (int i = 0; i < je->gap_count; i++) {
+				if (je->gap_history[i] > je->max_gap_ms)
+					je->max_gap_ms = je->gap_history[i];
+			}
+
+			// Smooth the max gap with EMA (alpha=0.1 for stability)
+			je->smoothed_max_gap_ms = 0.9 * je->smoothed_max_gap_ms + 0.1 * je->max_gap_ms;
 		}
-
-		// Smooth the max gap with EMA (alpha=0.1 for stability)
-		// This prevents overreacting to single large gaps
-		je->smoothed_max_gap_ms = 0.9 * je->smoothed_max_gap_ms + 0.1 * je->max_gap_ms;
 	}
 	je->last_update_time_us = receive_time_us;
 
