@@ -49,6 +49,12 @@ typedef struct {
 #define CUSUM_ACC_DRIFT 6600         // ~73ms acceptable drift per frame
 #define CUSUM_ACC_MAX_ERROR 7000     // ~77ms max single error
 
+// Max-gap tracking for bursty traffic (AI video specific)
+#define MAX_GAP_WINDOW 30            // Track max gap over last N frames
+#define BUFFER_TARGET_HYSTERESIS 3   // Require 3+ frame difference to change
+#define MIN_BUFFER_TARGET 4          // Never go below 4 frames
+#define MAX_BUFFER_TARGET 30         // Never go above 30 frames
+
 struct jitter_estimator {
 	// Kalman filter
 	kalman_state_t kalman;
@@ -85,6 +91,14 @@ struct jitter_estimator {
 	double cusum_pos;
 	double cusum_neg;
 	int cusum_alarm_count;
+
+	// Max-gap tracking for bursty AI video
+	double gap_history[MAX_GAP_WINDOW];
+	int gap_index;
+	int gap_count;
+	double max_gap_ms;          // Current max gap in window
+	double smoothed_max_gap_ms; // EMA smoothed max gap
+	int last_buffer_target;     // For hysteresis
 };
 
 static uint64_t get_time_us(void)
@@ -211,6 +225,14 @@ void jitter_estimator_reset(jitter_estimator_t *je)
 	je->cusum_pos = 0.0;
 	je->cusum_neg = 0.0;
 	je->cusum_alarm_count = 0;
+
+	// Reset max-gap tracking
+	memset(je->gap_history, 0, sizeof(je->gap_history));
+	je->gap_index = 0;
+	je->gap_count = 0;
+	je->max_gap_ms = 0.0;
+	je->smoothed_max_gap_ms = 200.0; // Start with reasonable default
+	je->last_buffer_target = MIN_BUFFER_TARGET;
 }
 
 void jitter_estimator_update(jitter_estimator_t *je, double frame_delay_ms, size_t frame_size)
@@ -358,21 +380,34 @@ double jitter_estimator_get_ms(jitter_estimator_t *je)
 
 int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 {
-	if (!je || fps <= 0)
-		return 10; // Default
+	if (!je)
+		return MIN_BUFFER_TARGET;
 
-	double jitter_ms = jitter_estimator_get_ms(je);
+	// For bursty AI video, use max-gap based approach instead of Kalman jitter
+	// This better handles the "burst of frames, then pause" pattern
 
-	// Convert jitter in ms to frames
-	double frame_duration_ms = 1000.0 / fps;
-	int target = (int)ceil(jitter_ms / frame_duration_ms);
+	double frame_duration_ms = 33.3; // Default to 30fps
+	if (fps > 5.0) {
+		frame_duration_ms = 1000.0 / fps;
+	}
+
+	// Calculate target based on smoothed max gap
+	// We need enough buffer to survive the longest gap
+	int target = (int)ceil(je->smoothed_max_gap_ms / frame_duration_ms) + 2; // +2 safety margin
 
 	// Clamp to reasonable range
-	if (target < 2)
-		target = 2;
-	if (target > 60)
-		target = 60;
+	if (target < MIN_BUFFER_TARGET)
+		target = MIN_BUFFER_TARGET;
+	if (target > MAX_BUFFER_TARGET)
+		target = MAX_BUFFER_TARGET;
 
+	// Apply hysteresis: only change if difference is significant
+	int diff = target - je->last_buffer_target;
+	if (abs(diff) < BUFFER_TARGET_HYSTERESIS) {
+		return je->last_buffer_target; // Keep current target
+	}
+
+	je->last_buffer_target = target;
 	return target;
 }
 
