@@ -6,11 +6,19 @@
 #include <libswscale/swscale.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_videotoolbox.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreVideo/CoreVideo.h>
+#include <VideoToolbox/VideoToolbox.h>
+#endif
+
 struct daydream_encoder {
 	AVCodecContext *codec_ctx;
 	AVFrame *frame;
 	AVPacket *packet;
-	struct SwsContext *sws_ctx;
+	struct SwsContext *sws_ctx; // Only used for SW fallback
 
 	uint32_t width;
 	uint32_t height;
@@ -18,6 +26,13 @@ struct daydream_encoder {
 	int64_t frame_count;
 
 	bool request_keyframe;
+	bool using_hw;
+
+#if defined(__APPLE__)
+	AVBufferRef *hw_device_ctx;
+	AVBufferRef *hw_frames_ctx;
+	CVPixelBufferPoolRef pixel_buffer_pool;
+#endif
 
 	uint8_t *output_buffer;
 	size_t output_buffer_size;
@@ -70,6 +85,51 @@ static void configure_encoder_options(AVCodecContext *ctx, const AVCodec *codec)
 	}
 }
 
+#if defined(__APPLE__)
+static bool init_videotoolbox_encoder(struct daydream_encoder *encoder, const AVCodec *codec)
+{
+	UNUSED_PARAMETER(codec);
+
+	// Create hardware device context
+	int ret = av_hwdevice_ctx_create(&encoder->hw_device_ctx, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0);
+	if (ret < 0) {
+		blog(LOG_INFO, "[Daydream Encoder] Failed to create VideoToolbox device context, using SW path");
+		return false;
+	}
+
+	encoder->codec_ctx->hw_device_ctx = av_buffer_ref(encoder->hw_device_ctx);
+	encoder->codec_ctx->pix_fmt = AV_PIX_FMT_VIDEOTOOLBOX;
+
+	// Create hardware frames context
+	encoder->hw_frames_ctx = av_hwframe_ctx_alloc(encoder->hw_device_ctx);
+	if (!encoder->hw_frames_ctx) {
+		blog(LOG_INFO, "[Daydream Encoder] Failed to create hw frames context");
+		av_buffer_unref(&encoder->hw_device_ctx);
+		return false;
+	}
+
+	AVHWFramesContext *frames_ctx = (AVHWFramesContext *)encoder->hw_frames_ctx->data;
+	frames_ctx->format = AV_PIX_FMT_VIDEOTOOLBOX;
+	frames_ctx->sw_format = AV_PIX_FMT_BGRA; // Input format - VideoToolbox will convert
+	frames_ctx->width = encoder->width;
+	frames_ctx->height = encoder->height;
+	frames_ctx->initial_pool_size = 4;
+
+	ret = av_hwframe_ctx_init(encoder->hw_frames_ctx);
+	if (ret < 0) {
+		blog(LOG_INFO, "[Daydream Encoder] Failed to init hw frames context: %d", ret);
+		av_buffer_unref(&encoder->hw_frames_ctx);
+		av_buffer_unref(&encoder->hw_device_ctx);
+		return false;
+	}
+
+	encoder->codec_ctx->hw_frames_ctx = av_buffer_ref(encoder->hw_frames_ctx);
+
+	blog(LOG_INFO, "[Daydream Encoder] VideoToolbox HW encoder initialized (BGRA direct input)");
+	return true;
+}
+#endif
+
 struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_config *config)
 {
 	if (!config || config->width == 0 || config->height == 0)
@@ -81,6 +141,7 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->fps = config->fps > 0 ? config->fps : 30;
 	encoder->frame_count = 0;
 	encoder->request_keyframe = true;
+	encoder->using_hw = false;
 
 	const AVCodec *codec = find_best_h264_encoder();
 	if (!codec) {
@@ -100,7 +161,6 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->codec_ctx->height = config->height;
 	encoder->codec_ctx->time_base = (AVRational){1, (int)encoder->fps};
 	encoder->codec_ctx->framerate = (AVRational){(int)encoder->fps, 1};
-	encoder->codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
 	encoder->codec_ctx->gop_size = encoder->fps;
 	encoder->codec_ctx->max_b_frames = 0;
 
@@ -111,8 +171,26 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 
 	configure_encoder_options(encoder->codec_ctx, codec);
 
+#if defined(__APPLE__)
+	// Try hardware encoder with direct BGRA input
+	if (strcmp(codec->name, "h264_videotoolbox") == 0) {
+		encoder->using_hw = init_videotoolbox_encoder(encoder, codec);
+	}
+#endif
+
+	// Fallback to software path
+	if (!encoder->using_hw) {
+		encoder->codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+	}
+
 	if (avcodec_open2(encoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Encoder] Failed to open codec");
+#if defined(__APPLE__)
+		if (encoder->hw_frames_ctx)
+			av_buffer_unref(&encoder->hw_frames_ctx);
+		if (encoder->hw_device_ctx)
+			av_buffer_unref(&encoder->hw_device_ctx);
+#endif
 		avcodec_free_context(&encoder->codec_ctx);
 		bfree(encoder);
 		return NULL;
@@ -121,39 +199,70 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->frame = av_frame_alloc();
 	if (!encoder->frame) {
 		blog(LOG_ERROR, "[Daydream Encoder] Failed to allocate frame");
+#if defined(__APPLE__)
+		if (encoder->hw_frames_ctx)
+			av_buffer_unref(&encoder->hw_frames_ctx);
+		if (encoder->hw_device_ctx)
+			av_buffer_unref(&encoder->hw_device_ctx);
+#endif
 		avcodec_free_context(&encoder->codec_ctx);
 		bfree(encoder);
 		return NULL;
 	}
 
-	encoder->frame->format = AV_PIX_FMT_YUV420P;
-	encoder->frame->width = config->width;
-	encoder->frame->height = config->height;
+	if (encoder->using_hw) {
+#if defined(__APPLE__)
+		// For HW path, we'll allocate frames from the hw context when encoding
+		encoder->frame->format = AV_PIX_FMT_VIDEOTOOLBOX;
+		encoder->frame->width = config->width;
+		encoder->frame->height = config->height;
+#endif
+	} else {
+		// Software path - allocate YUV frame
+		encoder->frame->format = AV_PIX_FMT_YUV420P;
+		encoder->frame->width = config->width;
+		encoder->frame->height = config->height;
 
-	if (av_frame_get_buffer(encoder->frame, 32) < 0) {
-		blog(LOG_ERROR, "[Daydream Encoder] Failed to allocate frame buffer");
-		av_frame_free(&encoder->frame);
-		avcodec_free_context(&encoder->codec_ctx);
-		bfree(encoder);
-		return NULL;
+		if (av_frame_get_buffer(encoder->frame, 32) < 0) {
+			blog(LOG_ERROR, "[Daydream Encoder] Failed to allocate frame buffer");
+			av_frame_free(&encoder->frame);
+#if defined(__APPLE__)
+			if (encoder->hw_frames_ctx)
+				av_buffer_unref(&encoder->hw_frames_ctx);
+			if (encoder->hw_device_ctx)
+				av_buffer_unref(&encoder->hw_device_ctx);
+#endif
+			avcodec_free_context(&encoder->codec_ctx);
+			bfree(encoder);
+			return NULL;
+		}
+
+		// Create sws context for SW path
+		encoder->sws_ctx = sws_getContext(config->width, config->height, AV_PIX_FMT_BGRA, config->width,
+						  config->height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, NULL, NULL,
+						  NULL);
+
+		if (!encoder->sws_ctx) {
+			blog(LOG_ERROR, "[Daydream Encoder] Failed to create sws context");
+			av_frame_free(&encoder->frame);
+			avcodec_free_context(&encoder->codec_ctx);
+			bfree(encoder);
+			return NULL;
+		}
 	}
 
 	encoder->packet = av_packet_alloc();
 	if (!encoder->packet) {
 		blog(LOG_ERROR, "[Daydream Encoder] Failed to allocate packet");
+		if (encoder->sws_ctx)
+			sws_freeContext(encoder->sws_ctx);
 		av_frame_free(&encoder->frame);
-		avcodec_free_context(&encoder->codec_ctx);
-		bfree(encoder);
-		return NULL;
-	}
-
-	encoder->sws_ctx = sws_getContext(config->width, config->height, AV_PIX_FMT_BGRA, config->width, config->height,
-					  AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, NULL, NULL, NULL);
-
-	if (!encoder->sws_ctx) {
-		blog(LOG_ERROR, "[Daydream Encoder] Failed to create sws context");
-		av_packet_free(&encoder->packet);
-		av_frame_free(&encoder->frame);
+#if defined(__APPLE__)
+		if (encoder->hw_frames_ctx)
+			av_buffer_unref(&encoder->hw_frames_ctx);
+		if (encoder->hw_device_ctx)
+			av_buffer_unref(&encoder->hw_device_ctx);
+#endif
 		avcodec_free_context(&encoder->codec_ctx);
 		bfree(encoder);
 		return NULL;
@@ -162,8 +271,8 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->output_buffer_size = config->width * config->height * 2;
 	encoder->output_buffer = bmalloc(encoder->output_buffer_size);
 
-	blog(LOG_INFO, "[Daydream Encoder] Created %dx%d @ %d fps, %d kbps (encoder: %s)", config->width,
-	     config->height, encoder->fps, bitrate / 1000, codec->name);
+	blog(LOG_INFO, "[Daydream Encoder] Created %dx%d @ %d fps, %d kbps (encoder: %s, hw: %s)", config->width,
+	     config->height, encoder->fps, bitrate / 1000, codec->name, encoder->using_hw ? "yes" : "no");
 
 	return encoder;
 }
@@ -179,6 +288,12 @@ void daydream_encoder_destroy(struct daydream_encoder *encoder)
 		av_packet_free(&encoder->packet);
 	if (encoder->frame)
 		av_frame_free(&encoder->frame);
+#if defined(__APPLE__)
+	if (encoder->hw_frames_ctx)
+		av_buffer_unref(&encoder->hw_frames_ctx);
+	if (encoder->hw_device_ctx)
+		av_buffer_unref(&encoder->hw_device_ctx);
+#endif
 	if (encoder->codec_ctx)
 		avcodec_free_context(&encoder->codec_ctx);
 	if (encoder->output_buffer)
@@ -187,39 +302,124 @@ void daydream_encoder_destroy(struct daydream_encoder *encoder)
 	bfree(encoder);
 }
 
+#if defined(__APPLE__)
+static bool encode_hw_frame(struct daydream_encoder *encoder, const uint8_t *bgra_data, uint32_t linesize)
+{
+	// Create CVPixelBuffer from BGRA data
+	CVPixelBufferRef pixel_buffer = NULL;
+
+	// Create pixel buffer attributes (pure C)
+	CFMutableDictionaryRef pixel_buffer_attrs = CFDictionaryCreateMutable(
+		kCFAllocatorDefault, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+	CFDictionaryRef empty_dict = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0, NULL, NULL);
+	CFDictionarySetValue(pixel_buffer_attrs, kCVPixelBufferIOSurfacePropertiesKey, empty_dict);
+	CFRelease(empty_dict);
+
+	CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, encoder->width, encoder->height,
+					      kCVPixelFormatType_32BGRA, pixel_buffer_attrs, &pixel_buffer);
+
+	CFRelease(pixel_buffer_attrs);
+
+	if (status != kCVReturnSuccess || !pixel_buffer) {
+		blog(LOG_ERROR, "[Daydream Encoder] Failed to create CVPixelBuffer: %d", status);
+		return false;
+	}
+
+	// Lock and copy BGRA data
+	CVPixelBufferLockBaseAddress(pixel_buffer, 0);
+	uint8_t *dst = CVPixelBufferGetBaseAddress(pixel_buffer);
+	size_t dst_stride = CVPixelBufferGetBytesPerRow(pixel_buffer);
+
+	if (dst_stride == linesize) {
+		memcpy(dst, bgra_data, linesize * encoder->height);
+	} else {
+		// Copy row by row if strides don't match
+		for (uint32_t y = 0; y < encoder->height; y++) {
+			memcpy(dst + y * dst_stride, bgra_data + y * linesize, encoder->width * 4);
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(pixel_buffer, 0);
+
+	// Create AVFrame and attach CVPixelBuffer
+	AVFrame *hw_frame = av_frame_alloc();
+	if (!hw_frame) {
+		CVPixelBufferRelease(pixel_buffer);
+		return false;
+	}
+
+	hw_frame->format = AV_PIX_FMT_VIDEOTOOLBOX;
+	hw_frame->width = encoder->width;
+	hw_frame->height = encoder->height;
+	hw_frame->data[3] = (uint8_t *)pixel_buffer; // VideoToolbox expects CVPixelBuffer in data[3]
+	hw_frame->pts = encoder->frame_count;
+
+	if (encoder->request_keyframe) {
+		hw_frame->pict_type = AV_PICTURE_TYPE_I;
+		encoder->request_keyframe = false;
+	} else {
+		hw_frame->pict_type = AV_PICTURE_TYPE_NONE;
+	}
+
+	int ret = avcodec_send_frame(encoder->codec_ctx, hw_frame);
+	av_frame_free(&hw_frame);
+	CVPixelBufferRelease(pixel_buffer);
+
+	return ret >= 0;
+}
+#endif
+
 bool daydream_encoder_encode(struct daydream_encoder *encoder, const uint8_t *bgra_data, uint32_t linesize,
 			     struct daydream_encoded_frame *out_frame)
 {
 	if (!encoder || !bgra_data || !out_frame)
 		return false;
 
-	if (av_frame_make_writable(encoder->frame) < 0) {
-		blog(LOG_ERROR, "[Daydream Encoder] Frame not writable");
+	bool send_success = false;
+
+#if defined(__APPLE__)
+	if (encoder->using_hw) {
+		send_success = encode_hw_frame(encoder, bgra_data, linesize);
+		if (send_success) {
+			encoder->frame_count++;
+		}
+	}
+#endif
+
+	if (!encoder->using_hw) {
+		// Software path - convert BGRA to YUV420P
+		if (av_frame_make_writable(encoder->frame) < 0) {
+			blog(LOG_ERROR, "[Daydream Encoder] Frame not writable");
+			return false;
+		}
+
+		const uint8_t *src_data[1] = {bgra_data};
+		int src_linesize[1] = {(int)linesize};
+
+		sws_scale(encoder->sws_ctx, src_data, src_linesize, 0, encoder->height, encoder->frame->data,
+			  encoder->frame->linesize);
+
+		encoder->frame->pts = encoder->frame_count++;
+
+		if (encoder->request_keyframe) {
+			encoder->frame->pict_type = AV_PICTURE_TYPE_I;
+			encoder->request_keyframe = false;
+		} else {
+			encoder->frame->pict_type = AV_PICTURE_TYPE_NONE;
+		}
+
+		int ret = avcodec_send_frame(encoder->codec_ctx, encoder->frame);
+		send_success = (ret >= 0);
+		if (ret < 0 && ret != AVERROR(EAGAIN)) {
+			blog(LOG_ERROR, "[Daydream Encoder] Error sending frame for encoding: %d", ret);
+		}
+	}
+
+	if (!send_success) {
 		return false;
 	}
 
-	const uint8_t *src_data[1] = {bgra_data};
-	int src_linesize[1] = {(int)linesize};
-
-	sws_scale(encoder->sws_ctx, src_data, src_linesize, 0, encoder->height, encoder->frame->data,
-		  encoder->frame->linesize);
-
-	encoder->frame->pts = encoder->frame_count++;
-
-	if (encoder->request_keyframe) {
-		encoder->frame->pict_type = AV_PICTURE_TYPE_I;
-		encoder->request_keyframe = false;
-	} else {
-		encoder->frame->pict_type = AV_PICTURE_TYPE_NONE;
-	}
-
-	int ret = avcodec_send_frame(encoder->codec_ctx, encoder->frame);
-	if (ret < 0) {
-		blog(LOG_ERROR, "[Daydream Encoder] Error sending frame for encoding");
-		return false;
-	}
-
-	ret = avcodec_receive_packet(encoder->codec_ctx, encoder->packet);
+	int ret = avcodec_receive_packet(encoder->codec_ctx, encoder->packet);
 	if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 		return false;
 	} else if (ret < 0) {
