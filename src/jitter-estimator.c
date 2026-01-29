@@ -383,8 +383,8 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 	if (!je)
 		return MIN_BUFFER_TARGET;
 
-	// For bursty AI video, use max-gap based approach instead of Kalman jitter
-	// This better handles the "burst of frames, then pause" pattern
+	// For bursty AI video, use max-gap based approach
+	// This handles the "burst of frames, then pause" pattern
 
 	double frame_duration_ms = 33.3; // Default to 30fps
 	if (fps > 5.0) {
@@ -392,7 +392,7 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 	}
 
 	// Calculate target based on smoothed max gap
-	// We need enough buffer to survive the longest gap
+	// We need enough buffer to survive the longest observed gap
 	int target = (int)ceil(je->smoothed_max_gap_ms / frame_duration_ms) + 2; // +2 safety margin
 
 	// Clamp to reasonable range
@@ -403,8 +403,17 @@ int jitter_estimator_get_buffer_target(jitter_estimator_t *je, double fps)
 
 	// Apply hysteresis: only change if difference is significant
 	int diff = target - je->last_buffer_target;
-	if (abs(diff) < BUFFER_TARGET_HYSTERESIS) {
-		return je->last_buffer_target; // Keep current target
+	if (diff > 0 && diff < BUFFER_TARGET_HYSTERESIS) {
+		return je->last_buffer_target; // Don't increase for small changes
+	}
+	if (diff < 0 && diff > -BUFFER_TARGET_HYSTERESIS) {
+		return je->last_buffer_target; // Don't decrease for small changes
+	}
+
+	// Log target changes
+	if (target != je->last_buffer_target) {
+		blog(LOG_INFO, "[Buffer] target %d->%d (max_gap=%.0fms, fps=%.1f)", je->last_buffer_target, target,
+		     je->smoothed_max_gap_ms, fps);
 	}
 
 	je->last_buffer_target = target;
@@ -467,13 +476,32 @@ void jitter_estimator_update_rtp(jitter_estimator_t *je, uint32_t rtp_timestamp,
 	if (!je || frame_size == 0)
 		return;
 
-	// Update FPS tracking using wall clock
+	// Update FPS and max-gap tracking using wall clock
 	if (je->last_update_time_us > 0) {
 		double delta_ms = (double)(receive_time_us - je->last_update_time_us) / 1000.0;
+
+		// FPS tracking
 		je->frame_times[je->fps_index] = delta_ms;
 		je->fps_index = (je->fps_index + 1) % FPS_WINDOW;
 		if (je->fps_count < FPS_WINDOW)
 			je->fps_count++;
+
+		// Max-gap tracking (key for bursty AI video)
+		je->gap_history[je->gap_index] = delta_ms;
+		je->gap_index = (je->gap_index + 1) % MAX_GAP_WINDOW;
+		if (je->gap_count < MAX_GAP_WINDOW)
+			je->gap_count++;
+
+		// Find max gap in window
+		je->max_gap_ms = 0.0;
+		for (int i = 0; i < je->gap_count; i++) {
+			if (je->gap_history[i] > je->max_gap_ms)
+				je->max_gap_ms = je->gap_history[i];
+		}
+
+		// Smooth the max gap with EMA (alpha=0.1 for stability)
+		// This prevents overreacting to single large gaps
+		je->smoothed_max_gap_ms = 0.9 * je->smoothed_max_gap_ms + 0.1 * je->max_gap_ms;
 	}
 	je->last_update_time_us = receive_time_us;
 

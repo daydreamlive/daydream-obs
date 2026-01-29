@@ -839,110 +839,176 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	static uint64_t render_no_frame_count = 0;
 
 	if (ctx->smooth_mode) {
-		// Chrome-style delay-based frame release
-		// Instead of controlling playback speed, we delay frame release based on jitter estimate
+		// Adaptive speed control optimized for bursty AI video
+		// Key concepts from Chrome: gradual speed transitions
 		pthread_mutex_lock(&ctx->jitter_mutex);
 
-		uint64_t now_ns = os_gettime_ns();
-		uint64_t now_us = now_ns / 1000;
+		uint64_t now = os_gettime_ns();
 
-		// Update target delay based on jitter estimate (Chrome: jitter + decode_time + render_delay)
-		// We use a simpler: jitter_ms + fixed overhead
-		double jitter_ms = jitter_estimator_get_ms(ctx->jitter_est);
-		double target_delay_ms = jitter_ms + 20.0; // +20ms for decode/render overhead
+		// Start playback when we have minimum frames
+		if (!ctx->jitter_playback_started) {
+			int start_threshold = ctx->buffer_target / 2;
+			if (start_threshold < 3)
+				start_threshold = 3;
 
-		// Clamp target delay to reasonable range
-		if (target_delay_ms < 50.0)
-			target_delay_ms = 50.0; // Min 50ms
-		if (target_delay_ms > 1000.0)
-			target_delay_ms = 1000.0; // Max 1 second
-
-		// Chrome's gradual delay adjustment: max 100ms change per second
-		// This prevents jarring jumps but may increase latency temporarily
-		double delta_s = (ctx->last_render_time > 0) ? (double)(now_ns - ctx->last_render_time) / 1e9 : 0.0;
-		double max_change_ms = 100.0 * delta_s; // 100ms/s
-
-		double delay_diff = target_delay_ms - ctx->current_delay_ms;
-		if (delay_diff > max_change_ms)
-			delay_diff = max_change_ms;
-		if (delay_diff < -max_change_ms)
-			delay_diff = -max_change_ms;
-		ctx->current_delay_ms += delay_diff;
-
-		ctx->last_render_time = now_ns;
-
-		// Check if we have frames ready to display
-		// A frame is ready when: now >= extrapolated_local_time + current_delay
-		if (!ctx->jitter_playback_started && ctx->jitter_count >= 3) {
-			ctx->jitter_playback_started = true;
-			blog(LOG_INFO, "[Chrome Mode] Playback started with %d frames, delay=%.1fms", ctx->jitter_count,
-			     ctx->current_delay_ms);
+			if (ctx->jitter_count >= start_threshold) {
+				struct jitter_frame *oldest = &ctx->jitter_buffer[ctx->jitter_tail];
+				ctx->jitter_playback_started = true;
+				ctx->jitter_playback_start_time = now;
+				ctx->jitter_playback_start_rtp = oldest->rtp_timestamp;
+				ctx->current_speed = 1.0f;
+				blog(LOG_INFO, "[Smooth] Playback started with %d frames (target=%d)",
+				     ctx->jitter_count, ctx->buffer_target);
+			}
 		}
 
-		if (ctx->jitter_playback_started && ctx->jitter_count > 0) {
-			// Find the most recent frame that's ready to display
-			struct jitter_frame *ready_frame = NULL;
-			int frames_to_release = 0;
+		if (ctx->jitter_playback_started) {
+			// Calculate target speed based on buffer level
+			float target_speed;
 
-			int idx = ctx->jitter_tail;
-			for (int i = 0; i < ctx->jitter_count; i++) {
-				struct jitter_frame *jf = &ctx->jitter_buffer[idx];
-
-				// Calculate render time for this frame
-				uint64_t frame_local_time_us = 0;
-				if (timestamp_extrapolator_is_ready(ctx->ts_extrap)) {
-					frame_local_time_us =
-						timestamp_extrapolator_extrapolate(ctx->ts_extrap, jf->rtp_timestamp);
-				} else {
-					// Fallback: use receive time
-					frame_local_time_us = jf->receive_time_ns / 1000;
-				}
-
-				uint64_t render_time_us =
-					frame_local_time_us + (uint64_t)(ctx->current_delay_ms * 1000);
-
-				if (now_us >= render_time_us) {
-					// This frame is ready
-					ready_frame = jf;
-					frames_to_release = i + 1;
-				} else {
-					// Future frames - stop checking
-					break;
-				}
-
-				idx = (idx + 1) % JITTER_BUFFER_SIZE;
+			if (ctx->jitter_count == 0) {
+				// Emergency: buffer empty
+				target_speed = ctx->speed_min;
+			} else if (ctx->jitter_count < ctx->buffer_target) {
+				// Below target: slow down proportionally
+				float ratio = (float)ctx->jitter_count / (float)ctx->buffer_target;
+				target_speed = ctx->speed_min + ratio * (1.0f - ctx->speed_min);
+			} else {
+				// At or above target: speed up to reduce latency
+				float excess = (float)(ctx->jitter_count - ctx->buffer_target);
+				float gain = 0.1f;
+				target_speed = 1.0f + gain * excess;
+				if (target_speed > ctx->speed_max)
+					target_speed = ctx->speed_max;
 			}
 
-			// Display the most recent ready frame
-			if (ready_frame) {
-				pthread_mutex_lock(&ctx->mutex);
+			// Chrome-inspired gradual speed change (prevents jerky playback)
+			uint64_t delta_ns = now - ctx->last_render_time;
+			if (ctx->last_render_time == 0) {
+				delta_ns = 16666667; // Assume 60fps initially
+			}
+			double delta_s = (double)delta_ns / 1e9;
 
-				size_t frame_size = ready_frame->size;
-				if (!ctx->decoded_frame || ctx->decoded_frame_width != ready_frame->width ||
-				    ctx->decoded_frame_height != ready_frame->height) {
+			// Max speed change: 0.5 per second (smoother than instant)
+			float max_speed_change = 0.5f * (float)delta_s;
+			float speed_diff = target_speed - ctx->current_speed;
+			if (speed_diff > max_speed_change)
+				speed_diff = max_speed_change;
+			if (speed_diff < -max_speed_change)
+				speed_diff = -max_speed_change;
+			ctx->current_speed += speed_diff;
+
+			ctx->last_render_time = now;
+
+			// Accumulate RTP ticks based on current speed
+			ctx->accumulated_rtp += ((double)delta_ns / 1000000.0) * 90.0 * ctx->current_speed;
+			uint32_t current_rtp = ctx->jitter_playback_start_rtp + (uint32_t)ctx->accumulated_rtp;
+
+			// Frame management with interpolation
+			if (!ctx->interp_has_a && ctx->jitter_count > 0) {
+				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+				size_t frame_size = jf->size;
+
+				if (!ctx->interp_frame_a || ctx->interp_width != jf->width ||
+				    ctx->interp_height != jf->height) {
+					bfree(ctx->interp_frame_a);
+					bfree(ctx->interp_frame_b);
+					bfree(ctx->interp_frame_out);
+					ctx->interp_frame_a = bmalloc(frame_size);
+					ctx->interp_frame_b = bmalloc(frame_size);
+					ctx->interp_frame_out = bmalloc(frame_size);
+					ctx->interp_width = jf->width;
+					ctx->interp_height = jf->height;
+				}
+
+				memcpy(ctx->interp_frame_a, jf->data, frame_size);
+				ctx->interp_rtp_a = jf->rtp_timestamp;
+				ctx->interp_has_a = true;
+
+				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+				ctx->jitter_count--;
+			}
+
+			if (ctx->interp_has_a && !ctx->interp_has_b && ctx->jitter_count > 0) {
+				struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+				memcpy(ctx->interp_frame_b, jf->data, jf->size);
+				ctx->interp_rtp_b = jf->rtp_timestamp;
+				ctx->interp_has_b = true;
+
+				ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+				ctx->jitter_count--;
+			}
+
+			// Advance frames if current time passed frame B
+			if (ctx->interp_has_a && ctx->interp_has_b) {
+				int32_t diff_to_b = (int32_t)(ctx->interp_rtp_b - current_rtp);
+
+				if (diff_to_b <= 0) {
+					memcpy(ctx->interp_frame_a, ctx->interp_frame_b,
+					       ctx->interp_width * ctx->interp_height * 4);
+					ctx->interp_rtp_a = ctx->interp_rtp_b;
+					ctx->interp_has_b = false;
+
+					if (ctx->jitter_count > 0) {
+						struct jitter_frame *jf = &ctx->jitter_buffer[ctx->jitter_tail];
+						memcpy(ctx->interp_frame_b, jf->data, jf->size);
+						ctx->interp_rtp_b = jf->rtp_timestamp;
+						ctx->interp_has_b = true;
+						ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
+						ctx->jitter_count--;
+					}
+				}
+			}
+
+			// Render interpolated frame
+			pthread_mutex_lock(&ctx->mutex);
+
+			if (ctx->interp_has_a) {
+				size_t frame_size = ctx->interp_width * ctx->interp_height * 4;
+
+				if (!ctx->decoded_frame || ctx->decoded_frame_width != ctx->interp_width ||
+				    ctx->decoded_frame_height != ctx->interp_height) {
 					bfree(ctx->decoded_frame);
 					ctx->decoded_frame = bmalloc(frame_size);
-					ctx->decoded_frame_width = ready_frame->width;
-					ctx->decoded_frame_height = ready_frame->height;
+					ctx->decoded_frame_width = ctx->interp_width;
+					ctx->decoded_frame_height = ctx->interp_height;
 				}
 
-				memcpy(ctx->decoded_frame, ready_frame->data, frame_size);
+				if (ctx->interp_has_b) {
+					int32_t rtp_range = (int32_t)(ctx->interp_rtp_b - ctx->interp_rtp_a);
+					int32_t rtp_pos = (int32_t)(current_rtp - ctx->interp_rtp_a);
+
+					float alpha = 0.0f;
+					if (rtp_range > 0) {
+						alpha = (float)rtp_pos / (float)rtp_range;
+						if (alpha < 0.0f)
+							alpha = 0.0f;
+						if (alpha > 1.0f)
+							alpha = 1.0f;
+					}
+
+					uint8_t *a = ctx->interp_frame_a;
+					uint8_t *b = ctx->interp_frame_b;
+					uint8_t *out = ctx->decoded_frame;
+					size_t pixel_count = ctx->interp_width * ctx->interp_height * 4;
+
+					for (size_t i = 0; i < pixel_count; i++) {
+						out[i] = (uint8_t)((float)a[i] * (1.0f - alpha) + (float)b[i] * alpha);
+					}
+
+					static int log_counter = 0;
+					if (log_counter++ % 30 == 0) {
+						blog(LOG_INFO, "[Smooth] buf=%d/%d, speed=%.2f, alpha=%.2f",
+						     ctx->jitter_count, ctx->buffer_target, ctx->current_speed, alpha);
+					}
+				} else {
+					memcpy(ctx->decoded_frame, ctx->interp_frame_a, frame_size);
+				}
+
 				ctx->decoded_frame_ready = true;
-
-				pthread_mutex_unlock(&ctx->mutex);
-
-				// Release all frames up to and including the ready frame
-				for (int i = 0; i < frames_to_release; i++) {
-					ctx->jitter_tail = (ctx->jitter_tail + 1) % JITTER_BUFFER_SIZE;
-					ctx->jitter_count--;
-				}
-
-				static int log_counter = 0;
-				if (log_counter++ % 30 == 0) {
-					blog(LOG_INFO, "[Chrome Mode] buf=%d, delay=%.0fms, jitter=%.0fms",
-					     ctx->jitter_count, ctx->current_delay_ms, jitter_ms);
-				}
 			}
+
+			pthread_mutex_unlock(&ctx->mutex);
 		}
 
 		pthread_mutex_unlock(&ctx->jitter_mutex);
