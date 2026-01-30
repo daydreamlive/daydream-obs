@@ -1975,7 +1975,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, PROP_SEED_INTERP, "slerp");
 	obs_data_set_default_bool(settings, PROP_NORMALIZE_SEED, true);
 
-	// Step Schedule defaults (t_index_list) - TouchDesigner default is [11]
+	// Step Schedule defaults (t_index_list)
 	obs_data_set_default_int(settings, PROP_NUM_STEPS, 50);
 	obs_data_set_default_int(settings, PROP_STEP_COUNT, 1);
 	obs_data_set_default_int(settings, PROP_STEP_1, 11);
@@ -1983,13 +1983,13 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, PROP_STEP_3, 0);
 	obs_data_set_default_int(settings, PROP_STEP_4, 0);
 
-	// IP Adapter defaults (TouchDesigner values)
+	// IP Adapter defaults
 	obs_data_set_default_bool(settings, PROP_IP_ADAPTER_ENABLED, true);
 	obs_data_set_default_double(settings, PROP_IP_ADAPTER_SCALE, 0.5);
 	obs_data_set_default_string(settings, PROP_IP_ADAPTER_TYPE, "regular");
 	obs_data_set_default_string(settings, PROP_STYLE_IMAGE_URL, "");
 
-	// ControlNet defaults (TouchDesigner values)
+	// ControlNet defaults
 	obs_data_set_default_double(settings, PROP_DEPTH_SCALE, 0.45);
 	obs_data_set_default_double(settings, PROP_CANNY_SCALE, 0.0);
 	obs_data_set_default_double(settings, PROP_TILE_SCALE, 0.21);

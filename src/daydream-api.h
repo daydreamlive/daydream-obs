@@ -59,7 +59,7 @@ struct daydream_stream_params {
 	int width;
 	int height;
 
-	// Schedules (TouchDesigner-equivalent)
+	// Schedules
 	struct daydream_prompt_schedule prompt_schedule;
 	struct daydream_seed_schedule seed_schedule;
 	struct daydream_step_schedule step_schedule;

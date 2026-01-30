@@ -161,7 +161,7 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 		goto cleanup;
 	}
 
-	// Build ControlNets array based on model (matching TouchDesigner schema)
+	// Build ControlNets array based on model
 	char controlnets_json[2048];
 	const char *model = params->model_id ? params->model_id : "";
 
@@ -229,7 +229,7 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	if (params->prompt_schedule.count <= 1) {
 		const char *p = (params->prompt_schedule.count == 1 && params->prompt_schedule.prompts[0])
 					? params->prompt_schedule.prompts[0]
-					: "strawberry"; // TouchDesigner default
+					: "strawberry";
 		snprintf(prompt_json, sizeof(prompt_json), "\"%s\"", p);
 	} else {
 		char *ptr = prompt_json;
@@ -273,7 +273,7 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 		}
 		sprintf(ptr, "]");
 	} else {
-		strcpy(t_index_json, "[11]"); // TouchDesigner default
+		strcpy(t_index_json, "[11]");
 	}
 
 	const char *prompt_interp = params->prompt_interpolation_method ? params->prompt_interpolation_method : "slerp";
