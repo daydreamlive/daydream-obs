@@ -5,6 +5,7 @@
 #include "daydream-decoder.h"
 #include "daydream-whip.h"
 #include "daydream-whep.h"
+#include "plugin-support.h"
 #include <obs-module.h>
 #include <limits.h>
 #include <graphics/graphics.h>
@@ -1208,6 +1209,41 @@ static void on_login_callback(bool success, const char *api_key, const char *err
 	obs_source_update_properties(ctx->source);
 }
 
+static void open_url(const char *url)
+{
+#if defined(__APPLE__)
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
+	system(cmd);
+#elif defined(_WIN32)
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
+	system(cmd);
+#else
+	char cmd[512];
+	snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
+	system(cmd);
+#endif
+}
+
+static bool on_homepage_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	open_url("https://daydream.live");
+	return false;
+}
+
+static bool on_github_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	open_url("https://github.com/daydreamlive");
+	return false;
+}
+
 static bool on_login_clicked(obs_properties_t *props, obs_property_t *property, void *data)
 {
 	UNUSED_PARAMETER(props);
@@ -1231,6 +1267,17 @@ static bool on_logout_clicked(obs_properties_t *props, obs_property_t *property,
 	daydream_auth_logout(ctx->auth);
 	obs_source_update_properties(ctx->source);
 	return true;
+}
+
+static bool on_auth_toggle_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	struct daydream_filter *ctx = data;
+
+	if (daydream_auth_is_logged_in(ctx->auth)) {
+		return on_logout_clicked(props, property, data);
+	} else {
+		return on_login_clicked(props, property, data);
+	}
 }
 
 static bool on_model_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
@@ -1604,13 +1651,10 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	bool logged_in = daydream_auth_is_logged_in(ctx->auth);
 	bool is_streaming = ctx->streaming;
 
-	if (logged_in) {
-		obs_properties_add_text(props, PROP_LOGIN_STATUS, "Status: Logged In", OBS_TEXT_INFO);
-		obs_properties_add_button(props, PROP_LOGOUT, "Logout", on_logout_clicked);
-	} else {
-		obs_properties_add_text(props, PROP_LOGIN_STATUS, "Status: Not Logged In", OBS_TEXT_INFO);
-		obs_properties_add_button(props, PROP_LOGIN, "Login with Daydream", on_login_clicked);
-	}
+	obs_properties_add_text(props, "title_header", "✦ Daydream ✦", OBS_TEXT_INFO);
+
+	const char *auth_label = logged_in ? "Logout" : "Login with Daydream";
+	obs_properties_add_button(props, PROP_LOGIN, auth_label, on_auth_toggle_clicked);
 
 	// --- Streaming Control ---
 	bool is_transitioning = ctx->start_thread_running || ctx->stopping;
@@ -1621,6 +1665,8 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *toggle =
 		obs_properties_add_button(props, PROP_START, toggle_label, on_streaming_toggle_clicked);
 	obs_property_set_enabled(toggle, logged_in && !is_transitioning);
+
+	obs_properties_add_text(props, "model_header", "\n\n【 Model 】", OBS_TEXT_INFO);
 
 	// Cold parameter: disabled during streaming
 	obs_property_t *model =
@@ -1633,32 +1679,32 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_modified_callback(model, on_model_changed);
 
 	// --- Prompt Schedule ---
-	obs_properties_add_text(props, "prompt_header", "--- Prompt Schedule ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "prompt_header", "\n\n【 Prompt Schedule 】", OBS_TEXT_INFO);
 
 	obs_property_t *prompt_count = obs_properties_add_int_slider(props, PROP_PROMPT_COUNT, "Prompt Count", 1, 4, 1);
 	obs_property_set_enabled(prompt_count, logged_in);
 	obs_property_set_modified_callback(prompt_count, on_prompt_count_changed);
 
-	obs_property_t *p1 = obs_properties_add_text(props, PROP_PROMPT_1, "Prompt 1", OBS_TEXT_MULTILINE);
+	obs_property_t *p1 = obs_properties_add_text(props, PROP_PROMPT_1, "Prompt 1", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(p1, logged_in);
 	obs_property_t *p1w = obs_properties_add_float_slider(props, PROP_PROMPT_1_WEIGHT, "Weight 1", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(p1w, logged_in);
 
-	obs_property_t *p2 = obs_properties_add_text(props, PROP_PROMPT_2, "Prompt 2", OBS_TEXT_MULTILINE);
+	obs_property_t *p2 = obs_properties_add_text(props, PROP_PROMPT_2, "Prompt 2", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(p2, logged_in);
 	obs_property_set_visible(p2, false);
 	obs_property_t *p2w = obs_properties_add_float_slider(props, PROP_PROMPT_2_WEIGHT, "Weight 2", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(p2w, logged_in);
 	obs_property_set_visible(p2w, false);
 
-	obs_property_t *p3 = obs_properties_add_text(props, PROP_PROMPT_3, "Prompt 3", OBS_TEXT_MULTILINE);
+	obs_property_t *p3 = obs_properties_add_text(props, PROP_PROMPT_3, "Prompt 3", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(p3, logged_in);
 	obs_property_set_visible(p3, false);
 	obs_property_t *p3w = obs_properties_add_float_slider(props, PROP_PROMPT_3_WEIGHT, "Weight 3", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(p3w, logged_in);
 	obs_property_set_visible(p3w, false);
 
-	obs_property_t *p4 = obs_properties_add_text(props, PROP_PROMPT_4, "Prompt 4", OBS_TEXT_MULTILINE);
+	obs_property_t *p4 = obs_properties_add_text(props, PROP_PROMPT_4, "Prompt 4", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(p4, logged_in);
 	obs_property_set_visible(p4, false);
 	obs_property_t *p4w = obs_properties_add_float_slider(props, PROP_PROMPT_4_WEIGHT, "Weight 4", 0.0, 1.0, 0.01);
@@ -1681,7 +1727,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_enabled(neg_prompt, logged_in);
 
 	// --- Seed Schedule ---
-	obs_properties_add_text(props, "seed_header", "--- Seed Schedule ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "seed_header", "\n\n【 Seed Schedule 】", OBS_TEXT_INFO);
 
 	obs_property_t *seed_count = obs_properties_add_int_slider(props, PROP_SEED_COUNT, "Seed Count", 1, 4, 1);
 	obs_property_set_enabled(seed_count, logged_in);
@@ -1725,7 +1771,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_visible(norm_seed, false);
 
 	// --- Step Schedule (t_index_list) ---
-	obs_properties_add_text(props, "step_header", "--- Step Schedule ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "step_header", "\n\n【 Step Schedule 】", OBS_TEXT_INFO);
 
 	// Cold parameter: disabled during streaming
 	obs_property_t *num_steps =
@@ -1752,7 +1798,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_visible(st4, false);
 
 	// --- Generation ---
-	obs_properties_add_text(props, "gen_header", "--- Generation ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "gen_header", "\n\n【 Generation 】", OBS_TEXT_INFO);
 
 	obs_property_t *guidance = obs_properties_add_float_slider(props, PROP_GUIDANCE, "Guidance", 0.1, 20.0, 0.1);
 	obs_property_set_enabled(guidance, logged_in);
@@ -1765,7 +1811,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_enabled(add_noise, logged_in && !is_streaming);
 
 	// --- IP Adapter ---
-	obs_properties_add_text(props, "ip_adapter_header", "--- IP Adapter ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "ip_adapter_header", "\n\n【 IP Adapter 】", OBS_TEXT_INFO);
 
 	obs_property_t *ip_enabled = obs_properties_add_bool(props, PROP_IP_ADAPTER_ENABLED, "Enable IP Adapter");
 	obs_property_set_enabled(ip_enabled, logged_in);
@@ -1786,7 +1832,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_enabled(style_url, logged_in);
 
 	// --- ControlNet ---
-	obs_properties_add_text(props, "controlnet_header", "--- ControlNet ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "controlnet_header", "\n\n【 ControlNet 】", OBS_TEXT_INFO);
 
 	obs_property_t *depth_scale =
 		obs_properties_add_float_slider(props, PROP_DEPTH_SCALE, "Depth Scale", 0.0, 1.0, 0.01);
@@ -1815,11 +1861,20 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_set_visible(color_scale, false);
 
 	// --- Experimental ---
-	obs_properties_add_text(props, "experimental_header", "--- Experimental ---", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "experimental_header", "\n\n【 Experimental 】", OBS_TEXT_INFO);
 
 	obs_property_t *frame_skip =
 		obs_properties_add_bool(props, PROP_FRAME_SKIP_ENABLED, "Skip Out-of-Order Frames");
 	obs_property_set_enabled(frame_skip, logged_in);
+
+	// --- About ---
+	obs_properties_add_text(props, "about_header", "\n\n【 About 】", OBS_TEXT_INFO);
+
+	char version_buf[64];
+	snprintf(version_buf, sizeof(version_buf), "Version %s", PLUGIN_VERSION);
+	obs_properties_add_text(props, "about_version", version_buf, OBS_TEXT_INFO);
+	obs_properties_add_button(props, "about_homepage", "Homepage", on_homepage_clicked);
+	obs_properties_add_button(props, "about_github", "GitHub", on_github_clicked);
 
 	return props;
 }
@@ -1881,7 +1936,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_COLOR_SCALE, 0.0);
 
 	// Experimental defaults
-	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, false);
+	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, true);
 }
 
 static struct obs_source_info daydream_filter_info = {
