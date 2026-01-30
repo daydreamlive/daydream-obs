@@ -186,6 +186,7 @@ bool daydream_whip_connect(struct daydream_whip *whip)
 	blog(LOG_INFO, "[Daydream WHIP] Connecting to %s", whip->whip_url.c_str());
 
 	rtc::Configuration config;
+	config.disableAutoNegotiation = true; // Manual negotiation for faster setup
 
 	whip->pc = std::make_shared<rtc::PeerConnection>(config);
 

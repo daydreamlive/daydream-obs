@@ -105,6 +105,9 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 
 	decoder->codec_ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	decoder->codec_ctx->flags2 |= AV_CODEC_FLAG2_FAST;
+	decoder->codec_ctx->thread_count = 1;              // Single thread for lowest latency
+	decoder->codec_ctx->thread_type = FF_THREAD_SLICE; // Slice-based threading if used
+	decoder->codec_ctx->delay = 0;                     // No decoder delay
 
 	// Try hardware decoder first, will fallback to SW on repeated failures
 	decoder->using_hw = init_hw_decoder(decoder, codec);

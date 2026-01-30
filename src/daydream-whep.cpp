@@ -194,6 +194,7 @@ bool daydream_whep_connect(struct daydream_whep *whep)
 	blog(LOG_INFO, "[Daydream WHEP] Connecting to %s", whep->whep_url.c_str());
 
 	rtc::Configuration config;
+	config.disableAutoNegotiation = true; // Manual negotiation for faster setup
 
 	whep->pc = std::make_shared<rtc::PeerConnection>(config);
 
