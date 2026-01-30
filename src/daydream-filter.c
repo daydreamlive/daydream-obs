@@ -1999,7 +1999,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 
 	// Experimental defaults
 	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, true);
-	obs_data_set_default_int(settings, PROP_BLUR_SIZE, 8);
+	obs_data_set_default_int(settings, PROP_BLUR_SIZE, 2);
 }
 
 static struct obs_source_info daydream_filter_info = {
