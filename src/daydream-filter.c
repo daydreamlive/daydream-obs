@@ -71,6 +71,9 @@
 #define PROP_START "start"
 #define PROP_STOP "stop"
 
+// Experimental
+#define PROP_FRAME_SKIP_ENABLED "frame_skip_enabled"
+
 struct daydream_filter {
 	obs_source_t *source;
 
@@ -185,19 +188,39 @@ struct daydream_filter {
 	uint64_t last_encode_time;
 	uint32_t target_fps;
 
-	// Adaptive bitrate control
-	uint32_t current_bitrate;
-	uint32_t min_bitrate;
-	uint32_t max_bitrate;
-	int32_t last_rtt_ms;
-	int32_t avg_rtt_ms;
-	uint64_t last_bitrate_check;
+	// Parameter update tracking
+	uint64_t pending_update_flags;
+	uint64_t last_update_time_ns;
+	pthread_t update_thread;
+	pthread_cond_t update_cond;
+	bool update_thread_running;
+	bool update_pending;
+
+	// Experimental: Frame skip
+	bool frame_skip_enabled;
+	uint32_t last_displayed_rtp_ts;
+	bool rtp_sync_established;
+	uint64_t frames_received;
+	uint64_t frames_skipped;
 };
+
+// Forward declaration
+static void schedule_params_update(struct daydream_filter *ctx, uint64_t flags);
 
 static const char *daydream_filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
 	return "Daydream";
+}
+
+// Helper to safely compare strings (handles NULL)
+static bool str_changed(const char *old_str, const char *new_str)
+{
+	if (!old_str && !new_str)
+		return false;
+	if (!old_str || !new_str)
+		return true;
+	return strcmp(old_str, new_str) != 0;
 }
 
 static void daydream_filter_update(void *data, obs_data_t *settings)
@@ -206,7 +229,126 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Free existing strings
+	bool is_streaming = ctx->streaming;
+	uint64_t update_flags = 0;
+
+	// Read new values from settings
+	const char *new_negative_prompt = obs_data_get_string(settings, PROP_NEGATIVE_PROMPT);
+	const char *new_model = obs_data_get_string(settings, PROP_MODEL);
+	float new_guidance = (float)obs_data_get_double(settings, PROP_GUIDANCE);
+	float new_delta = (float)obs_data_get_double(settings, PROP_DELTA);
+	int new_num_steps = (int)obs_data_get_int(settings, PROP_NUM_STEPS);
+	bool new_add_noise = obs_data_get_bool(settings, PROP_ADD_NOISE);
+
+	// Prompt Schedule
+	int new_prompt_count = (int)obs_data_get_int(settings, PROP_PROMPT_COUNT);
+	const char *new_prompts[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	float new_prompt_weights[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	new_prompts[0] = obs_data_get_string(settings, PROP_PROMPT_1);
+	new_prompt_weights[0] = (float)obs_data_get_double(settings, PROP_PROMPT_1_WEIGHT);
+	new_prompts[1] = obs_data_get_string(settings, PROP_PROMPT_2);
+	new_prompt_weights[1] = (float)obs_data_get_double(settings, PROP_PROMPT_2_WEIGHT);
+	new_prompts[2] = obs_data_get_string(settings, PROP_PROMPT_3);
+	new_prompt_weights[2] = (float)obs_data_get_double(settings, PROP_PROMPT_3_WEIGHT);
+	new_prompts[3] = obs_data_get_string(settings, PROP_PROMPT_4);
+	new_prompt_weights[3] = (float)obs_data_get_double(settings, PROP_PROMPT_4_WEIGHT);
+	const char *new_prompt_interp = obs_data_get_string(settings, PROP_PROMPT_INTERP);
+	bool new_normalize_prompt = obs_data_get_bool(settings, PROP_NORMALIZE_PROMPT);
+
+	// Seed Schedule
+	int new_seed_count = (int)obs_data_get_int(settings, PROP_SEED_COUNT);
+	int new_seeds[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	float new_seed_weights[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	new_seeds[0] = (int)obs_data_get_int(settings, PROP_SEED_1);
+	new_seed_weights[0] = (float)obs_data_get_double(settings, PROP_SEED_1_WEIGHT);
+	new_seeds[1] = (int)obs_data_get_int(settings, PROP_SEED_2);
+	new_seed_weights[1] = (float)obs_data_get_double(settings, PROP_SEED_2_WEIGHT);
+	new_seeds[2] = (int)obs_data_get_int(settings, PROP_SEED_3);
+	new_seed_weights[2] = (float)obs_data_get_double(settings, PROP_SEED_3_WEIGHT);
+	new_seeds[3] = (int)obs_data_get_int(settings, PROP_SEED_4);
+	new_seed_weights[3] = (float)obs_data_get_double(settings, PROP_SEED_4_WEIGHT);
+	const char *new_seed_interp = obs_data_get_string(settings, PROP_SEED_INTERP);
+	bool new_normalize_seed = obs_data_get_bool(settings, PROP_NORMALIZE_SEED);
+
+	// Step Schedule
+	int new_step_count = (int)obs_data_get_int(settings, PROP_STEP_COUNT);
+	int new_step_indices[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	new_step_indices[0] = (int)obs_data_get_int(settings, PROP_STEP_1);
+	new_step_indices[1] = (int)obs_data_get_int(settings, PROP_STEP_2);
+	new_step_indices[2] = (int)obs_data_get_int(settings, PROP_STEP_3);
+	new_step_indices[3] = (int)obs_data_get_int(settings, PROP_STEP_4);
+
+	// IP Adapter
+	bool new_ip_enabled = obs_data_get_bool(settings, PROP_IP_ADAPTER_ENABLED);
+	float new_ip_scale = (float)obs_data_get_double(settings, PROP_IP_ADAPTER_SCALE);
+	const char *new_ip_type = obs_data_get_string(settings, PROP_IP_ADAPTER_TYPE);
+	const char *new_style_url = obs_data_get_string(settings, PROP_STYLE_IMAGE_URL);
+
+	// ControlNet scales
+	float new_depth = (float)obs_data_get_double(settings, PROP_DEPTH_SCALE);
+	float new_canny = (float)obs_data_get_double(settings, PROP_CANNY_SCALE);
+	float new_tile = (float)obs_data_get_double(settings, PROP_TILE_SCALE);
+	float new_openpose = (float)obs_data_get_double(settings, PROP_OPENPOSE_SCALE);
+	float new_hed = (float)obs_data_get_double(settings, PROP_HED_SCALE);
+	float new_color = (float)obs_data_get_double(settings, PROP_COLOR_SCALE);
+
+	// Experimental
+	bool new_frame_skip = obs_data_get_bool(settings, PROP_FRAME_SKIP_ENABLED);
+
+	// Detect changes if streaming
+	if (is_streaming) {
+		// Prompt changes
+		if (new_prompt_count != ctx->prompt_count)
+			update_flags |= UPDATE_FLAG_PROMPT;
+		for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS && !(update_flags & UPDATE_FLAG_PROMPT); i++) {
+			if (str_changed(ctx->prompts[i], new_prompts[i]) ||
+			    ctx->prompt_weights[i] != new_prompt_weights[i])
+				update_flags |= UPDATE_FLAG_PROMPT;
+		}
+
+		if (str_changed(ctx->negative_prompt, new_negative_prompt))
+			update_flags |= UPDATE_FLAG_NEGATIVE_PROMPT;
+
+		// Seed changes
+		if (new_seed_count != ctx->seed_count)
+			update_flags |= UPDATE_FLAG_SEED;
+		for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS && !(update_flags & UPDATE_FLAG_SEED); i++) {
+			if (ctx->seeds[i] != new_seeds[i] || ctx->seed_weights[i] != new_seed_weights[i])
+				update_flags |= UPDATE_FLAG_SEED;
+		}
+
+		// Step schedule changes
+		if (new_step_count != ctx->step_count)
+			update_flags |= UPDATE_FLAG_STEP_SCHEDULE;
+		for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS && !(update_flags & UPDATE_FLAG_STEP_SCHEDULE); i++) {
+			if (ctx->step_indices[i] != new_step_indices[i])
+				update_flags |= UPDATE_FLAG_STEP_SCHEDULE;
+		}
+
+		if (ctx->guidance != new_guidance)
+			update_flags |= UPDATE_FLAG_GUIDANCE;
+		if (ctx->delta != new_delta)
+			update_flags |= UPDATE_FLAG_DELTA;
+
+		// ControlNet changes
+		if (ctx->depth_scale != new_depth || ctx->canny_scale != new_canny || ctx->tile_scale != new_tile ||
+		    ctx->openpose_scale != new_openpose || ctx->hed_scale != new_hed || ctx->color_scale != new_color)
+			update_flags |= UPDATE_FLAG_CONTROLNETS;
+
+		// IP Adapter changes
+		if (ctx->ip_adapter_enabled != new_ip_enabled || ctx->ip_adapter_scale != new_ip_scale ||
+		    str_changed(ctx->style_image_url, new_style_url))
+			update_flags |= UPDATE_FLAG_IP_ADAPTER;
+
+		// Interpolation changes
+		if (str_changed(ctx->prompt_interpolation, new_prompt_interp) ||
+		    ctx->normalize_prompt_weights != new_normalize_prompt ||
+		    str_changed(ctx->seed_interpolation, new_seed_interp) ||
+		    ctx->normalize_seed_weights != new_normalize_seed)
+			update_flags |= UPDATE_FLAG_INTERP;
+	}
+
+	// Now update context with new values
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
 	bfree(ctx->ip_adapter_type);
@@ -215,63 +357,166 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	bfree(ctx->seed_interpolation);
 	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
 		bfree(ctx->prompts[i]);
-		ctx->prompts[i] = NULL;
 	}
 
-	ctx->negative_prompt = bstrdup(obs_data_get_string(settings, PROP_NEGATIVE_PROMPT));
-	ctx->model = bstrdup(obs_data_get_string(settings, PROP_MODEL));
-	ctx->guidance = (float)obs_data_get_double(settings, PROP_GUIDANCE);
-	ctx->delta = (float)obs_data_get_double(settings, PROP_DELTA);
-	ctx->num_inference_steps = (int)obs_data_get_int(settings, PROP_NUM_STEPS);
-	ctx->add_noise = obs_data_get_bool(settings, PROP_ADD_NOISE);
+	ctx->negative_prompt = bstrdup(new_negative_prompt);
+	ctx->model = bstrdup(new_model);
+	ctx->guidance = new_guidance;
+	ctx->delta = new_delta;
+	ctx->num_inference_steps = new_num_steps;
+	ctx->add_noise = new_add_noise;
 
-	// Prompt Schedule
-	ctx->prompt_count = (int)obs_data_get_int(settings, PROP_PROMPT_COUNT);
-	ctx->prompts[0] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_1));
-	ctx->prompt_weights[0] = (float)obs_data_get_double(settings, PROP_PROMPT_1_WEIGHT);
-	ctx->prompts[1] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_2));
-	ctx->prompt_weights[1] = (float)obs_data_get_double(settings, PROP_PROMPT_2_WEIGHT);
-	ctx->prompts[2] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_3));
-	ctx->prompt_weights[2] = (float)obs_data_get_double(settings, PROP_PROMPT_3_WEIGHT);
-	ctx->prompts[3] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_4));
-	ctx->prompt_weights[3] = (float)obs_data_get_double(settings, PROP_PROMPT_4_WEIGHT);
-	ctx->prompt_interpolation = bstrdup(obs_data_get_string(settings, PROP_PROMPT_INTERP));
-	ctx->normalize_prompt_weights = obs_data_get_bool(settings, PROP_NORMALIZE_PROMPT);
+	ctx->prompt_count = new_prompt_count;
+	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		ctx->prompts[i] = bstrdup(new_prompts[i]);
+		ctx->prompt_weights[i] = new_prompt_weights[i];
+	}
+	ctx->prompt_interpolation = bstrdup(new_prompt_interp);
+	ctx->normalize_prompt_weights = new_normalize_prompt;
 
-	// Seed Schedule
-	ctx->seed_count = (int)obs_data_get_int(settings, PROP_SEED_COUNT);
-	ctx->seeds[0] = (int)obs_data_get_int(settings, PROP_SEED_1);
-	ctx->seed_weights[0] = (float)obs_data_get_double(settings, PROP_SEED_1_WEIGHT);
-	ctx->seeds[1] = (int)obs_data_get_int(settings, PROP_SEED_2);
-	ctx->seed_weights[1] = (float)obs_data_get_double(settings, PROP_SEED_2_WEIGHT);
-	ctx->seeds[2] = (int)obs_data_get_int(settings, PROP_SEED_3);
-	ctx->seed_weights[2] = (float)obs_data_get_double(settings, PROP_SEED_3_WEIGHT);
-	ctx->seeds[3] = (int)obs_data_get_int(settings, PROP_SEED_4);
-	ctx->seed_weights[3] = (float)obs_data_get_double(settings, PROP_SEED_4_WEIGHT);
-	ctx->seed_interpolation = bstrdup(obs_data_get_string(settings, PROP_SEED_INTERP));
-	ctx->normalize_seed_weights = obs_data_get_bool(settings, PROP_NORMALIZE_SEED);
+	ctx->seed_count = new_seed_count;
+	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		ctx->seeds[i] = new_seeds[i];
+		ctx->seed_weights[i] = new_seed_weights[i];
+	}
+	ctx->seed_interpolation = bstrdup(new_seed_interp);
+	ctx->normalize_seed_weights = new_normalize_seed;
 
-	// Step Schedule
-	ctx->step_count = (int)obs_data_get_int(settings, PROP_STEP_COUNT);
-	ctx->step_indices[0] = (int)obs_data_get_int(settings, PROP_STEP_1);
-	ctx->step_indices[1] = (int)obs_data_get_int(settings, PROP_STEP_2);
-	ctx->step_indices[2] = (int)obs_data_get_int(settings, PROP_STEP_3);
-	ctx->step_indices[3] = (int)obs_data_get_int(settings, PROP_STEP_4);
+	ctx->step_count = new_step_count;
+	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		ctx->step_indices[i] = new_step_indices[i];
+	}
 
-	// IP Adapter
-	ctx->ip_adapter_enabled = obs_data_get_bool(settings, PROP_IP_ADAPTER_ENABLED);
-	ctx->ip_adapter_scale = (float)obs_data_get_double(settings, PROP_IP_ADAPTER_SCALE);
-	ctx->ip_adapter_type = bstrdup(obs_data_get_string(settings, PROP_IP_ADAPTER_TYPE));
-	ctx->style_image_url = bstrdup(obs_data_get_string(settings, PROP_STYLE_IMAGE_URL));
+	ctx->ip_adapter_enabled = new_ip_enabled;
+	ctx->ip_adapter_scale = new_ip_scale;
+	ctx->ip_adapter_type = bstrdup(new_ip_type);
+	ctx->style_image_url = bstrdup(new_style_url);
 
-	// ControlNet scales
-	ctx->depth_scale = (float)obs_data_get_double(settings, PROP_DEPTH_SCALE);
-	ctx->canny_scale = (float)obs_data_get_double(settings, PROP_CANNY_SCALE);
-	ctx->tile_scale = (float)obs_data_get_double(settings, PROP_TILE_SCALE);
-	ctx->openpose_scale = (float)obs_data_get_double(settings, PROP_OPENPOSE_SCALE);
-	ctx->hed_scale = (float)obs_data_get_double(settings, PROP_HED_SCALE);
-	ctx->color_scale = (float)obs_data_get_double(settings, PROP_COLOR_SCALE);
+	ctx->depth_scale = new_depth;
+	ctx->canny_scale = new_canny;
+	ctx->tile_scale = new_tile;
+	ctx->openpose_scale = new_openpose;
+	ctx->hed_scale = new_hed;
+	ctx->color_scale = new_color;
 
+	ctx->frame_skip_enabled = new_frame_skip;
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	// Schedule parameter update if any hot params changed during streaming
+	if (update_flags != 0) {
+		schedule_params_update(ctx, update_flags);
+	}
+}
+
+#define PARAMS_UPDATE_DELAY_NS (100 * 1000000ULL) // 100ms debounce
+
+static void *update_thread_func(void *arg)
+{
+	struct daydream_filter *ctx = arg;
+
+	while (ctx->update_thread_running) {
+		pthread_mutex_lock(&ctx->mutex);
+
+		// Wait for update signal
+		while (ctx->update_thread_running && !ctx->update_pending) {
+			pthread_cond_wait(&ctx->update_cond, &ctx->mutex);
+		}
+
+		if (!ctx->update_thread_running) {
+			pthread_mutex_unlock(&ctx->mutex);
+			break;
+		}
+
+		// Debounce: wait for 100ms after last change
+		uint64_t target_time = ctx->last_update_time_ns + PARAMS_UPDATE_DELAY_NS;
+		uint64_t now = os_gettime_ns();
+
+		if (now < target_time) {
+			pthread_mutex_unlock(&ctx->mutex);
+			os_sleep_ms((uint32_t)((target_time - now) / 1000000ULL));
+			pthread_mutex_lock(&ctx->mutex);
+		}
+
+		// Check if still pending and no new changes came in
+		if (!ctx->update_pending || !ctx->streaming) {
+			pthread_mutex_unlock(&ctx->mutex);
+			continue;
+		}
+
+		// Collect current state
+		uint64_t flags = ctx->pending_update_flags;
+		ctx->pending_update_flags = 0;
+		ctx->update_pending = false;
+
+		// Build params struct
+		struct daydream_stream_params params = {0};
+		params.model_id = ctx->model;
+		params.negative_prompt = ctx->negative_prompt;
+		params.guidance = ctx->guidance;
+		params.delta = ctx->delta;
+		params.num_inference_steps = ctx->num_inference_steps;
+
+		params.prompt_schedule.count = ctx->prompt_count;
+		for (int i = 0; i < ctx->prompt_count; i++) {
+			params.prompt_schedule.prompts[i] = ctx->prompts[i];
+			params.prompt_schedule.weights[i] = ctx->prompt_weights[i];
+		}
+
+		params.seed_schedule.count = ctx->seed_count;
+		for (int i = 0; i < ctx->seed_count; i++) {
+			params.seed_schedule.seeds[i] = ctx->seeds[i];
+			params.seed_schedule.weights[i] = ctx->seed_weights[i];
+		}
+
+		params.step_schedule.count = ctx->step_count;
+		for (int i = 0; i < ctx->step_count; i++) {
+			params.step_schedule.steps[i] = ctx->step_indices[i];
+		}
+
+		params.ip_adapter.enabled = ctx->ip_adapter_enabled;
+		params.ip_adapter.scale = ctx->ip_adapter_scale;
+		params.ip_adapter.type = ctx->ip_adapter_type;
+		params.ip_adapter.style_image_url = ctx->style_image_url;
+
+		params.controlnets.depth_scale = ctx->depth_scale;
+		params.controlnets.canny_scale = ctx->canny_scale;
+		params.controlnets.tile_scale = ctx->tile_scale;
+		params.controlnets.openpose_scale = ctx->openpose_scale;
+		params.controlnets.hed_scale = ctx->hed_scale;
+		params.controlnets.color_scale = ctx->color_scale;
+
+		params.prompt_interpolation_method = ctx->prompt_interpolation;
+		params.normalize_prompt_weights = ctx->normalize_prompt_weights;
+		params.seed_interpolation_method = ctx->seed_interpolation;
+		params.normalize_seed_weights = ctx->normalize_seed_weights;
+
+		char *stream_id = bstrdup(ctx->stream_id);
+		const char *api_key = daydream_auth_get_api_key(ctx->auth);
+
+		pthread_mutex_unlock(&ctx->mutex);
+
+		// Send PATCH request
+		if (stream_id && api_key) {
+			bool success = daydream_api_update_stream(api_key, stream_id, &params, flags);
+			if (!success) {
+				blog(LOG_WARNING, "[Daydream] Failed to update stream parameters");
+			}
+		}
+
+		bfree(stream_id);
+	}
+
+	return NULL;
+}
+
+static void schedule_params_update(struct daydream_filter *ctx, uint64_t flags)
+{
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->pending_update_flags |= flags;
+	ctx->update_pending = true;
+	ctx->last_update_time_ns = os_gettime_ns();
+	pthread_cond_signal(&ctx->update_cond);
 	pthread_mutex_unlock(&ctx->mutex);
 }
 
@@ -279,10 +524,34 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 {
 	struct daydream_filter *ctx = userdata;
 	UNUSED_PARAMETER(is_keyframe);
-	UNUSED_PARAMETER(rtp_timestamp);
 
 	if (!ctx || !ctx->decoder || ctx->stopping)
 		return;
+
+	ctx->frames_received++;
+
+	// Frame skip: drop out-of-order frames
+	if (ctx->frame_skip_enabled) {
+		if (!ctx->rtp_sync_established) {
+			ctx->last_displayed_rtp_ts = rtp_timestamp;
+			ctx->rtp_sync_established = true;
+		} else {
+			// Skip if frame is out of order (older than last displayed)
+			// Handle RTP timestamp wraparound with 0x80000000 check
+			if (rtp_timestamp <= ctx->last_displayed_rtp_ts &&
+			    ctx->last_displayed_rtp_ts - rtp_timestamp < 0x80000000) {
+				ctx->frames_skipped++;
+				if (ctx->frames_skipped % 100 == 1) {
+					blog(LOG_INFO,
+					     "[Daydream] Skipped out-of-order frame: rtp=%u, last=%u, skipped %llu/%llu",
+					     rtp_timestamp, ctx->last_displayed_rtp_ts, ctx->frames_skipped,
+					     ctx->frames_received);
+				}
+				return;
+			}
+			ctx->last_displayed_rtp_ts = rtp_timestamp;
+		}
+	}
 
 	struct daydream_decoded_frame decoded;
 	if (!daydream_decoder_decode(ctx->decoder, data, size, &decoded))
@@ -422,57 +691,6 @@ static void *encode_thread_func(void *data)
 							 encoded.is_keyframe);
 				ctx->frame_count++;
 			}
-
-			// Adaptive bitrate: check RTT every second
-			uint64_t now_ns = os_gettime_ns();
-			if (now_ns - ctx->last_bitrate_check > 1000000000ULL) {
-				ctx->last_bitrate_check = now_ns;
-
-				int32_t rtt_ms = daydream_whip_get_rtt_ms(ctx->whip);
-				if (rtt_ms > 0) {
-					// Exponential moving average of RTT
-					if (ctx->avg_rtt_ms <= 0) {
-						ctx->avg_rtt_ms = rtt_ms;
-					} else {
-						ctx->avg_rtt_ms = (ctx->avg_rtt_ms * 7 + rtt_ms) / 8;
-					}
-
-					uint32_t new_bitrate = ctx->current_bitrate;
-
-					// RTT thresholds for bitrate adjustment
-					if (ctx->avg_rtt_ms > 300) {
-						// High latency: reduce bitrate by 20%
-						new_bitrate = ctx->current_bitrate * 80 / 100;
-						blog(LOG_INFO, "[Daydream] High RTT (%d ms), reducing bitrate",
-						     ctx->avg_rtt_ms);
-					} else if (ctx->avg_rtt_ms > 150) {
-						// Medium latency: reduce bitrate by 10%
-						new_bitrate = ctx->current_bitrate * 90 / 100;
-					} else if (ctx->avg_rtt_ms < 50 && ctx->last_rtt_ms < 50) {
-						// Low latency for 2 checks: increase bitrate by 5%
-						new_bitrate = ctx->current_bitrate * 105 / 100;
-					}
-
-					// Clamp to min/max
-					if (new_bitrate < ctx->min_bitrate)
-						new_bitrate = ctx->min_bitrate;
-					if (new_bitrate > ctx->max_bitrate)
-						new_bitrate = ctx->max_bitrate;
-
-					// Apply new bitrate if changed significantly (>5%)
-					if (new_bitrate != ctx->current_bitrate) {
-						int diff = (int)new_bitrate - (int)ctx->current_bitrate;
-						if (diff < 0)
-							diff = -diff;
-						if (diff > (int)(ctx->current_bitrate / 20)) {
-							daydream_encoder_set_bitrate(ctx->encoder, new_bitrate);
-							ctx->current_bitrate = new_bitrate;
-						}
-					}
-
-					ctx->last_rtt_ms = rtt_ms;
-				}
-			}
 		}
 
 		// Release buffer ownership
@@ -504,6 +722,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->frame_cond, NULL);
+	pthread_cond_init(&ctx->update_cond, NULL);
 
 	ctx->auth = daydream_auth_create();
 	daydream_filter_update(ctx, settings);
@@ -514,6 +733,13 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 static void stop_streaming(struct daydream_filter *ctx)
 {
 	ctx->stopping = true;
+
+	// Stop update thread first
+	if (ctx->update_thread_running) {
+		ctx->update_thread_running = false;
+		pthread_cond_signal(&ctx->update_cond);
+		pthread_join(ctx->update_thread, NULL);
+	}
 
 	if (ctx->encode_thread_running) {
 		ctx->encode_thread_running = false;
@@ -566,6 +792,13 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->streaming = false;
 	ctx->stopping = false;
 	ctx->decoded_frame_ready = false;
+
+	// Clear pending updates
+	ctx->pending_update_flags = 0;
+	ctx->update_pending = false;
+
+	// Trigger UI refresh to re-enable cold parameters
+	obs_source_update_properties(ctx->source);
 }
 
 static void daydream_filter_destroy(void *data)
@@ -619,6 +852,7 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->nv12_uv_data[1]);
 
 	pthread_cond_destroy(&ctx->frame_cond);
+	pthread_cond_destroy(&ctx->update_cond);
 	pthread_mutex_destroy(&ctx->mutex);
 
 	bfree(ctx);
@@ -1250,16 +1484,17 @@ static void *start_streaming_thread_func(void *data)
 	ctx->frame_count = 0;
 	ctx->last_encode_time = os_gettime_ns();
 
-	// Initialize adaptive bitrate control
-	ctx->current_bitrate = 500000; // Start at 500kbps
-	ctx->min_bitrate = 200000;     // Min 200kbps
-	ctx->max_bitrate = 2000000;    // Max 2Mbps
-	ctx->last_rtt_ms = -1;
-	ctx->avg_rtt_ms = -1;
-	ctx->last_bitrate_check = os_gettime_ns();
+	// Reset frame skip stats
+	ctx->frames_received = 0;
+	ctx->frames_skipped = 0;
+	ctx->rtp_sync_established = false;
 
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
+
+	// Start update thread for live parameter updates
+	ctx->update_thread_running = true;
+	pthread_create(&ctx->update_thread, NULL, update_thread_func, ctx);
 
 	const char *whep_url = daydream_whip_get_whep_url(ctx->whip);
 	if (whep_url) {
@@ -1347,6 +1582,7 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	struct daydream_filter *ctx = data;
 	obs_properties_t *props = obs_properties_create();
 	bool logged_in = daydream_auth_is_logged_in(ctx->auth);
+	bool is_streaming = ctx->streaming;
 
 	if (logged_in) {
 		obs_properties_add_text(props, PROP_LOGIN_STATUS, "Status: Logged In", OBS_TEXT_INFO);
@@ -1356,13 +1592,14 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_button(props, PROP_LOGIN, "Login with Daydream", on_login_clicked);
 	}
 
+	// Cold parameter: disabled during streaming
 	obs_property_t *model =
 		obs_properties_add_list(props, PROP_MODEL, "Model", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(model, "SDXL Turbo", "stabilityai/sdxl-turbo");
 	obs_property_list_add_string(model, "SD Turbo", "stabilityai/sd-turbo");
 	obs_property_list_add_string(model, "Dreamshaper 8", "Lykon/dreamshaper-8");
 	obs_property_list_add_string(model, "Openjourney v4", "prompthero/openjourney-v4");
-	obs_property_set_enabled(model, logged_in);
+	obs_property_set_enabled(model, logged_in && !is_streaming);
 	obs_property_set_modified_callback(model, on_model_changed);
 
 	// --- Prompt Schedule ---
@@ -1460,9 +1697,10 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	// --- Step Schedule (t_index_list) ---
 	obs_properties_add_text(props, "step_header", "--- Step Schedule ---", OBS_TEXT_INFO);
 
+	// Cold parameter: disabled during streaming
 	obs_property_t *num_steps =
 		obs_properties_add_int_slider(props, PROP_NUM_STEPS, "Num Inference Steps", 1, 100, 1);
-	obs_property_set_enabled(num_steps, logged_in);
+	obs_property_set_enabled(num_steps, logged_in && !is_streaming);
 
 	obs_property_t *step_count = obs_properties_add_int_slider(props, PROP_STEP_COUNT, "Step Count", 1, 4, 1);
 	obs_property_set_enabled(step_count, logged_in);
@@ -1492,8 +1730,9 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *delta = obs_properties_add_float_slider(props, PROP_DELTA, "Delta", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(delta, logged_in);
 
+	// Cold parameter: disabled during streaming
 	obs_property_t *add_noise = obs_properties_add_bool(props, PROP_ADD_NOISE, "Add Noise");
-	obs_property_set_enabled(add_noise, logged_in);
+	obs_property_set_enabled(add_noise, logged_in && !is_streaming);
 
 	// --- IP Adapter ---
 	obs_properties_add_text(props, "ip_adapter_header", "--- IP Adapter ---", OBS_TEXT_INFO);
@@ -1505,11 +1744,12 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_float_slider(props, PROP_IP_ADAPTER_SCALE, "IP Adapter Scale", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(ip_scale, logged_in);
 
+	// Cold parameter: disabled during streaming
 	obs_property_t *ip_type = obs_properties_add_list(props, PROP_IP_ADAPTER_TYPE, "IP Adapter Type",
 							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(ip_type, "Regular", "regular");
 	obs_property_list_add_string(ip_type, "FaceID", "faceid");
-	obs_property_set_enabled(ip_type, logged_in);
+	obs_property_set_enabled(ip_type, logged_in && !is_streaming);
 
 	obs_property_t *style_url =
 		obs_properties_add_text(props, PROP_STYLE_IMAGE_URL, "Style Image URL", OBS_TEXT_DEFAULT);
@@ -1543,6 +1783,13 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_float_slider(props, PROP_COLOR_SCALE, "Color Scale", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(color_scale, logged_in);
 	obs_property_set_visible(color_scale, false);
+
+	// --- Experimental ---
+	obs_properties_add_text(props, "experimental_header", "--- Experimental ---", OBS_TEXT_INFO);
+
+	obs_property_t *frame_skip =
+		obs_properties_add_bool(props, PROP_FRAME_SKIP_ENABLED, "Skip Out-of-Order Frames");
+	obs_property_set_enabled(frame_skip, logged_in);
 
 	// --- Streaming Controls ---
 	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
@@ -1609,6 +1856,9 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_OPENPOSE_SCALE, 0.0);
 	obs_data_set_default_double(settings, PROP_HED_SCALE, 0.0);
 	obs_data_set_default_double(settings, PROP_COLOR_SCALE, 0.0);
+
+	// Experimental defaults
+	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, false);
 }
 
 static struct obs_source_info daydream_filter_info = {

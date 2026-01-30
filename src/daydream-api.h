@@ -2,8 +2,20 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #define DAYDREAM_MAX_SCHEDULE_SLOTS 4
+
+// Update flags for live parameter updates (bitmask)
+#define UPDATE_FLAG_PROMPT (1ULL << 0)
+#define UPDATE_FLAG_NEGATIVE_PROMPT (1ULL << 1)
+#define UPDATE_FLAG_SEED (1ULL << 2)
+#define UPDATE_FLAG_STEP_SCHEDULE (1ULL << 3)
+#define UPDATE_FLAG_GUIDANCE (1ULL << 4)
+#define UPDATE_FLAG_DELTA (1ULL << 5)
+#define UPDATE_FLAG_CONTROLNETS (1ULL << 6)
+#define UPDATE_FLAG_IP_ADAPTER (1ULL << 7)
+#define UPDATE_FLAG_INTERP (1ULL << 8)
 
 struct daydream_ip_adapter_params {
 	bool enabled;
@@ -75,5 +87,11 @@ void daydream_api_cleanup(void);
 
 struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 							 const struct daydream_stream_params *params);
+
+// Update stream parameters (PATCH request)
+// Only fields indicated by update_flags will be sent
+// Returns true on success, false on failure
+bool daydream_api_update_stream(const char *api_key, const char *stream_id, const struct daydream_stream_params *params,
+				uint64_t update_flags);
 
 void daydream_api_free_result(struct daydream_stream_result *result);

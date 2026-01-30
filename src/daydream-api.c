@@ -62,6 +62,66 @@ static char *find_json_string(const char *json, const char *key)
 	return result;
 }
 
+// Escape a string for JSON (handles quotes, backslashes, newlines, etc.)
+// Returns allocated string that must be freed by caller
+static char *json_escape_string(const char *str)
+{
+	if (!str)
+		return strdup("");
+
+	// Count how much space we need
+	size_t len = 0;
+	for (const char *p = str; *p; p++) {
+		switch (*p) {
+		case '"':
+		case '\\':
+		case '\n':
+		case '\r':
+		case '\t':
+			len += 2;
+			break;
+		default:
+			len += 1;
+			break;
+		}
+	}
+
+	char *escaped = malloc(len + 1);
+	if (!escaped)
+		return NULL;
+
+	char *out = escaped;
+	for (const char *p = str; *p; p++) {
+		switch (*p) {
+		case '"':
+			*out++ = '\\';
+			*out++ = '"';
+			break;
+		case '\\':
+			*out++ = '\\';
+			*out++ = '\\';
+			break;
+		case '\n':
+			*out++ = '\\';
+			*out++ = 'n';
+			break;
+		case '\r':
+			*out++ = '\\';
+			*out++ = 'r';
+			break;
+		case '\t':
+			*out++ = '\\';
+			*out++ = 't';
+			break;
+		default:
+			*out++ = *p;
+			break;
+		}
+	}
+	*out = '\0';
+	return escaped;
+}
+
 void daydream_api_init(void)
 {
 	curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -318,6 +378,245 @@ cleanup:
 		free(response.data);
 
 	return result;
+}
+
+bool daydream_api_update_stream(const char *api_key, const char *stream_id, const struct daydream_stream_params *params,
+				uint64_t update_flags)
+{
+	if (!api_key || !stream_id || !params || update_flags == 0)
+		return false;
+
+	CURL *curl = NULL;
+	struct curl_slist *headers = NULL;
+	struct response_buffer response = {0};
+	char *json_body = NULL;
+	bool success = false;
+
+	curl = curl_easy_init();
+	if (!curl) {
+		blog(LOG_ERROR, "[Daydream] Failed to initialize curl for update");
+		return false;
+	}
+
+	char auth_header[512];
+	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
+
+	headers = curl_slist_append(headers, auth_header);
+	headers = curl_slist_append(headers, "Content-Type: application/json");
+	headers = curl_slist_append(headers, "x-client-source: obs");
+
+	size_t json_size = 8192;
+	json_body = malloc(json_size);
+	if (!json_body) {
+		blog(LOG_ERROR, "[Daydream] Failed to allocate memory for update");
+		goto cleanup;
+	}
+
+	// Build JSON body with only changed parameters
+	// Use json_escape_string for all string values to handle special characters
+	char *ptr = json_body;
+	ptr += sprintf(ptr, "{\"pipeline\":\"streamdiffusion\",\"params\":{");
+
+	// Always include model_id (required by API)
+	ptr += sprintf(ptr, "\"model_id\":\"%s\"", params->model_id ? params->model_id : "stabilityai/sdxl-turbo");
+
+	// Prompt schedule
+	if (update_flags & UPDATE_FLAG_PROMPT) {
+		if (params->prompt_schedule.count <= 1) {
+			const char *p = (params->prompt_schedule.count == 1 && params->prompt_schedule.prompts[0])
+						? params->prompt_schedule.prompts[0]
+						: "strawberry";
+			char *escaped = json_escape_string(p);
+			ptr += sprintf(ptr, ",\"prompt\":\"%s\"", escaped);
+			free(escaped);
+		} else {
+			ptr += sprintf(ptr, ",\"prompt\":[");
+			for (int i = 0; i < params->prompt_schedule.count; i++) {
+				if (i > 0)
+					ptr += sprintf(ptr, ",");
+				char *escaped = json_escape_string(
+					params->prompt_schedule.prompts[i] ? params->prompt_schedule.prompts[i] : "");
+				ptr += sprintf(ptr, "[\"%s\",%.2f]", escaped, params->prompt_schedule.weights[i]);
+				free(escaped);
+			}
+			ptr += sprintf(ptr, "]");
+		}
+	}
+
+	// Negative prompt
+	if (update_flags & UPDATE_FLAG_NEGATIVE_PROMPT) {
+		char *escaped = json_escape_string(params->negative_prompt ? params->negative_prompt : "");
+		ptr += sprintf(ptr, ",\"negative_prompt\":\"%s\"", escaped);
+		free(escaped);
+	}
+
+	// Seed schedule
+	if (update_flags & UPDATE_FLAG_SEED) {
+		if (params->seed_schedule.count <= 1) {
+			int s = (params->seed_schedule.count == 1) ? params->seed_schedule.seeds[0] : 42;
+			ptr += sprintf(ptr, ",\"seed\":%d", s);
+		} else {
+			ptr += sprintf(ptr, ",\"seed\":[");
+			for (int i = 0; i < params->seed_schedule.count; i++) {
+				if (i > 0)
+					ptr += sprintf(ptr, ",");
+				ptr += sprintf(ptr, "[%d,%.2f]", params->seed_schedule.seeds[i],
+					       params->seed_schedule.weights[i]);
+			}
+			ptr += sprintf(ptr, "]");
+		}
+	}
+
+	// Step schedule (t_index_list)
+	if (update_flags & UPDATE_FLAG_STEP_SCHEDULE) {
+		ptr += sprintf(ptr, ",\"t_index_list\":[");
+		if (params->step_schedule.count > 0) {
+			for (int i = 0; i < params->step_schedule.count; i++) {
+				if (i > 0)
+					ptr += sprintf(ptr, ",");
+				ptr += sprintf(ptr, "%d", params->step_schedule.steps[i]);
+			}
+		} else {
+			ptr += sprintf(ptr, "11");
+		}
+		ptr += sprintf(ptr, "]");
+	}
+
+	// Guidance
+	if (update_flags & UPDATE_FLAG_GUIDANCE) {
+		ptr += sprintf(ptr, ",\"guidance_scale\":%.2f", params->guidance);
+	}
+
+	// Delta
+	if (update_flags & UPDATE_FLAG_DELTA) {
+		ptr += sprintf(ptr, ",\"delta\":%.2f", params->delta);
+	}
+
+	// ControlNets
+	if (update_flags & UPDATE_FLAG_CONTROLNETS) {
+		const char *model = params->model_id ? params->model_id : "";
+
+		if (strcmp(model, "stabilityai/sd-turbo") == 0) {
+			ptr += sprintf(
+				ptr,
+				",\"controlnets\":["
+				"{\"model_id\":\"thibaud/controlnet-sd21-depth-diffusers\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"thibaud/controlnet-sd21-canny-diffusers\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"thibaud/controlnet-sd21-hed-diffusers\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"hed\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"thibaud/controlnet-sd21-openpose-diffusers\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"openpose\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"thibaud/controlnet-sd21-color-diffusers\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"passthrough\",\"preprocessor_params\":{},\"enabled\":true}"
+				"]",
+				params->controlnets.depth_scale, params->controlnets.canny_scale,
+				params->controlnets.hed_scale, params->controlnets.openpose_scale,
+				params->controlnets.color_scale);
+		} else if (strcmp(model, "stabilityai/sdxl-turbo") == 0) {
+			ptr += sprintf(
+				ptr,
+				",\"controlnets\":["
+				"{\"model_id\":\"xinsir/controlnet-depth-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"xinsir/controlnet-canny-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"xinsir/controlnet-tile-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"feedback\",\"preprocessor_params\":{},\"enabled\":true}"
+				"]",
+				params->controlnets.depth_scale, params->controlnets.canny_scale,
+				params->controlnets.tile_scale);
+		} else {
+			ptr += sprintf(
+				ptr,
+				",\"controlnets\":["
+				"{\"model_id\":\"lllyasviel/control_v11f1p_sd15_depth\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"lllyasviel/control_v11p_sd15_canny\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+				"{\"model_id\":\"lllyasviel/control_v11f1e_sd15_tile\",\"conditioning_scale\":%.2f,"
+				"\"preprocessor\":\"feedback\",\"preprocessor_params\":{},\"enabled\":true}"
+				"]",
+				params->controlnets.depth_scale, params->controlnets.canny_scale,
+				params->controlnets.tile_scale);
+		}
+	}
+
+	// IP Adapter
+	if (update_flags & UPDATE_FLAG_IP_ADAPTER) {
+		const char *ip_type = params->ip_adapter.type ? params->ip_adapter.type : "regular";
+		ptr += sprintf(ptr, ",\"ip_adapter\":{\"enabled\":%s,\"scale\":%.2f,\"type\":\"%s\"}",
+			       params->ip_adapter.enabled ? "true" : "false", params->ip_adapter.scale, ip_type);
+
+		if (params->ip_adapter.style_image_url && strlen(params->ip_adapter.style_image_url) > 0) {
+			char *escaped = json_escape_string(params->ip_adapter.style_image_url);
+			ptr += sprintf(ptr, ",\"ip_adapter_style_image_url\":\"%s\"", escaped);
+			free(escaped);
+		}
+	}
+
+	// Interpolation settings
+	if (update_flags & UPDATE_FLAG_INTERP) {
+		if (params->prompt_schedule.count > 1) {
+			const char *prompt_interp =
+				params->prompt_interpolation_method ? params->prompt_interpolation_method : "slerp";
+			ptr += sprintf(ptr, ",\"prompt_interpolation_method\":\"%s\",\"normalize_prompt_weights\":%s",
+				       prompt_interp, params->normalize_prompt_weights ? "true" : "false");
+		}
+		if (params->seed_schedule.count > 1) {
+			const char *seed_interp = params->seed_interpolation_method ? params->seed_interpolation_method
+										    : "slerp";
+			ptr += sprintf(ptr, ",\"seed_interpolation_method\":\"%s\",\"normalize_seed_weights\":%s",
+				       seed_interp, params->normalize_seed_weights ? "true" : "false");
+		}
+	}
+
+	ptr += sprintf(ptr, "}}");
+
+	char url[512];
+	snprintf(url, sizeof(url), "%s/streams/%s", DAYDREAM_API_BASE, stream_id);
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+	blog(LOG_INFO, "[Daydream] Updating stream %s with flags 0x%llx", stream_id, (unsigned long long)update_flags);
+	blog(LOG_INFO, "[Daydream] Update JSON: %s", json_body);
+
+	CURLcode res = curl_easy_perform(curl);
+	if (res != CURLE_OK) {
+		blog(LOG_ERROR, "[Daydream] Update request failed: %s", curl_easy_strerror(res));
+		goto cleanup;
+	}
+
+	long http_code = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+	if (http_code != 200 && http_code != 204) {
+		blog(LOG_ERROR, "[Daydream] Update failed with HTTP %ld: %s", http_code,
+		     response.data ? response.data : "No response");
+		goto cleanup;
+	}
+
+	blog(LOG_INFO, "[Daydream] Stream parameters updated successfully");
+	success = true;
+
+cleanup:
+	if (curl)
+		curl_easy_cleanup(curl);
+	if (headers)
+		curl_slist_free_all(headers);
+	if (json_body)
+		free(json_body);
+	if (response.data)
+		free(response.data);
+
+	return success;
 }
 
 void daydream_api_free_result(struct daydream_stream_result *result)

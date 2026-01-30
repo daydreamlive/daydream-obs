@@ -15,9 +15,10 @@ struct daydream_decoder {
 	AVBufferRef *hw_device_ctx;
 	enum AVPixelFormat hw_pix_fmt;
 	bool using_hw;
-	bool hw_failed;           // HW decode permanently failed, using SW
-	int consecutive_failures; // Track decode failures for fallback
-	bool output_nv12;         // Output NV12 (true) or BGRA (false)
+	bool hw_failed;              // HW decode permanently failed, using SW
+	bool had_successful_decode;  // Track if we've ever decoded successfully
+	int consecutive_hw_failures; // Track HW-specific failures (transfer errors)
+	bool output_nv12;            // Output NV12 (true) or BGRA (false)
 
 	uint32_t width;
 	uint32_t height;
@@ -108,7 +109,8 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	// Try hardware decoder first, will fallback to SW on repeated failures
 	decoder->using_hw = init_hw_decoder(decoder, codec);
 	decoder->hw_failed = false;
-	decoder->consecutive_failures = 0;
+	decoder->had_successful_decode = false;
+	decoder->consecutive_hw_failures = 0;
 
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to open codec");
@@ -235,13 +237,13 @@ static bool fallback_to_sw_decoder(struct daydream_decoder *decoder)
 
 	decoder->using_hw = false;
 	decoder->hw_failed = true;
-	decoder->consecutive_failures = 0;
+	decoder->consecutive_hw_failures = 0;
 
 	blog(LOG_INFO, "[Daydream Decoder] Successfully fell back to software decoder");
 	return true;
 }
 
-#define HW_FAILURE_THRESHOLD 5 // Fallback after 5 consecutive failures
+#define HW_FAILURE_THRESHOLD 5 // Fallback after 5 consecutive HW transfer failures
 
 bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h264_data, size_t size,
 			     struct daydream_decoded_frame *out_frame)
@@ -254,25 +256,15 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 
 	int ret = avcodec_send_packet(decoder->codec_ctx, decoder->packet);
 	if (ret < 0 && ret != AVERROR(EAGAIN)) {
-		// Track failures for HW fallback
-		if (decoder->using_hw && !decoder->hw_failed) {
-			decoder->consecutive_failures++;
-			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
-				fallback_to_sw_decoder(decoder);
-			}
-		}
+		// Don't count send_packet failures as HW failures - they're usually
+		// due to missing SPS/PPS at stream start, not HW issues
 		return false;
 	}
 
 	ret = avcodec_receive_frame(decoder->codec_ctx, decoder->frame);
 	if (ret < 0) {
-		// Track failures for HW fallback
-		if (decoder->using_hw && !decoder->hw_failed && ret != AVERROR(EAGAIN)) {
-			decoder->consecutive_failures++;
-			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
-				fallback_to_sw_decoder(decoder);
-			}
-		}
+		// Don't count receive_frame failures as HW failures - they're usually
+		// due to missing SPS/PPS at stream start, not HW issues
 		return false;
 	}
 
@@ -281,10 +273,12 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	if (decoder->using_hw && decoder->frame->format == decoder->hw_pix_fmt) {
 		ret = av_hwframe_transfer_data(decoder->sw_frame, decoder->frame, 0);
 		if (ret < 0) {
-			blog(LOG_ERROR, "[Daydream Decoder] Failed to transfer HW frame to CPU");
-			// Track failures for HW fallback
-			decoder->consecutive_failures++;
-			if (decoder->consecutive_failures >= HW_FAILURE_THRESHOLD) {
+			// This IS a HW-specific failure (frame transfer from GPU to CPU)
+			// Only count these for HW fallback decision
+			decoder->consecutive_hw_failures++;
+			blog(LOG_WARNING, "[Daydream Decoder] HW frame transfer failed (%d/%d)",
+			     decoder->consecutive_hw_failures, HW_FAILURE_THRESHOLD);
+			if (decoder->consecutive_hw_failures >= HW_FAILURE_THRESHOLD) {
 				fallback_to_sw_decoder(decoder);
 			}
 			return false;
@@ -292,8 +286,14 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 		src_frame = decoder->sw_frame;
 	}
 
-	// Successful decode - reset failure counter
-	decoder->consecutive_failures = 0;
+	// Successful decode - reset HW failure counter and mark success
+	decoder->consecutive_hw_failures = 0;
+	if (!decoder->had_successful_decode) {
+		decoder->had_successful_decode = true;
+		blog(LOG_INFO, "[Daydream Decoder] First frame decoded (%s, format: %s)",
+		     decoder->using_hw ? "hardware" : "software",
+		     src_frame->format == AV_PIX_FMT_NV12 ? "NV12/GPU" : "YUV420P/CPU");
+	}
 
 	uint32_t frame_width = src_frame->width;
 	uint32_t frame_height = src_frame->height;
