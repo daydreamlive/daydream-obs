@@ -74,6 +74,7 @@
 
 // Experimental
 #define PROP_FRAME_SKIP_ENABLED "frame_skip_enabled"
+#define PROP_BLUR_SIZE "blur_size"
 
 struct daydream_filter {
 	obs_source_t *source;
@@ -182,6 +183,11 @@ struct daydream_filter {
 	gs_effect_t *nv12_effect;
 	gs_texrender_t *nv12_texrender;
 
+	// Blur background for letterboxing
+	gs_texrender_t *blur_texrender;
+	gs_texrender_t *blur_texrender2;
+	gs_effect_t *blur_effect;
+
 	pthread_mutex_t mutex;
 	pthread_cond_t frame_cond;
 
@@ -203,6 +209,9 @@ struct daydream_filter {
 	bool rtp_sync_established;
 	uint64_t frames_received;
 	uint64_t frames_skipped;
+
+	// Experimental: Blur background
+	int blur_size;
 };
 
 // Forward declaration
@@ -295,6 +304,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 
 	// Experimental
 	bool new_frame_skip = obs_data_get_bool(settings, PROP_FRAME_SKIP_ENABLED);
+	int new_blur_size = (int)obs_data_get_int(settings, PROP_BLUR_SIZE);
 
 	// Detect changes if streaming
 	if (is_streaming) {
@@ -401,6 +411,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->color_scale = new_color;
 
 	ctx->frame_skip_enabled = new_frame_skip;
+	ctx->blur_size = new_blur_size;
 
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -827,6 +838,12 @@ static void daydream_filter_destroy(void *data)
 		gs_effect_destroy(ctx->nv12_effect);
 	if (ctx->nv12_texrender)
 		gs_texrender_destroy(ctx->nv12_texrender);
+	if (ctx->blur_texrender)
+		gs_texrender_destroy(ctx->blur_texrender);
+	if (ctx->blur_texrender2)
+		gs_texrender_destroy(ctx->blur_texrender2);
+	if (ctx->blur_effect)
+		gs_effect_destroy(ctx->blur_effect);
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
@@ -1164,9 +1181,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
 
-	gs_technique_begin(tech);
-	gs_technique_begin_pass(tech, 0);
-
 	if (ctx->streaming && output != tex) {
 		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
 							     : (float)STREAM_SIZE / (float)parent_height;
@@ -1174,18 +1188,61 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float render_x = (ctx->width - render_size) / 2.0f;
 		float render_y = (ctx->height - render_size) / 2.0f;
 
+		// Simple color blur: downsample then upscale (bilinear filtering does the rest)
+		gs_texture_t *blur_tex = NULL;
+		int blur_size = ctx->blur_size;
+		if (blur_size > 0) {
+			if (!ctx->blur_texrender)
+				ctx->blur_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+
+			if (ctx->blur_texrender) {
+				gs_texrender_reset(ctx->blur_texrender);
+				if (gs_texrender_begin(ctx->blur_texrender, blur_size, blur_size)) {
+					struct vec4 clear_color;
+					vec4_zero(&clear_color);
+					gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+					gs_ortho(0.0f, (float)blur_size, 0.0f, (float)blur_size, -100.0f, 100.0f);
+
+					gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"),
+							      output);
+					gs_technique_begin(tech);
+					gs_technique_begin_pass(tech, 0);
+					gs_draw_sprite(output, 0, blur_size, blur_size);
+					gs_technique_end_pass(tech);
+					gs_technique_end(tech);
+
+					gs_texrender_end(ctx->blur_texrender);
+					blur_tex = gs_texrender_get_texture(ctx->blur_texrender);
+				}
+			}
+		}
+
+		gs_technique_begin(tech);
+		gs_technique_begin_pass(tech, 0);
+
+		// Draw blurred background full screen
+		if (blur_tex) {
+			gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), blur_tex);
+			gs_draw_sprite(blur_tex, 0, ctx->width, ctx->height);
+		}
+
+		// Draw actual output centered
 		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
 		gs_matrix_push();
 		gs_matrix_translate3f(render_x, render_y, 0.0f);
 		gs_draw_sprite(output, 0, (uint32_t)render_size, (uint32_t)render_size);
 		gs_matrix_pop();
+
+		gs_technique_end_pass(tech);
+		gs_technique_end(tech);
 	} else {
+		gs_technique_begin(tech);
+		gs_technique_begin_pass(tech, 0);
 		gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), output);
 		gs_draw_sprite(output, 0, ctx->width, ctx->height);
+		gs_technique_end_pass(tech);
+		gs_technique_end(tech);
 	}
-
-	gs_technique_end_pass(tech);
-	gs_technique_end(tech);
 }
 
 static uint32_t daydream_filter_get_width(void *data)
@@ -1867,6 +1924,10 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_bool(props, PROP_FRAME_SKIP_ENABLED, "Skip Out-of-Order Frames");
 	obs_property_set_enabled(frame_skip, logged_in);
 
+	obs_property_t *blur_size =
+		obs_properties_add_int_slider(props, PROP_BLUR_SIZE, "Background Blur (0=off)", 0, 64, 4);
+	obs_property_set_enabled(blur_size, logged_in);
+
 	// --- About ---
 	obs_properties_add_text(props, "about_header", "\n\n【 About 】", OBS_TEXT_INFO);
 
@@ -1937,6 +1998,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 
 	// Experimental defaults
 	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, true);
+	obs_data_set_default_int(settings, PROP_BLUR_SIZE, 8);
 }
 
 static struct obs_source_info daydream_filter_info = {

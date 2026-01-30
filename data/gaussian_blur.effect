@@ -1,0 +1,94 @@
+// Gaussian blur shader for Daydream OBS plugin
+// Two-pass separable Gaussian blur (fixed kernel size)
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 texel_size;  // 1.0 / texture_size
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData vert_out;
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv = v_in.uv;
+    return vert_out;
+}
+
+// 13-tap Gaussian blur (sigma ~4)
+// Weights: 0.0044, 0.0175, 0.0540, 0.1295, 0.2420, 0.3989, 0.2420, 0.1295, 0.0540, 0.0175, 0.0044
+// Normalized and symmetric, we can combine samples
+
+float4 PSBlurH(VertData v_in) : TARGET
+{
+    float4 color = float4(0.0, 0.0, 0.0, 0.0);
+    float2 uv = v_in.uv;
+    float tx = texel_size.x;
+
+    // 13-tap kernel (weights normalized to sum to 1)
+    color += image.Sample(def_sampler, uv + float2(-6.0 * tx, 0.0)) * 0.0044;
+    color += image.Sample(def_sampler, uv + float2(-5.0 * tx, 0.0)) * 0.0175;
+    color += image.Sample(def_sampler, uv + float2(-4.0 * tx, 0.0)) * 0.0540;
+    color += image.Sample(def_sampler, uv + float2(-3.0 * tx, 0.0)) * 0.1295;
+    color += image.Sample(def_sampler, uv + float2(-2.0 * tx, 0.0)) * 0.2420;
+    color += image.Sample(def_sampler, uv + float2(-1.0 * tx, 0.0)) * 0.3989;
+    color += image.Sample(def_sampler, uv) * 0.5;
+    color += image.Sample(def_sampler, uv + float2(1.0 * tx, 0.0)) * 0.3989;
+    color += image.Sample(def_sampler, uv + float2(2.0 * tx, 0.0)) * 0.2420;
+    color += image.Sample(def_sampler, uv + float2(3.0 * tx, 0.0)) * 0.1295;
+    color += image.Sample(def_sampler, uv + float2(4.0 * tx, 0.0)) * 0.0540;
+    color += image.Sample(def_sampler, uv + float2(5.0 * tx, 0.0)) * 0.0175;
+    color += image.Sample(def_sampler, uv + float2(6.0 * tx, 0.0)) * 0.0044;
+
+    return color / 2.1926;
+}
+
+float4 PSBlurV(VertData v_in) : TARGET
+{
+    float4 color = float4(0.0, 0.0, 0.0, 0.0);
+    float2 uv = v_in.uv;
+    float ty = texel_size.y;
+
+    color += image.Sample(def_sampler, uv + float2(0.0, -6.0 * ty)) * 0.0044;
+    color += image.Sample(def_sampler, uv + float2(0.0, -5.0 * ty)) * 0.0175;
+    color += image.Sample(def_sampler, uv + float2(0.0, -4.0 * ty)) * 0.0540;
+    color += image.Sample(def_sampler, uv + float2(0.0, -3.0 * ty)) * 0.1295;
+    color += image.Sample(def_sampler, uv + float2(0.0, -2.0 * ty)) * 0.2420;
+    color += image.Sample(def_sampler, uv + float2(0.0, -1.0 * ty)) * 0.3989;
+    color += image.Sample(def_sampler, uv) * 0.5;
+    color += image.Sample(def_sampler, uv + float2(0.0, 1.0 * ty)) * 0.3989;
+    color += image.Sample(def_sampler, uv + float2(0.0, 2.0 * ty)) * 0.2420;
+    color += image.Sample(def_sampler, uv + float2(0.0, 3.0 * ty)) * 0.1295;
+    color += image.Sample(def_sampler, uv + float2(0.0, 4.0 * ty)) * 0.0540;
+    color += image.Sample(def_sampler, uv + float2(0.0, 5.0 * ty)) * 0.0175;
+    color += image.Sample(def_sampler, uv + float2(0.0, 6.0 * ty)) * 0.0044;
+
+    return color / 2.1926;
+}
+
+technique DrawH
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBlurH(v_in);
+    }
+}
+
+technique DrawV
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBlurV(v_in);
+    }
+}
