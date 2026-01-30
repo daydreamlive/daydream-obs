@@ -89,19 +89,26 @@ static void configure_encoder_options(AVCodecContext *ctx, const AVCodec *codec)
 		av_opt_set(ctx->priv_data, "preset", "ultrafast", 0);
 		av_opt_set(ctx->priv_data, "tune", "zerolatency", 0);
 		av_opt_set(ctx->priv_data, "profile", "baseline", 0);
+		av_opt_set(ctx->priv_data, "sliced-threads", "1", 0); // Parallel slice encoding
+		av_opt_set(ctx->priv_data, "sync-lookahead", "0", 0); // No lookahead buffer
 	} else if (strcmp(name, "h264_videotoolbox") == 0) {
 		av_opt_set(ctx->priv_data, "realtime", "1", 0);
 		av_opt_set(ctx->priv_data, "allow_sw", "0", 0);
+		av_opt_set(ctx->priv_data, "prio_speed", "1", 0); // Prioritize speed
 	} else if (strcmp(name, "h264_nvenc") == 0) {
-		av_opt_set(ctx->priv_data, "preset", "p1", 0);
-		av_opt_set(ctx->priv_data, "tune", "ll", 0);
+		av_opt_set(ctx->priv_data, "preset", "p1", 0); // Fastest preset
+		av_opt_set(ctx->priv_data, "tune", "ull", 0);  // Ultra low latency
 		av_opt_set(ctx->priv_data, "rc", "cbr", 0);
+		av_opt_set(ctx->priv_data, "delay", "0", 0); // No delay
+		av_opt_set(ctx->priv_data, "zerolatency", "1", 0);
 	} else if (strcmp(name, "h264_amf") == 0) {
 		av_opt_set(ctx->priv_data, "usage", "ultralowlatency", 0);
 		av_opt_set(ctx->priv_data, "quality", "speed", 0);
+		av_opt_set(ctx->priv_data, "rc", "cbr", 0);
 	} else if (strcmp(name, "h264_qsv") == 0) {
 		av_opt_set(ctx->priv_data, "preset", "veryfast", 0);
 		av_opt_set(ctx->priv_data, "low_power", "1", 0);
+		av_opt_set(ctx->priv_data, "async_depth", "1", 0); // Minimal async depth
 	}
 }
 
@@ -199,13 +206,13 @@ struct daydream_encoder *daydream_encoder_create(const struct daydream_encoder_c
 	encoder->codec_ctx->height = config->height;
 	encoder->codec_ctx->time_base = (AVRational){1, (int)encoder->fps};
 	encoder->codec_ctx->framerate = (AVRational){(int)encoder->fps, 1};
-	encoder->codec_ctx->gop_size = encoder->fps;
+	encoder->codec_ctx->gop_size = encoder->fps / 2; // Keyframe every 0.5s for faster recovery
 	encoder->codec_ctx->max_b_frames = 0;
 
 	uint32_t bitrate = config->bitrate > 0 ? config->bitrate : 2000000;
 	encoder->codec_ctx->bit_rate = bitrate;
 	encoder->codec_ctx->rc_max_rate = bitrate;
-	encoder->codec_ctx->rc_buffer_size = bitrate / 2;
+	encoder->codec_ctx->rc_buffer_size = bitrate / 4; // Smaller buffer for faster rate control
 
 	configure_encoder_options(encoder->codec_ctx, codec);
 
@@ -664,11 +671,21 @@ static bool init_zerocopy_encoder(struct daydream_encoder *encoder, uint32_t bit
 		return false;
 	}
 
-	// Configure session for realtime low-latency
+	// Configure session for realtime ultra-low-latency
 	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
 	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
 	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_ProfileLevel,
 			     kVTProfileLevel_H264_Baseline_AutoLevel);
+
+	// Ultra-low-latency: no frame delay, prioritize speed
+	int32_t maxFrameDelay = 0;
+	CFNumberRef delayNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &maxFrameDelay);
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_MaxFrameDelayCount, delayNum);
+	CFRelease(delayNum);
+
+	// Prioritize encoding speed over quality
+	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
+			     kCFBooleanTrue);
 
 	// Set bitrate
 	CFNumberRef bitrateNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &bitrate);
@@ -681,8 +698,8 @@ static bool init_zerocopy_encoder(struct daydream_encoder *encoder, uint32_t bit
 	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_ExpectedFrameRate, fpsNum);
 	CFRelease(fpsNum);
 
-	// Set keyframe interval
-	int32_t keyframeInterval = encoder->fps;
+	// Set keyframe interval (0.5 seconds for faster recovery)
+	int32_t keyframeInterval = encoder->fps / 2;
 	CFNumberRef keyframeNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &keyframeInterval);
 	VTSessionSetProperty(encoder->vt_session, kVTCompressionPropertyKey_MaxKeyFrameInterval, keyframeNum);
 	CFRelease(keyframeNum);

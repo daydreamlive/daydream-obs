@@ -1948,9 +1948,10 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, PROP_DELTA, 0.7);
 	obs_data_set_default_bool(settings, PROP_ADD_NOISE, true);
 
-	// Prompt Schedule defaults - TouchDesigner default is 'strawberry'
+	// Prompt Schedule defaults
 	obs_data_set_default_int(settings, PROP_PROMPT_COUNT, 1);
-	obs_data_set_default_string(settings, PROP_PROMPT_1, "strawberry");
+	obs_data_set_default_string(settings, PROP_PROMPT_1,
+				    "cute shiba inu, studio ghibli style, anime, soft lighting");
 	obs_data_set_default_double(settings, PROP_PROMPT_1_WEIGHT, 1.0);
 	obs_data_set_default_string(settings, PROP_PROMPT_2, "");
 	obs_data_set_default_double(settings, PROP_PROMPT_2_WEIGHT, 1.0);
