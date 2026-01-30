@@ -752,10 +752,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 					gs_texrender_end(ctx->nv12_texrender);
 				}
-
-				gs_texture_t *rgb_tex = gs_texrender_get_texture(ctx->nv12_texrender);
-				if (rgb_tex)
-					output = rgb_tex;
 			}
 		} else if (ctx->decoded_frame[read_idx]) {
 			if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != w ||
@@ -767,7 +763,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 			if (ctx->output_texture) {
 				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame[read_idx], w * 4, false);
-				output = ctx->output_texture;
 			}
 		}
 
@@ -775,6 +770,17 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		pthread_mutex_lock(&ctx->mutex);
 		ctx->decode_consume_idx = -1;
 		pthread_mutex_unlock(&ctx->mutex);
+	}
+
+	// Use cached decoded texture if streaming (regardless of new frame)
+	if (ctx->streaming) {
+		if (ctx->nv12_texrender) {
+			gs_texture_t *rgb_tex = gs_texrender_get_texture(ctx->nv12_texrender);
+			if (rgb_tex)
+				output = rgb_tex;
+		} else if (ctx->output_texture) {
+			output = ctx->output_texture;
+		}
 	}
 
 	// Final render
