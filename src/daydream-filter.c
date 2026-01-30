@@ -1518,6 +1518,9 @@ static void *start_streaming_thread_func(void *data)
 	ctx->start_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
 
+	// Trigger UI refresh to update streaming button
+	obs_source_update_properties(ctx->source);
+
 	return NULL;
 }
 
@@ -1546,7 +1549,10 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 	pthread_create(&ctx->start_thread, NULL, start_streaming_thread_func, ctx);
 
 	pthread_mutex_unlock(&ctx->mutex);
-	return false;
+
+	// Force UI refresh to show disabled button
+	obs_source_update_properties(ctx->source);
+	return true;
 }
 
 static bool on_stop_clicked(obs_properties_t *props, obs_property_t *property, void *data)
@@ -1577,6 +1583,20 @@ static bool on_stop_clicked(obs_properties_t *props, obs_property_t *property, v
 	return false;
 }
 
+static bool on_streaming_toggle_clicked(obs_properties_t *props, obs_property_t *property, void *data)
+{
+	struct daydream_filter *ctx = data;
+
+	if (ctx->streaming) {
+		on_stop_clicked(props, property, data);
+	} else {
+		on_start_clicked(props, property, data);
+	}
+
+	// Return true to refresh properties UI (updates button label)
+	return true;
+}
+
 static obs_properties_t *daydream_filter_get_properties(void *data)
 {
 	struct daydream_filter *ctx = data;
@@ -1591,6 +1611,16 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_text(props, PROP_LOGIN_STATUS, "Status: Not Logged In", OBS_TEXT_INFO);
 		obs_properties_add_button(props, PROP_LOGIN, "Login with Daydream", on_login_clicked);
 	}
+
+	// --- Streaming Control ---
+	bool is_transitioning = ctx->start_thread_running || ctx->stopping;
+	blog(LOG_INFO,
+	     "[Daydream] get_properties: streaming=%d, start_thread_running=%d, stopping=%d, transitioning=%d",
+	     ctx->streaming, ctx->start_thread_running, ctx->stopping, is_transitioning);
+	const char *toggle_label = is_streaming ? "Stop Streaming" : "Start Streaming";
+	obs_property_t *toggle =
+		obs_properties_add_button(props, PROP_START, toggle_label, on_streaming_toggle_clicked);
+	obs_property_set_enabled(toggle, logged_in && !is_transitioning);
 
 	// Cold parameter: disabled during streaming
 	obs_property_t *model =
@@ -1790,13 +1820,6 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *frame_skip =
 		obs_properties_add_bool(props, PROP_FRAME_SKIP_ENABLED, "Skip Out-of-Order Frames");
 	obs_property_set_enabled(frame_skip, logged_in);
-
-	// --- Streaming Controls ---
-	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
-	obs_property_set_enabled(start, logged_in && !ctx->streaming);
-
-	obs_property_t *stop = obs_properties_add_button(props, PROP_STOP, "Stop Streaming", on_stop_clicked);
-	obs_property_set_enabled(stop, logged_in && ctx->streaming);
 
 	return props;
 }
