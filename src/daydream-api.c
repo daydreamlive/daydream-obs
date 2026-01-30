@@ -94,11 +94,144 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	headers = curl_slist_append(headers, "Content-Type: application/json");
 	headers = curl_slist_append(headers, "x-client-source: obs");
 
-	size_t json_size = 2048;
+	size_t json_size = 8192;
 	json_body = malloc(json_size);
 	if (!json_body) {
 		result.error = strdup("Failed to allocate memory");
 		goto cleanup;
+	}
+
+	// Build ControlNets array based on model (matching TouchDesigner schema)
+	char controlnets_json[2048];
+	const char *model = params->model_id ? params->model_id : "";
+
+	if (strcmp(model, "stabilityai/sd-turbo") == 0) {
+		// SD Turbo (SD2.1): openpose, hed, canny, depth, color
+		snprintf(controlnets_json, sizeof(controlnets_json),
+			 "["
+			 "{\"model_id\":\"thibaud/controlnet-sd21-depth-diffusers\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"thibaud/controlnet-sd21-canny-diffusers\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"thibaud/controlnet-sd21-hed-diffusers\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"hed\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"thibaud/controlnet-sd21-openpose-diffusers\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"openpose\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"thibaud/controlnet-sd21-color-diffusers\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"passthrough\",\"preprocessor_params\":{},\"enabled\":true}"
+			 "]",
+			 params->controlnets.depth_scale, params->controlnets.canny_scale,
+			 params->controlnets.hed_scale, params->controlnets.openpose_scale,
+			 params->controlnets.color_scale);
+	} else if (strcmp(model, "stabilityai/sdxl-turbo") == 0) {
+		// SDXL Turbo: depth, canny, tile
+		snprintf(controlnets_json, sizeof(controlnets_json),
+			 "["
+			 "{\"model_id\":\"xinsir/controlnet-depth-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"xinsir/controlnet-canny-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"xinsir/controlnet-tile-sdxl-1.0\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"feedback\",\"preprocessor_params\":{},\"enabled\":true}"
+			 "]",
+			 params->controlnets.depth_scale, params->controlnets.canny_scale,
+			 params->controlnets.tile_scale);
+	} else {
+		// SD1.5 models (Dreamshaper 8, Openjourney v4): depth, canny, tile
+		snprintf(controlnets_json, sizeof(controlnets_json),
+			 "["
+			 "{\"model_id\":\"lllyasviel/control_v11f1p_sd15_depth\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"depth_tensorrt\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"lllyasviel/control_v11p_sd15_canny\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"canny\",\"preprocessor_params\":{},\"enabled\":true},"
+			 "{\"model_id\":\"lllyasviel/control_v11f1e_sd15_tile\",\"conditioning_scale\":%.2f,"
+			 "\"preprocessor\":\"feedback\",\"preprocessor_params\":{},\"enabled\":true}"
+			 "]",
+			 params->controlnets.depth_scale, params->controlnets.canny_scale,
+			 params->controlnets.tile_scale);
+	}
+
+	// Build IP Adapter JSON
+	char ip_adapter_json[512];
+	const char *ip_type = params->ip_adapter.type ? params->ip_adapter.type : "regular";
+	snprintf(ip_adapter_json, sizeof(ip_adapter_json), "{\"enabled\":%s,\"scale\":%.2f,\"type\":\"%s\"}",
+		 params->ip_adapter.enabled ? "true" : "false", params->ip_adapter.scale, ip_type);
+
+	// Build style image URL part (empty string if not set)
+	char style_image_json[512] = "";
+	if (params->ip_adapter.style_image_url && strlen(params->ip_adapter.style_image_url) > 0) {
+		snprintf(style_image_json, sizeof(style_image_json), ",\"ip_adapter_style_image_url\":\"%s\"",
+			 params->ip_adapter.style_image_url);
+	}
+
+	// Build prompt (single string or weighted list)
+	char prompt_json[2048];
+	if (params->prompt_schedule.count <= 1) {
+		const char *p = (params->prompt_schedule.count == 1 && params->prompt_schedule.prompts[0])
+					? params->prompt_schedule.prompts[0]
+					: "strawberry"; // TouchDesigner default
+		snprintf(prompt_json, sizeof(prompt_json), "\"%s\"", p);
+	} else {
+		char *ptr = prompt_json;
+		ptr += sprintf(ptr, "[");
+		for (int i = 0; i < params->prompt_schedule.count; i++) {
+			if (i > 0)
+				ptr += sprintf(ptr, ",");
+			ptr += sprintf(ptr, "[\"%s\",%.2f]",
+				       params->prompt_schedule.prompts[i] ? params->prompt_schedule.prompts[i] : "",
+				       params->prompt_schedule.weights[i]);
+		}
+		sprintf(ptr, "]");
+	}
+
+	// Build seed (single int or weighted list)
+	char seed_json[512];
+	if (params->seed_schedule.count <= 1) {
+		int s = (params->seed_schedule.count == 1) ? params->seed_schedule.seeds[0] : 42;
+		snprintf(seed_json, sizeof(seed_json), "%d", s);
+	} else {
+		char *ptr = seed_json;
+		ptr += sprintf(ptr, "[");
+		for (int i = 0; i < params->seed_schedule.count; i++) {
+			if (i > 0)
+				ptr += sprintf(ptr, ",");
+			ptr += sprintf(ptr, "[%d,%.2f]", params->seed_schedule.seeds[i],
+				       params->seed_schedule.weights[i]);
+		}
+		sprintf(ptr, "]");
+	}
+
+	// Build t_index_list (step schedule)
+	char t_index_json[256];
+	if (params->step_schedule.count > 0) {
+		char *ptr = t_index_json;
+		ptr += sprintf(ptr, "[");
+		for (int i = 0; i < params->step_schedule.count; i++) {
+			if (i > 0)
+				ptr += sprintf(ptr, ",");
+			ptr += sprintf(ptr, "%d", params->step_schedule.steps[i]);
+		}
+		sprintf(ptr, "]");
+	} else {
+		strcpy(t_index_json, "[11]"); // TouchDesigner default
+	}
+
+	const char *prompt_interp = params->prompt_interpolation_method ? params->prompt_interpolation_method : "slerp";
+	const char *seed_interp = params->seed_interpolation_method ? params->seed_interpolation_method : "slerp";
+
+	// Build params JSON - only include interpolation params if schedule has multiple items
+	char interp_params_json[512] = "";
+	if (params->prompt_schedule.count > 1) {
+		snprintf(interp_params_json, sizeof(interp_params_json),
+			 ",\"prompt_interpolation_method\":\"%s\",\"normalize_prompt_weights\":%s", prompt_interp,
+			 params->normalize_prompt_weights ? "true" : "false");
+	}
+
+	char seed_interp_json[512] = "";
+	if (params->seed_schedule.count > 1) {
+		snprintf(seed_interp_json, sizeof(seed_interp_json),
+			 ",\"seed_interpolation_method\":\"%s\",\"normalize_seed_weights\":%s", seed_interp,
+			 params->normalize_seed_weights ? "true" : "false");
 	}
 
 	snprintf(json_body, json_size,
@@ -106,17 +239,24 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 		 "\"pipeline\":\"streamdiffusion\","
 		 "\"params\":{"
 		 "\"model_id\":\"%s\","
-		 "\"prompt\":\"%s\","
+		 "\"prompt\":%s,"
 		 "\"negative_prompt\":\"%s\","
 		 "\"guidance_scale\":%.2f,"
 		 "\"delta\":%.2f,"
 		 "\"num_inference_steps\":%d,"
+		 "\"t_index_list\":%s,"
 		 "\"width\":%d,"
-		 "\"height\":%d"
+		 "\"height\":%d,"
+		 "\"do_add_noise\":%s,"
+		 "\"seed\":%s,"
+		 "\"ip_adapter\":%s%s%s%s,"
+		 "\"controlnets\":%s"
 		 "}"
 		 "}",
-		 params->model_id, params->prompt, params->negative_prompt, params->guidance, params->delta,
-		 params->steps, params->width, params->height);
+		 params->model_id, prompt_json, params->negative_prompt, params->guidance, params->delta,
+		 params->num_inference_steps, t_index_json, params->width, params->height,
+		 params->do_add_noise ? "true" : "false", seed_json, ip_adapter_json, style_image_json,
+		 interp_params_json, seed_interp_json, controlnets_json);
 
 	char url[256];
 	snprintf(url, sizeof(url), "%s/streams", DAYDREAM_API_BASE);
@@ -129,7 +269,10 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
 
 	blog(LOG_INFO, "[Daydream] Creating stream with model: %s", params->model_id);
-	blog(LOG_INFO, "[Daydream] Prompt: %s", params->prompt);
+	blog(LOG_INFO, "[Daydream] Prompt schedule count: %d", params->prompt_schedule.count);
+	if (params->prompt_schedule.count > 0 && params->prompt_schedule.prompts[0]) {
+		blog(LOG_INFO, "[Daydream] First prompt: %s", params->prompt_schedule.prompts[0]);
+	}
 
 	CURLcode res = curl_easy_perform(curl);
 	if (res != CURLE_OK) {

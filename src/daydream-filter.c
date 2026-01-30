@@ -6,6 +6,7 @@
 #include "daydream-whip.h"
 #include "daydream-whep.h"
 #include <obs-module.h>
+#include <limits.h>
 #include <graphics/graphics.h>
 #include <util/threading.h>
 #include <util/platform.h>
@@ -13,12 +14,60 @@
 #define PROP_LOGIN "login"
 #define PROP_LOGOUT "logout"
 #define PROP_LOGIN_STATUS "login_status"
-#define PROP_PROMPT "prompt"
-#define PROP_NEGATIVE_PROMPT "negative_prompt"
 #define PROP_MODEL "model"
+#define PROP_NEGATIVE_PROMPT "negative_prompt"
 #define PROP_GUIDANCE "guidance"
 #define PROP_DELTA "delta"
-#define PROP_STEPS "steps"
+#define PROP_NUM_STEPS "num_steps"
+#define PROP_ADD_NOISE "add_noise"
+
+// Prompt Schedule
+#define PROP_PROMPT_COUNT "prompt_count"
+#define PROP_PROMPT_1 "prompt_1"
+#define PROP_PROMPT_1_WEIGHT "prompt_1_weight"
+#define PROP_PROMPT_2 "prompt_2"
+#define PROP_PROMPT_2_WEIGHT "prompt_2_weight"
+#define PROP_PROMPT_3 "prompt_3"
+#define PROP_PROMPT_3_WEIGHT "prompt_3_weight"
+#define PROP_PROMPT_4 "prompt_4"
+#define PROP_PROMPT_4_WEIGHT "prompt_4_weight"
+#define PROP_PROMPT_INTERP "prompt_interpolation"
+#define PROP_NORMALIZE_PROMPT "normalize_prompt_weights"
+
+// Seed Schedule
+#define PROP_SEED_COUNT "seed_count"
+#define PROP_SEED_1 "seed_1"
+#define PROP_SEED_1_WEIGHT "seed_1_weight"
+#define PROP_SEED_2 "seed_2"
+#define PROP_SEED_2_WEIGHT "seed_2_weight"
+#define PROP_SEED_3 "seed_3"
+#define PROP_SEED_3_WEIGHT "seed_3_weight"
+#define PROP_SEED_4 "seed_4"
+#define PROP_SEED_4_WEIGHT "seed_4_weight"
+#define PROP_SEED_INTERP "seed_interpolation"
+#define PROP_NORMALIZE_SEED "normalize_seed_weights"
+
+// Step Schedule (t_index_list)
+#define PROP_STEP_COUNT "step_count"
+#define PROP_STEP_1 "step_1"
+#define PROP_STEP_2 "step_2"
+#define PROP_STEP_3 "step_3"
+#define PROP_STEP_4 "step_4"
+
+// IP Adapter
+#define PROP_IP_ADAPTER_ENABLED "ip_adapter_enabled"
+#define PROP_IP_ADAPTER_SCALE "ip_adapter_scale"
+#define PROP_IP_ADAPTER_TYPE "ip_adapter_type"
+#define PROP_STYLE_IMAGE_URL "style_image_url"
+
+// ControlNet
+#define PROP_DEPTH_SCALE "depth_scale"
+#define PROP_CANNY_SCALE "canny_scale"
+#define PROP_TILE_SCALE "tile_scale"
+#define PROP_OPENPOSE_SCALE "openpose_scale"
+#define PROP_HED_SCALE "hed_scale"
+#define PROP_COLOR_SCALE "color_scale"
+
 #define PROP_START "start"
 #define PROP_STOP "stop"
 
@@ -42,12 +91,44 @@ struct daydream_filter {
 
 	struct daydream_auth *auth;
 
-	char *prompt;
 	char *negative_prompt;
 	char *model;
 	float guidance;
 	float delta;
-	int steps;
+	int num_inference_steps;
+	bool add_noise;
+
+	// Prompt Schedule
+	int prompt_count;
+	char *prompts[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	float prompt_weights[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	char *prompt_interpolation;
+	bool normalize_prompt_weights;
+
+	// Seed Schedule
+	int seed_count;
+	int seeds[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	float seed_weights[DAYDREAM_MAX_SCHEDULE_SLOTS];
+	char *seed_interpolation;
+	bool normalize_seed_weights;
+
+	// Step Schedule (t_index_list)
+	int step_count;
+	int step_indices[DAYDREAM_MAX_SCHEDULE_SLOTS];
+
+	// IP Adapter
+	bool ip_adapter_enabled;
+	float ip_adapter_scale;
+	char *ip_adapter_type;
+	char *style_image_url;
+
+	// ControlNet scales
+	float depth_scale;
+	float canny_scale;
+	float tile_scale;
+	float openpose_scale;
+	float hed_scale;
+	float color_scale;
 
 	char *stream_id;
 	char *whip_url;
@@ -125,16 +206,71 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	bfree(ctx->prompt);
+	// Free existing strings
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
+	bfree(ctx->ip_adapter_type);
+	bfree(ctx->style_image_url);
+	bfree(ctx->prompt_interpolation);
+	bfree(ctx->seed_interpolation);
+	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		bfree(ctx->prompts[i]);
+		ctx->prompts[i] = NULL;
+	}
 
-	ctx->prompt = bstrdup(obs_data_get_string(settings, PROP_PROMPT));
 	ctx->negative_prompt = bstrdup(obs_data_get_string(settings, PROP_NEGATIVE_PROMPT));
 	ctx->model = bstrdup(obs_data_get_string(settings, PROP_MODEL));
 	ctx->guidance = (float)obs_data_get_double(settings, PROP_GUIDANCE);
 	ctx->delta = (float)obs_data_get_double(settings, PROP_DELTA);
-	ctx->steps = (int)obs_data_get_int(settings, PROP_STEPS);
+	ctx->num_inference_steps = (int)obs_data_get_int(settings, PROP_NUM_STEPS);
+	ctx->add_noise = obs_data_get_bool(settings, PROP_ADD_NOISE);
+
+	// Prompt Schedule
+	ctx->prompt_count = (int)obs_data_get_int(settings, PROP_PROMPT_COUNT);
+	ctx->prompts[0] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_1));
+	ctx->prompt_weights[0] = (float)obs_data_get_double(settings, PROP_PROMPT_1_WEIGHT);
+	ctx->prompts[1] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_2));
+	ctx->prompt_weights[1] = (float)obs_data_get_double(settings, PROP_PROMPT_2_WEIGHT);
+	ctx->prompts[2] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_3));
+	ctx->prompt_weights[2] = (float)obs_data_get_double(settings, PROP_PROMPT_3_WEIGHT);
+	ctx->prompts[3] = bstrdup(obs_data_get_string(settings, PROP_PROMPT_4));
+	ctx->prompt_weights[3] = (float)obs_data_get_double(settings, PROP_PROMPT_4_WEIGHT);
+	ctx->prompt_interpolation = bstrdup(obs_data_get_string(settings, PROP_PROMPT_INTERP));
+	ctx->normalize_prompt_weights = obs_data_get_bool(settings, PROP_NORMALIZE_PROMPT);
+
+	// Seed Schedule
+	ctx->seed_count = (int)obs_data_get_int(settings, PROP_SEED_COUNT);
+	ctx->seeds[0] = (int)obs_data_get_int(settings, PROP_SEED_1);
+	ctx->seed_weights[0] = (float)obs_data_get_double(settings, PROP_SEED_1_WEIGHT);
+	ctx->seeds[1] = (int)obs_data_get_int(settings, PROP_SEED_2);
+	ctx->seed_weights[1] = (float)obs_data_get_double(settings, PROP_SEED_2_WEIGHT);
+	ctx->seeds[2] = (int)obs_data_get_int(settings, PROP_SEED_3);
+	ctx->seed_weights[2] = (float)obs_data_get_double(settings, PROP_SEED_3_WEIGHT);
+	ctx->seeds[3] = (int)obs_data_get_int(settings, PROP_SEED_4);
+	ctx->seed_weights[3] = (float)obs_data_get_double(settings, PROP_SEED_4_WEIGHT);
+	ctx->seed_interpolation = bstrdup(obs_data_get_string(settings, PROP_SEED_INTERP));
+	ctx->normalize_seed_weights = obs_data_get_bool(settings, PROP_NORMALIZE_SEED);
+
+	// Step Schedule
+	ctx->step_count = (int)obs_data_get_int(settings, PROP_STEP_COUNT);
+	ctx->step_indices[0] = (int)obs_data_get_int(settings, PROP_STEP_1);
+	ctx->step_indices[1] = (int)obs_data_get_int(settings, PROP_STEP_2);
+	ctx->step_indices[2] = (int)obs_data_get_int(settings, PROP_STEP_3);
+	ctx->step_indices[3] = (int)obs_data_get_int(settings, PROP_STEP_4);
+
+	// IP Adapter
+	ctx->ip_adapter_enabled = obs_data_get_bool(settings, PROP_IP_ADAPTER_ENABLED);
+	ctx->ip_adapter_scale = (float)obs_data_get_double(settings, PROP_IP_ADAPTER_SCALE);
+	ctx->ip_adapter_type = bstrdup(obs_data_get_string(settings, PROP_IP_ADAPTER_TYPE));
+	ctx->style_image_url = bstrdup(obs_data_get_string(settings, PROP_STYLE_IMAGE_URL));
+
+	// ControlNet scales
+	ctx->depth_scale = (float)obs_data_get_double(settings, PROP_DEPTH_SCALE);
+	ctx->canny_scale = (float)obs_data_get_double(settings, PROP_CANNY_SCALE);
+	ctx->tile_scale = (float)obs_data_get_double(settings, PROP_TILE_SCALE);
+	ctx->openpose_scale = (float)obs_data_get_double(settings, PROP_OPENPOSE_SCALE);
+	ctx->hed_scale = (float)obs_data_get_double(settings, PROP_HED_SCALE);
+	ctx->color_scale = (float)obs_data_get_double(settings, PROP_COLOR_SCALE);
 
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -461,9 +597,15 @@ static void daydream_filter_destroy(void *data)
 
 	daydream_auth_destroy(ctx->auth);
 
-	bfree(ctx->prompt);
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
+	bfree(ctx->ip_adapter_type);
+	bfree(ctx->style_image_url);
+	bfree(ctx->prompt_interpolation);
+	bfree(ctx->seed_interpolation);
+	for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		bfree(ctx->prompts[i]);
+	}
 	bfree(ctx->stream_id);
 	bfree(ctx->whip_url);
 	bfree(ctx->whep_url);
@@ -857,6 +999,89 @@ static bool on_logout_clicked(obs_properties_t *props, obs_property_t *property,
 	return true;
 }
 
+static bool on_model_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+
+	const char *model = obs_data_get_string(settings, PROP_MODEL);
+	bool is_sd_turbo = model && strcmp(model, "stabilityai/sd-turbo") == 0;
+
+	// SD Turbo: openpose, hed, canny, depth, color
+	// Others (SDXL, Dreamshaper, Openjourney): depth, canny, tile
+
+	obs_property_t *depth = obs_properties_get(props, PROP_DEPTH_SCALE);
+	obs_property_t *canny = obs_properties_get(props, PROP_CANNY_SCALE);
+	obs_property_t *tile = obs_properties_get(props, PROP_TILE_SCALE);
+	obs_property_t *openpose = obs_properties_get(props, PROP_OPENPOSE_SCALE);
+	obs_property_t *hed = obs_properties_get(props, PROP_HED_SCALE);
+	obs_property_t *color = obs_properties_get(props, PROP_COLOR_SCALE);
+
+	if (depth)
+		obs_property_set_visible(depth, true);
+	if (canny)
+		obs_property_set_visible(canny, true);
+	if (tile)
+		obs_property_set_visible(tile, !is_sd_turbo);
+	if (openpose)
+		obs_property_set_visible(openpose, is_sd_turbo);
+	if (hed)
+		obs_property_set_visible(hed, is_sd_turbo);
+	if (color)
+		obs_property_set_visible(color, is_sd_turbo);
+
+	return true;
+}
+
+static bool on_prompt_count_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	int count = (int)obs_data_get_int(settings, PROP_PROMPT_COUNT);
+
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_2), count >= 2);
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_2_WEIGHT), count >= 2);
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_3), count >= 3);
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_3_WEIGHT), count >= 3);
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_4), count >= 4);
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_4_WEIGHT), count >= 4);
+
+	// Show interpolation options only if multiple prompts
+	obs_property_set_visible(obs_properties_get(props, PROP_PROMPT_INTERP), count > 1);
+	obs_property_set_visible(obs_properties_get(props, PROP_NORMALIZE_PROMPT), count > 1);
+
+	return true;
+}
+
+static bool on_seed_count_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	int count = (int)obs_data_get_int(settings, PROP_SEED_COUNT);
+
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_2), count >= 2);
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_2_WEIGHT), count >= 2);
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_3), count >= 3);
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_3_WEIGHT), count >= 3);
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_4), count >= 4);
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_4_WEIGHT), count >= 4);
+
+	// Show interpolation options only if multiple seeds
+	obs_property_set_visible(obs_properties_get(props, PROP_SEED_INTERP), count > 1);
+	obs_property_set_visible(obs_properties_get(props, PROP_NORMALIZE_SEED), count > 1);
+
+	return true;
+}
+
+static bool on_step_count_changed(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+{
+	UNUSED_PARAMETER(property);
+	int count = (int)obs_data_get_int(settings, PROP_STEP_COUNT);
+
+	obs_property_set_visible(obs_properties_get(props, PROP_STEP_2), count >= 2);
+	obs_property_set_visible(obs_properties_get(props, PROP_STEP_3), count >= 3);
+	obs_property_set_visible(obs_properties_get(props, PROP_STEP_4), count >= 4);
+
+	return true;
+}
+
 static void *start_streaming_thread_func(void *data)
 {
 	struct daydream_filter *ctx = data;
@@ -868,22 +1093,69 @@ static void *start_streaming_thread_func(void *data)
 
 	struct daydream_stream_params params = {
 		.model_id = ctx->model ? bstrdup(ctx->model) : NULL,
-		.prompt = ctx->prompt ? bstrdup(ctx->prompt) : NULL,
 		.negative_prompt = ctx->negative_prompt ? bstrdup(ctx->negative_prompt) : NULL,
 		.guidance = ctx->guidance,
 		.delta = ctx->delta,
-		.steps = ctx->steps,
+		.num_inference_steps = ctx->num_inference_steps,
 		.width = (int)STREAM_SIZE,
 		.height = (int)STREAM_SIZE,
+		.do_add_noise = ctx->add_noise,
+		.ip_adapter =
+			{
+				.enabled = ctx->ip_adapter_enabled,
+				.scale = ctx->ip_adapter_scale,
+				.type = ctx->ip_adapter_type ? bstrdup(ctx->ip_adapter_type) : NULL,
+				.style_image_url = ctx->style_image_url ? bstrdup(ctx->style_image_url) : NULL,
+			},
+		.prompt_interpolation_method = ctx->prompt_interpolation ? bstrdup(ctx->prompt_interpolation) : NULL,
+		.normalize_prompt_weights = ctx->normalize_prompt_weights,
+		.seed_interpolation_method = ctx->seed_interpolation ? bstrdup(ctx->seed_interpolation) : NULL,
+		.normalize_seed_weights = ctx->normalize_seed_weights,
+		.controlnets =
+			{
+				.depth_scale = ctx->depth_scale,
+				.canny_scale = ctx->canny_scale,
+				.tile_scale = ctx->tile_scale,
+				.openpose_scale = ctx->openpose_scale,
+				.hed_scale = ctx->hed_scale,
+				.color_scale = ctx->color_scale,
+			},
 	};
+
+	// Copy prompt schedule
+	params.prompt_schedule.count = ctx->prompt_count;
+	for (int i = 0; i < ctx->prompt_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.prompt_schedule.prompts[i] = ctx->prompts[i] ? bstrdup(ctx->prompts[i]) : NULL;
+		params.prompt_schedule.weights[i] = ctx->prompt_weights[i];
+	}
+
+	// Copy seed schedule
+	params.seed_schedule.count = ctx->seed_count;
+	for (int i = 0; i < ctx->seed_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.seed_schedule.seeds[i] = ctx->seeds[i];
+		params.seed_schedule.weights[i] = ctx->seed_weights[i];
+	}
+
+	// Copy step schedule
+	params.step_schedule.count = ctx->step_count;
+	for (int i = 0; i < ctx->step_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.step_schedule.steps[i] = ctx->step_indices[i];
+	}
+
 	uint32_t target_fps = ctx->target_fps;
 	pthread_mutex_unlock(&ctx->mutex);
 
 	struct daydream_stream_result result = daydream_api_create_stream(api_key_copy, &params);
 
 	bfree((char *)params.model_id);
-	bfree((char *)params.prompt);
 	bfree((char *)params.negative_prompt);
+	for (int i = 0; i < params.prompt_schedule.count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		bfree((char *)params.prompt_schedule.prompts[i]);
+	}
+	bfree((char *)params.ip_adapter.type);
+	bfree((char *)params.ip_adapter.style_image_url);
+	bfree((char *)params.prompt_interpolation_method);
+	bfree((char *)params.seed_interpolation_method);
 
 	pthread_mutex_lock(&ctx->mutex);
 
@@ -1091,13 +1363,128 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_list_add_string(model, "Dreamshaper 8", "Lykon/dreamshaper-8");
 	obs_property_list_add_string(model, "Openjourney v4", "prompthero/openjourney-v4");
 	obs_property_set_enabled(model, logged_in);
+	obs_property_set_modified_callback(model, on_model_changed);
 
-	obs_property_t *prompt = obs_properties_add_text(props, PROP_PROMPT, "Prompt", OBS_TEXT_MULTILINE);
-	obs_property_set_enabled(prompt, logged_in);
+	// --- Prompt Schedule ---
+	obs_properties_add_text(props, "prompt_header", "--- Prompt Schedule ---", OBS_TEXT_INFO);
+
+	obs_property_t *prompt_count = obs_properties_add_int_slider(props, PROP_PROMPT_COUNT, "Prompt Count", 1, 4, 1);
+	obs_property_set_enabled(prompt_count, logged_in);
+	obs_property_set_modified_callback(prompt_count, on_prompt_count_changed);
+
+	obs_property_t *p1 = obs_properties_add_text(props, PROP_PROMPT_1, "Prompt 1", OBS_TEXT_MULTILINE);
+	obs_property_set_enabled(p1, logged_in);
+	obs_property_t *p1w = obs_properties_add_float_slider(props, PROP_PROMPT_1_WEIGHT, "Weight 1", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(p1w, logged_in);
+
+	obs_property_t *p2 = obs_properties_add_text(props, PROP_PROMPT_2, "Prompt 2", OBS_TEXT_MULTILINE);
+	obs_property_set_enabled(p2, logged_in);
+	obs_property_set_visible(p2, false);
+	obs_property_t *p2w = obs_properties_add_float_slider(props, PROP_PROMPT_2_WEIGHT, "Weight 2", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(p2w, logged_in);
+	obs_property_set_visible(p2w, false);
+
+	obs_property_t *p3 = obs_properties_add_text(props, PROP_PROMPT_3, "Prompt 3", OBS_TEXT_MULTILINE);
+	obs_property_set_enabled(p3, logged_in);
+	obs_property_set_visible(p3, false);
+	obs_property_t *p3w = obs_properties_add_float_slider(props, PROP_PROMPT_3_WEIGHT, "Weight 3", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(p3w, logged_in);
+	obs_property_set_visible(p3w, false);
+
+	obs_property_t *p4 = obs_properties_add_text(props, PROP_PROMPT_4, "Prompt 4", OBS_TEXT_MULTILINE);
+	obs_property_set_enabled(p4, logged_in);
+	obs_property_set_visible(p4, false);
+	obs_property_t *p4w = obs_properties_add_float_slider(props, PROP_PROMPT_4_WEIGHT, "Weight 4", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(p4w, logged_in);
+	obs_property_set_visible(p4w, false);
+
+	obs_property_t *prompt_interp = obs_properties_add_list(props, PROP_PROMPT_INTERP, "Prompt Interpolation",
+								OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(prompt_interp, "Slerp", "slerp");
+	obs_property_list_add_string(prompt_interp, "Linear", "linear");
+	obs_property_set_enabled(prompt_interp, logged_in);
+	obs_property_set_visible(prompt_interp, false);
+
+	obs_property_t *norm_prompt = obs_properties_add_bool(props, PROP_NORMALIZE_PROMPT, "Normalize Prompt Weights");
+	obs_property_set_enabled(norm_prompt, logged_in);
+	obs_property_set_visible(norm_prompt, false);
 
 	obs_property_t *neg_prompt =
 		obs_properties_add_text(props, PROP_NEGATIVE_PROMPT, "Negative Prompt", OBS_TEXT_DEFAULT);
 	obs_property_set_enabled(neg_prompt, logged_in);
+
+	// --- Seed Schedule ---
+	obs_properties_add_text(props, "seed_header", "--- Seed Schedule ---", OBS_TEXT_INFO);
+
+	obs_property_t *seed_count = obs_properties_add_int_slider(props, PROP_SEED_COUNT, "Seed Count", 1, 4, 1);
+	obs_property_set_enabled(seed_count, logged_in);
+	obs_property_set_modified_callback(seed_count, on_seed_count_changed);
+
+	obs_property_t *s1 = obs_properties_add_int(props, PROP_SEED_1, "Seed 1", 0, INT_MAX, 1);
+	obs_property_set_enabled(s1, logged_in);
+	obs_property_t *s1w = obs_properties_add_float_slider(props, PROP_SEED_1_WEIGHT, "Weight 1", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(s1w, logged_in);
+
+	obs_property_t *s2 = obs_properties_add_int(props, PROP_SEED_2, "Seed 2", 0, INT_MAX, 1);
+	obs_property_set_enabled(s2, logged_in);
+	obs_property_set_visible(s2, false);
+	obs_property_t *s2w = obs_properties_add_float_slider(props, PROP_SEED_2_WEIGHT, "Weight 2", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(s2w, logged_in);
+	obs_property_set_visible(s2w, false);
+
+	obs_property_t *s3 = obs_properties_add_int(props, PROP_SEED_3, "Seed 3", 0, INT_MAX, 1);
+	obs_property_set_enabled(s3, logged_in);
+	obs_property_set_visible(s3, false);
+	obs_property_t *s3w = obs_properties_add_float_slider(props, PROP_SEED_3_WEIGHT, "Weight 3", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(s3w, logged_in);
+	obs_property_set_visible(s3w, false);
+
+	obs_property_t *s4 = obs_properties_add_int(props, PROP_SEED_4, "Seed 4", 0, INT_MAX, 1);
+	obs_property_set_enabled(s4, logged_in);
+	obs_property_set_visible(s4, false);
+	obs_property_t *s4w = obs_properties_add_float_slider(props, PROP_SEED_4_WEIGHT, "Weight 4", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(s4w, logged_in);
+	obs_property_set_visible(s4w, false);
+
+	obs_property_t *seed_interp = obs_properties_add_list(props, PROP_SEED_INTERP, "Seed Interpolation",
+							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(seed_interp, "Slerp", "slerp");
+	obs_property_list_add_string(seed_interp, "Linear", "linear");
+	obs_property_set_enabled(seed_interp, logged_in);
+	obs_property_set_visible(seed_interp, false);
+
+	obs_property_t *norm_seed = obs_properties_add_bool(props, PROP_NORMALIZE_SEED, "Normalize Seed Weights");
+	obs_property_set_enabled(norm_seed, logged_in);
+	obs_property_set_visible(norm_seed, false);
+
+	// --- Step Schedule (t_index_list) ---
+	obs_properties_add_text(props, "step_header", "--- Step Schedule ---", OBS_TEXT_INFO);
+
+	obs_property_t *num_steps =
+		obs_properties_add_int_slider(props, PROP_NUM_STEPS, "Num Inference Steps", 1, 100, 1);
+	obs_property_set_enabled(num_steps, logged_in);
+
+	obs_property_t *step_count = obs_properties_add_int_slider(props, PROP_STEP_COUNT, "Step Count", 1, 4, 1);
+	obs_property_set_enabled(step_count, logged_in);
+	obs_property_set_modified_callback(step_count, on_step_count_changed);
+
+	obs_property_t *st1 = obs_properties_add_int_slider(props, PROP_STEP_1, "Step 1 (t_index)", 0, 50, 1);
+	obs_property_set_enabled(st1, logged_in);
+
+	obs_property_t *st2 = obs_properties_add_int_slider(props, PROP_STEP_2, "Step 2 (t_index)", 0, 50, 1);
+	obs_property_set_enabled(st2, logged_in);
+	obs_property_set_visible(st2, false);
+
+	obs_property_t *st3 = obs_properties_add_int_slider(props, PROP_STEP_3, "Step 3 (t_index)", 0, 50, 1);
+	obs_property_set_enabled(st3, logged_in);
+	obs_property_set_visible(st3, false);
+
+	obs_property_t *st4 = obs_properties_add_int_slider(props, PROP_STEP_4, "Step 4 (t_index)", 0, 50, 1);
+	obs_property_set_enabled(st4, logged_in);
+	obs_property_set_visible(st4, false);
+
+	// --- Generation ---
+	obs_properties_add_text(props, "gen_header", "--- Generation ---", OBS_TEXT_INFO);
 
 	obs_property_t *guidance = obs_properties_add_float_slider(props, PROP_GUIDANCE, "Guidance", 0.1, 20.0, 0.1);
 	obs_property_set_enabled(guidance, logged_in);
@@ -1105,9 +1492,59 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 	obs_property_t *delta = obs_properties_add_float_slider(props, PROP_DELTA, "Delta", 0.0, 1.0, 0.01);
 	obs_property_set_enabled(delta, logged_in);
 
-	obs_property_t *steps = obs_properties_add_int_slider(props, PROP_STEPS, "Steps", 1, 100, 1);
-	obs_property_set_enabled(steps, logged_in);
+	obs_property_t *add_noise = obs_properties_add_bool(props, PROP_ADD_NOISE, "Add Noise");
+	obs_property_set_enabled(add_noise, logged_in);
 
+	// --- IP Adapter ---
+	obs_properties_add_text(props, "ip_adapter_header", "--- IP Adapter ---", OBS_TEXT_INFO);
+
+	obs_property_t *ip_enabled = obs_properties_add_bool(props, PROP_IP_ADAPTER_ENABLED, "Enable IP Adapter");
+	obs_property_set_enabled(ip_enabled, logged_in);
+
+	obs_property_t *ip_scale =
+		obs_properties_add_float_slider(props, PROP_IP_ADAPTER_SCALE, "IP Adapter Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(ip_scale, logged_in);
+
+	obs_property_t *ip_type = obs_properties_add_list(props, PROP_IP_ADAPTER_TYPE, "IP Adapter Type",
+							  OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(ip_type, "Regular", "regular");
+	obs_property_list_add_string(ip_type, "FaceID", "faceid");
+	obs_property_set_enabled(ip_type, logged_in);
+
+	obs_property_t *style_url =
+		obs_properties_add_text(props, PROP_STYLE_IMAGE_URL, "Style Image URL", OBS_TEXT_DEFAULT);
+	obs_property_set_enabled(style_url, logged_in);
+
+	// --- ControlNet ---
+	obs_properties_add_text(props, "controlnet_header", "--- ControlNet ---", OBS_TEXT_INFO);
+
+	obs_property_t *depth_scale =
+		obs_properties_add_float_slider(props, PROP_DEPTH_SCALE, "Depth Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(depth_scale, logged_in);
+
+	obs_property_t *canny_scale =
+		obs_properties_add_float_slider(props, PROP_CANNY_SCALE, "Canny Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(canny_scale, logged_in);
+
+	obs_property_t *tile_scale =
+		obs_properties_add_float_slider(props, PROP_TILE_SCALE, "Tile Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(tile_scale, logged_in);
+
+	obs_property_t *openpose_scale =
+		obs_properties_add_float_slider(props, PROP_OPENPOSE_SCALE, "Openpose Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(openpose_scale, logged_in);
+	obs_property_set_visible(openpose_scale, false);
+
+	obs_property_t *hed_scale = obs_properties_add_float_slider(props, PROP_HED_SCALE, "HED Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(hed_scale, logged_in);
+	obs_property_set_visible(hed_scale, false);
+
+	obs_property_t *color_scale =
+		obs_properties_add_float_slider(props, PROP_COLOR_SCALE, "Color Scale", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(color_scale, logged_in);
+	obs_property_set_visible(color_scale, false);
+
+	// --- Streaming Controls ---
 	obs_property_t *start = obs_properties_add_button(props, PROP_START, "Start Streaming", on_start_clicked);
 	obs_property_set_enabled(start, logged_in && !ctx->streaming);
 
@@ -1120,11 +1557,58 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 static void daydream_filter_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, PROP_MODEL, "stabilityai/sdxl-turbo");
-	obs_data_set_default_string(settings, PROP_PROMPT, "a beautiful landscape");
-	obs_data_set_default_string(settings, PROP_NEGATIVE_PROMPT, "blurry, low quality");
+	obs_data_set_default_string(settings, PROP_NEGATIVE_PROMPT, "blurry, low quality, flat, 2d");
 	obs_data_set_default_double(settings, PROP_GUIDANCE, 1.0);
 	obs_data_set_default_double(settings, PROP_DELTA, 0.7);
-	obs_data_set_default_int(settings, PROP_STEPS, 50);
+	obs_data_set_default_bool(settings, PROP_ADD_NOISE, true);
+
+	// Prompt Schedule defaults - TouchDesigner default is 'strawberry'
+	obs_data_set_default_int(settings, PROP_PROMPT_COUNT, 1);
+	obs_data_set_default_string(settings, PROP_PROMPT_1, "strawberry");
+	obs_data_set_default_double(settings, PROP_PROMPT_1_WEIGHT, 1.0);
+	obs_data_set_default_string(settings, PROP_PROMPT_2, "");
+	obs_data_set_default_double(settings, PROP_PROMPT_2_WEIGHT, 1.0);
+	obs_data_set_default_string(settings, PROP_PROMPT_3, "");
+	obs_data_set_default_double(settings, PROP_PROMPT_3_WEIGHT, 1.0);
+	obs_data_set_default_string(settings, PROP_PROMPT_4, "");
+	obs_data_set_default_double(settings, PROP_PROMPT_4_WEIGHT, 1.0);
+	obs_data_set_default_string(settings, PROP_PROMPT_INTERP, "slerp");
+	obs_data_set_default_bool(settings, PROP_NORMALIZE_PROMPT, true);
+
+	// Seed Schedule defaults
+	obs_data_set_default_int(settings, PROP_SEED_COUNT, 1);
+	obs_data_set_default_int(settings, PROP_SEED_1, 42);
+	obs_data_set_default_double(settings, PROP_SEED_1_WEIGHT, 1.0);
+	obs_data_set_default_int(settings, PROP_SEED_2, 0);
+	obs_data_set_default_double(settings, PROP_SEED_2_WEIGHT, 1.0);
+	obs_data_set_default_int(settings, PROP_SEED_3, 0);
+	obs_data_set_default_double(settings, PROP_SEED_3_WEIGHT, 1.0);
+	obs_data_set_default_int(settings, PROP_SEED_4, 0);
+	obs_data_set_default_double(settings, PROP_SEED_4_WEIGHT, 1.0);
+	obs_data_set_default_string(settings, PROP_SEED_INTERP, "slerp");
+	obs_data_set_default_bool(settings, PROP_NORMALIZE_SEED, true);
+
+	// Step Schedule defaults (t_index_list) - TouchDesigner default is [11]
+	obs_data_set_default_int(settings, PROP_NUM_STEPS, 50);
+	obs_data_set_default_int(settings, PROP_STEP_COUNT, 1);
+	obs_data_set_default_int(settings, PROP_STEP_1, 11);
+	obs_data_set_default_int(settings, PROP_STEP_2, 0);
+	obs_data_set_default_int(settings, PROP_STEP_3, 0);
+	obs_data_set_default_int(settings, PROP_STEP_4, 0);
+
+	// IP Adapter defaults (TouchDesigner values)
+	obs_data_set_default_bool(settings, PROP_IP_ADAPTER_ENABLED, true);
+	obs_data_set_default_double(settings, PROP_IP_ADAPTER_SCALE, 0.5);
+	obs_data_set_default_string(settings, PROP_IP_ADAPTER_TYPE, "regular");
+	obs_data_set_default_string(settings, PROP_STYLE_IMAGE_URL, "");
+
+	// ControlNet defaults (TouchDesigner values)
+	obs_data_set_default_double(settings, PROP_DEPTH_SCALE, 0.45);
+	obs_data_set_default_double(settings, PROP_CANNY_SCALE, 0.0);
+	obs_data_set_default_double(settings, PROP_TILE_SCALE, 0.21);
+	obs_data_set_default_double(settings, PROP_OPENPOSE_SCALE, 0.0);
+	obs_data_set_default_double(settings, PROP_HED_SCALE, 0.0);
+	obs_data_set_default_double(settings, PROP_COLOR_SCALE, 0.0);
 }
 
 static struct obs_source_info daydream_filter_info = {
