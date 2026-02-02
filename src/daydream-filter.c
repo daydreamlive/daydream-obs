@@ -20,7 +20,6 @@
 
 #if defined(__APPLE__)
 #include <CoreVideo/CoreVideo.h>
-#include <IOSurface/IOSurface.h>
 #endif
 
 #define PROP_LOGIN "login"
@@ -98,12 +97,6 @@ struct daydream_filter {
 
 	gs_texrender_t *crop_texrender;
 	gs_stagesurf_t *crop_stagesurface;
-
-#if defined(__APPLE__)
-	// Zero-copy encoding (IOSurface-backed texture)
-	gs_texture_t *iosurface_texture;
-	bool use_zerocopy;
-#endif
 
 	struct daydream_auth *auth;
 
@@ -761,19 +754,9 @@ static void *stream_encoder_create(uint32_t width, uint32_t height, uint32_t fps
 		.height = height,
 		.fps = fps,
 		.bitrate = bitrate,
-#if defined(__APPLE__)
-		.use_zerocopy = false,
-#endif
 	};
 
 	ctx->encoder = daydream_encoder_create(&config);
-
-#if defined(__APPLE__)
-	if (ctx->encoder && daydream_encoder_is_zerocopy(ctx->encoder)) {
-		ctx->use_zerocopy = true;
-	}
-#endif
-
 	return ctx->encoder;
 }
 
@@ -786,9 +769,6 @@ static void stream_encoder_destroy(void *encoder, void *userdata)
 		daydream_encoder_destroy(ctx->encoder);
 		ctx->encoder = NULL;
 	}
-#if defined(__APPLE__)
-	ctx->use_zerocopy = false;
-#endif
 }
 
 static void *stream_decoder_create(uint32_t width, uint32_t height, void *userdata)
@@ -967,18 +947,12 @@ static void *encode_thread_func(void *data)
 			break;
 		}
 
-#if defined(__APPLE__)
-		bool zerocopy = ctx->use_zerocopy;
-#else
-		bool zerocopy = false;
-		UNUSED_PARAMETER(zerocopy);
-#endif
 		uint8_t *frame_data = NULL;
 		uint32_t frame_linesize = 0;
 		uint32_t frame_width = 0;
 		uint32_t frame_height = 0;
 
-		// Get frame from buffer (for non-zerocopy) or just consume the ready flag (for zerocopy)
+		// Get frame from buffer
 		if (!daydream_framebuffer_begin_read(ctx->encode_buffer, &frame_data, &frame_width, &frame_height,
 						     &frame_linesize)) {
 			continue; // No frame available
@@ -986,16 +960,7 @@ static void *encode_thread_func(void *data)
 
 		if (ctx->encoder && ctx->whip && daydream_whip_is_connected(ctx->whip)) {
 			struct daydream_encoded_frame encoded;
-			bool success = false;
-
-#if defined(__APPLE__)
-			if (zerocopy) {
-				success = daydream_encoder_encode_iosurface(ctx->encoder, &encoded);
-			} else
-#endif
-			{
-				success = daydream_encoder_encode(ctx->encoder, frame_data, frame_linesize, &encoded);
-			}
+			bool success = daydream_encoder_encode(ctx->encoder, frame_data, frame_linesize, &encoded);
 
 			if (success) {
 				uint32_t timestamp_ms = (uint32_t)(ctx->frame_count * 1000 / ctx->target_fps);
@@ -1081,16 +1046,6 @@ static void stop_streaming(struct daydream_filter *ctx)
 	if (ctx->stream) {
 		daydream_stream_stop(ctx->stream);
 	}
-
-#if defined(__APPLE__)
-	// Handle macOS-specific resources not managed by stream module
-	if (ctx->iosurface_texture) {
-		obs_enter_graphics();
-		gs_texture_destroy(ctx->iosurface_texture);
-		obs_leave_graphics();
-		ctx->iosurface_texture = NULL;
-	}
-#endif
 
 	ctx->streaming = false;
 	ctx->stopping = false;
@@ -1239,26 +1194,6 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	// Capture and send frames when streaming
 	if (ctx->streaming && ctx->encode_thread_running) {
-#if defined(__APPLE__)
-		// Create IOSurface texture on first frame (must be done in render thread)
-		if (ctx->use_zerocopy && !ctx->iosurface_texture && ctx->encoder) {
-			IOSurfaceRef iosurface = daydream_encoder_get_iosurface(ctx->encoder);
-			if (iosurface) {
-				ctx->iosurface_texture = gs_texture_create_from_iosurface(iosurface);
-				if (ctx->iosurface_texture) {
-					blog(LOG_INFO, "[Daydream] IOSurface texture created in render thread");
-				} else {
-					blog(LOG_WARNING,
-					     "[Daydream] Failed to create IOSurface texture, falling back");
-					ctx->use_zerocopy = false;
-				}
-			} else {
-				blog(LOG_WARNING, "[Daydream] No IOSurface available, falling back");
-				ctx->use_zerocopy = false;
-			}
-		}
-#endif
-
 		float scale = (parent_width < parent_height) ? (float)STREAM_SIZE / (float)parent_width
 							     : (float)STREAM_SIZE / (float)parent_height;
 
@@ -1267,12 +1202,14 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float offset_x = (scaled_width - STREAM_SIZE) / 2.0f;
 		float offset_y = (scaled_height - STREAM_SIZE) / 2.0f;
 
-#if defined(__APPLE__)
-		// Zero-copy path: render directly to IOSurface texture
-		if (ctx->use_zerocopy && ctx->iosurface_texture) {
-			gs_set_render_target(ctx->iosurface_texture, NULL);
-			gs_set_viewport(0, 0, STREAM_SIZE, STREAM_SIZE);
+		// Copy to CPU buffer for encoding
+		if (!ctx->crop_texrender)
+			ctx->crop_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+		if (!ctx->crop_stagesurface)
+			ctx->crop_stagesurface = gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
 
+		gs_texrender_reset(ctx->crop_texrender);
+		if (gs_texrender_begin(ctx->crop_texrender, STREAM_SIZE, STREAM_SIZE)) {
 			struct vec4 clear_color;
 			vec4_zero(&clear_color);
 			gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
@@ -1289,81 +1226,40 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			gs_technique_end_pass(tech);
 			gs_technique_end(tech);
 
-			gs_set_render_target(NULL, NULL);
+			gs_texrender_end(ctx->crop_texrender);
+		}
 
-			// Signal encode thread - no CPU copy needed!
-			// Use framebuffer just for signaling (configure if not already done)
-			uint32_t fb_w, fb_h;
-			daydream_framebuffer_get_dimensions(ctx->encode_buffer, &fb_w, &fb_h);
-			if (fb_w != STREAM_SIZE || fb_h != STREAM_SIZE) {
-				daydream_framebuffer_configure(ctx->encode_buffer, STREAM_SIZE, STREAM_SIZE, 4);
-			}
-			daydream_framebuffer_begin_write(ctx->encode_buffer, NULL);
-			daydream_framebuffer_end_write(ctx->encode_buffer);
-		} else
-#endif
-		{
-			// Standard path: copy to CPU buffer
-			if (!ctx->crop_texrender)
-				ctx->crop_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-			if (!ctx->crop_stagesurface)
-				ctx->crop_stagesurface = gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
+		gs_texture_t *crop_tex = gs_texrender_get_texture(ctx->crop_texrender);
+		if (crop_tex) {
+			gs_stage_texture(ctx->crop_stagesurface, crop_tex);
 
-			gs_texrender_reset(ctx->crop_texrender);
-			if (gs_texrender_begin(ctx->crop_texrender, STREAM_SIZE, STREAM_SIZE)) {
-				struct vec4 clear_color;
-				vec4_zero(&clear_color);
-				gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
-				gs_ortho(offset_x / scale, (offset_x + STREAM_SIZE) / scale, offset_y / scale,
-					 (offset_y + STREAM_SIZE) / scale, -100.0f, 100.0f);
+			uint8_t *video_data = NULL;
+			uint32_t video_linesize = 0;
 
-				gs_effect_t *default_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-				gs_technique_t *tech = gs_effect_get_technique(default_effect, "Draw");
-				gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"), tex);
-
-				gs_technique_begin(tech);
-				gs_technique_begin_pass(tech, 0);
-				gs_draw_sprite(tex, 0, ctx->width, ctx->height);
-				gs_technique_end_pass(tech);
-				gs_technique_end(tech);
-
-				gs_texrender_end(ctx->crop_texrender);
-			}
-
-			gs_texture_t *crop_tex = gs_texrender_get_texture(ctx->crop_texrender);
-			if (crop_tex) {
-				gs_stage_texture(ctx->crop_stagesurface, crop_tex);
-
-				uint8_t *video_data = NULL;
-				uint32_t video_linesize = 0;
-
-				if (gs_stagesurface_map(ctx->crop_stagesurface, &video_data, &video_linesize)) {
-					// Configure framebuffer if dimensions changed
-					uint32_t fb_w, fb_h;
-					daydream_framebuffer_get_dimensions(ctx->encode_buffer, &fb_w, &fb_h);
-					if (fb_w != STREAM_SIZE || fb_h != STREAM_SIZE) {
-						daydream_framebuffer_configure(ctx->encode_buffer, STREAM_SIZE,
-									       STREAM_SIZE, 4);
-					}
-
-					// Write frame to encode buffer
-					uint32_t fb_linesize;
-					uint8_t *write_buf =
-						daydream_framebuffer_begin_write(ctx->encode_buffer, &fb_linesize);
-					if (write_buf) {
-						// Copy row by row to handle linesize differences
-						uint32_t copy_size = STREAM_SIZE * 4; // BGRA
-						for (uint32_t row = 0; row < STREAM_SIZE; row++) {
-							memcpy(write_buf + row * fb_linesize,
-							       video_data + row * video_linesize, copy_size);
-						}
-						daydream_framebuffer_end_write(ctx->encode_buffer);
-					}
-
-					gs_stagesurface_unmap(ctx->crop_stagesurface);
+			if (gs_stagesurface_map(ctx->crop_stagesurface, &video_data, &video_linesize)) {
+				// Configure framebuffer if dimensions changed
+				uint32_t fb_w, fb_h;
+				daydream_framebuffer_get_dimensions(ctx->encode_buffer, &fb_w, &fb_h);
+				if (fb_w != STREAM_SIZE || fb_h != STREAM_SIZE) {
+					daydream_framebuffer_configure(ctx->encode_buffer, STREAM_SIZE, STREAM_SIZE, 4);
 				}
+
+				// Write frame to encode buffer
+				uint32_t fb_linesize;
+				uint8_t *write_buf = daydream_framebuffer_begin_write(ctx->encode_buffer, &fb_linesize);
+				if (write_buf) {
+					// Copy row by row to handle linesize differences
+					uint32_t copy_size = STREAM_SIZE * 4; // BGRA
+					for (uint32_t row = 0; row < STREAM_SIZE; row++) {
+						memcpy(write_buf + row * fb_linesize, video_data + row * video_linesize,
+						       copy_size);
+					}
+					daydream_framebuffer_end_write(ctx->encode_buffer);
+				}
+
+				gs_stagesurface_unmap(ctx->crop_stagesurface);
 			}
-		} // end of else (standard path)
+		}
 	}
 
 	gs_texture_t *output = tex;
