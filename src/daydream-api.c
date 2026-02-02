@@ -40,7 +40,11 @@ static char *json_get_string(cJSON *json, const char *key)
 }
 
 // Build ControlNets array based on model
+#ifdef DAYDREAM_TESTING
+cJSON *build_controlnets_json(const char *model, const struct daydream_controlnet_params *controlnets)
+#else
 static cJSON *build_controlnets_json(const char *model, const struct daydream_controlnet_params *controlnets)
+#endif
 {
 	cJSON *arr = cJSON_CreateArray();
 	if (!arr)
@@ -114,7 +118,11 @@ static cJSON *build_controlnets_json(const char *model, const struct daydream_co
 }
 
 // Build prompt JSON (string or weighted array)
+#ifdef DAYDREAM_TESTING
+cJSON *build_prompt_json(const struct daydream_prompt_schedule *schedule)
+#else
 static cJSON *build_prompt_json(const struct daydream_prompt_schedule *schedule)
+#endif
 {
 	if (schedule->count <= 1) {
 		const char *p = (schedule->count == 1 && schedule->prompts[0]) ? schedule->prompts[0] : "strawberry";
@@ -132,7 +140,11 @@ static cJSON *build_prompt_json(const struct daydream_prompt_schedule *schedule)
 }
 
 // Build seed JSON (int or weighted array)
+#ifdef DAYDREAM_TESTING
+cJSON *build_seed_json(const struct daydream_seed_schedule *schedule)
+#else
 static cJSON *build_seed_json(const struct daydream_seed_schedule *schedule)
+#endif
 {
 	if (schedule->count <= 1) {
 		int s = (schedule->count == 1) ? schedule->seeds[0] : 42;
@@ -150,7 +162,11 @@ static cJSON *build_seed_json(const struct daydream_seed_schedule *schedule)
 }
 
 // Build t_index_list JSON
+#ifdef DAYDREAM_TESTING
+cJSON *build_step_schedule_json(const struct daydream_step_schedule *schedule)
+#else
 static cJSON *build_step_schedule_json(const struct daydream_step_schedule *schedule)
+#endif
 {
 	cJSON *arr = cJSON_CreateArray();
 	if (schedule->count > 0) {
@@ -164,7 +180,11 @@ static cJSON *build_step_schedule_json(const struct daydream_step_schedule *sche
 }
 
 // Build IP Adapter JSON
+#ifdef DAYDREAM_TESTING
+cJSON *build_ip_adapter_json(const struct daydream_ip_adapter_params *ip_adapter)
+#else
 static cJSON *build_ip_adapter_json(const struct daydream_ip_adapter_params *ip_adapter)
+#endif
 {
 	cJSON *obj = cJSON_CreateObject();
 	cJSON_AddBoolToObject(obj, "enabled", ip_adapter->enabled);

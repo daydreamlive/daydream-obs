@@ -9,6 +9,7 @@ project(${_name} VERSION ${_version})
 
 option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
 option(ENABLE_QT "Use Qt functionality" OFF)
+option(ENABLE_TESTING "Enable unit tests" OFF)
 
 include(compilerconfig)
 include(defaults)
@@ -41,7 +42,15 @@ FetchContent_Declare(cjson GIT_REPOSITORY https://github.com/DaveGamble/cJSON.gi
 set(ENABLE_CJSON_TEST OFF CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(libdatachannel cjson)
+# Test framework dependencies (fetched only when testing is enabled)
+if(ENABLE_TESTING)
+  FetchContent_Declare(CMocka GIT_REPOSITORY https://gitlab.com/cmocka/cmocka.git GIT_TAG cmocka-1.1.7 EXCLUDE_FROM_ALL)
+  set(WITH_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(WITH_STATIC_LIB ON CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(libdatachannel cjson CMocka)
+else()
+  FetchContent_MakeAvailable(libdatachannel cjson)
+endif()
 
 foreach(
   _target
@@ -52,6 +61,8 @@ foreach(
   mbedtls
   mbedcrypto
   mbedx509
+  cmocka
+  cmocka-static
 )
   if(TARGET ${_target})
     get_target_property(_opts ${_target} COMPILE_OPTIONS)
@@ -163,3 +174,9 @@ foreach(data_file ${data_files})
 endforeach()
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+# Unit tests
+if(ENABLE_TESTING)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
