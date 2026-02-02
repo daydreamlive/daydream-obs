@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "daydream-error.h"
 
 #define DAYDREAM_MAX_SCHEDULE_SLOTS 4
 
@@ -78,8 +79,8 @@ struct daydream_stream_result {
 	char *stream_id;
 	char *whip_url;
 	char *whep_url;
-	char *error;
-	bool success;
+	daydream_error_t error; // Error code (DAYDREAM_OK on success)
+	char *error_detail;     // Optional: detailed error message (e.g., server response)
 };
 
 void daydream_api_init(void);
@@ -90,8 +91,8 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 
 // Update stream parameters (PATCH request)
 // Only fields indicated by update_flags will be sent
-// Returns true on success, false on failure
-bool daydream_api_update_stream(const char *api_key, const char *stream_id, const struct daydream_stream_params *params,
-				uint64_t update_flags);
+// Returns DAYDREAM_OK on success, error code on failure
+daydream_error_t daydream_api_update_stream(const char *api_key, const char *stream_id,
+					    const struct daydream_stream_params *params, uint64_t update_flags);
 
 void daydream_api_free_result(struct daydream_stream_result *result);

@@ -513,9 +513,10 @@ static void *update_thread_func(void *arg)
 
 		// Send PATCH request
 		if (stream_id && api_key) {
-			bool success = daydream_api_update_stream(api_key, stream_id, &params, flags);
-			if (!success) {
-				blog(LOG_WARNING, "[Daydream] Failed to update stream parameters");
+			daydream_error_t err = daydream_api_update_stream(api_key, stream_id, &params, flags);
+			if (err != DAYDREAM_OK) {
+				blog(LOG_WARNING, "[Daydream] Failed to update stream parameters: %s",
+				     daydream_error_string(err));
 			}
 		}
 
@@ -1520,7 +1521,12 @@ static void *start_streaming_thread_func(void *data)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	if (ctx->stopping || !result.success) {
+	if (ctx->stopping || result.error != DAYDREAM_OK) {
+		if (result.error != DAYDREAM_OK) {
+			blog(LOG_ERROR, "[Daydream] Stream creation failed: %s%s%s",
+			     daydream_error_string(result.error), result.error_detail ? " - " : "",
+			     result.error_detail ? result.error_detail : "");
+		}
 		bfree(api_key_copy);
 		daydream_api_free_result(&result);
 		ctx->start_thread_running = false;

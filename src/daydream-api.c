@@ -196,7 +196,7 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 
 	curl = curl_easy_init();
 	if (!curl) {
-		result.error = strdup("Failed to initialize curl");
+		result.error = DAYDREAM_ERR_CURL_INIT;
 		return result;
 	}
 
@@ -249,7 +249,7 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 
 	json_body = cJSON_PrintUnformatted(root);
 	if (!json_body) {
-		result.error = strdup("Failed to serialize JSON");
+		result.error = DAYDREAM_ERR_JSON_SERIALIZE;
 		goto cleanup;
 	}
 
@@ -271,8 +271,9 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 
 	CURLcode res = curl_easy_perform(curl);
 	if (res != CURLE_OK) {
-		result.error = strdup(curl_easy_strerror(res));
-		blog(LOG_ERROR, "[Daydream] API request failed: %s", result.error);
+		result.error = DAYDREAM_ERR_CURL_PERFORM;
+		result.error_detail = strdup(curl_easy_strerror(res));
+		blog(LOG_ERROR, "[Daydream] API request failed: %s", result.error_detail);
 		goto cleanup;
 	}
 
@@ -280,11 +281,11 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 
 	if (http_code != 200 && http_code != 201) {
-		char error_msg[512];
-		snprintf(error_msg, sizeof(error_msg), "HTTP %ld: %s", http_code,
-			 response.data ? response.data : "No response");
-		result.error = strdup(error_msg);
-		blog(LOG_ERROR, "[Daydream] API error: %s", result.error);
+		result.error = daydream_error_from_http(http_code);
+		if (response.data)
+			result.error_detail = strdup(response.data);
+		blog(LOG_ERROR, "[Daydream] API error (HTTP %ld): %s", http_code,
+		     result.error_detail ? result.error_detail : "No response");
 		goto cleanup;
 	}
 
@@ -293,8 +294,8 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	// Parse response using cJSON
 	response_json = cJSON_Parse(response.data);
 	if (!response_json) {
-		result.error = strdup("Failed to parse JSON response");
-		blog(LOG_ERROR, "[Daydream] %s", result.error);
+		result.error = DAYDREAM_ERR_JSON_PARSE;
+		blog(LOG_ERROR, "[Daydream] Failed to parse JSON response");
 		goto cleanup;
 	}
 
@@ -302,12 +303,12 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	result.whip_url = json_get_string(response_json, "whip_url");
 
 	if (result.stream_id && result.whip_url) {
-		result.success = true;
+		result.error = DAYDREAM_OK;
 		blog(LOG_INFO, "[Daydream] Stream created: %s", result.stream_id);
 		blog(LOG_INFO, "[Daydream] WHIP URL: %s", result.whip_url);
 	} else {
-		result.error = strdup("Missing id or whip_url in response");
-		blog(LOG_ERROR, "[Daydream] %s", result.error);
+		result.error = DAYDREAM_ERR_JSON_MISSING_FIELD;
+		blog(LOG_ERROR, "[Daydream] Missing id or whip_url in response");
 	}
 
 cleanup:
@@ -327,23 +328,23 @@ cleanup:
 	return result;
 }
 
-bool daydream_api_update_stream(const char *api_key, const char *stream_id, const struct daydream_stream_params *params,
-				uint64_t update_flags)
+daydream_error_t daydream_api_update_stream(const char *api_key, const char *stream_id,
+					    const struct daydream_stream_params *params, uint64_t update_flags)
 {
 	if (!api_key || !stream_id || !params || update_flags == 0)
-		return false;
+		return DAYDREAM_ERR_NULL_PARAM;
 
 	CURL *curl = NULL;
 	struct curl_slist *headers = NULL;
 	struct response_buffer response = {0};
 	char *json_body = NULL;
 	cJSON *root = NULL;
-	bool success = false;
+	daydream_error_t result = DAYDREAM_ERR_UNKNOWN;
 
 	curl = curl_easy_init();
 	if (!curl) {
 		blog(LOG_ERROR, "[Daydream] Failed to initialize curl for update");
-		return false;
+		return DAYDREAM_ERR_CURL_INIT;
 	}
 
 	char auth_header[512];
@@ -428,6 +429,7 @@ bool daydream_api_update_stream(const char *api_key, const char *stream_id, cons
 	json_body = cJSON_PrintUnformatted(root);
 	if (!json_body) {
 		blog(LOG_ERROR, "[Daydream] Failed to serialize update JSON");
+		result = DAYDREAM_ERR_JSON_SERIALIZE;
 		goto cleanup;
 	}
 
@@ -448,6 +450,7 @@ bool daydream_api_update_stream(const char *api_key, const char *stream_id, cons
 	CURLcode res = curl_easy_perform(curl);
 	if (res != CURLE_OK) {
 		blog(LOG_ERROR, "[Daydream] Update request failed: %s", curl_easy_strerror(res));
+		result = DAYDREAM_ERR_CURL_PERFORM;
 		goto cleanup;
 	}
 
@@ -457,11 +460,12 @@ bool daydream_api_update_stream(const char *api_key, const char *stream_id, cons
 	if (http_code != 200 && http_code != 204) {
 		blog(LOG_ERROR, "[Daydream] Update failed with HTTP %ld: %s", http_code,
 		     response.data ? response.data : "No response");
+		result = daydream_error_from_http(http_code);
 		goto cleanup;
 	}
 
 	blog(LOG_INFO, "[Daydream] Stream parameters updated successfully");
-	success = true;
+	result = DAYDREAM_OK;
 
 cleanup:
 	if (curl)
@@ -475,7 +479,7 @@ cleanup:
 	if (response.data)
 		free(response.data);
 
-	return success;
+	return result;
 }
 
 void daydream_api_free_result(struct daydream_stream_result *result)
@@ -492,8 +496,9 @@ void daydream_api_free_result(struct daydream_stream_result *result)
 		free(result->whep_url);
 		result->whep_url = NULL;
 	}
-	if (result->error) {
-		free(result->error);
-		result->error = NULL;
+	if (result->error_detail) {
+		free(result->error_detail);
+		result->error_detail = NULL;
 	}
+	result->error = DAYDREAM_OK;
 }
