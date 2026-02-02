@@ -5,6 +5,12 @@
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
+#if defined(__APPLE__)
+#include <libavutil/hwcontext_videotoolbox.h>
+#include <CoreVideo/CoreVideo.h>
+#include <IOSurface/IOSurface.h>
+#endif
+
 struct daydream_decoder {
 	AVCodecContext *codec_ctx;
 	AVFrame *frame;
@@ -19,6 +25,10 @@ struct daydream_decoder {
 	bool had_successful_decode;  // Track if we've ever decoded successfully
 	int consecutive_hw_failures; // Track HW-specific failures (transfer errors)
 	bool output_nv12;            // Output NV12 (true) or BGRA (false)
+
+#if defined(__APPLE__)
+	bool use_zerocopy; // macOS: use CVPixelBuffer zero-copy path
+#endif
 
 	uint32_t width;
 	uint32_t height;
@@ -114,6 +124,15 @@ struct daydream_decoder *daydream_decoder_create(const struct daydream_decoder_c
 	decoder->hw_failed = false;
 	decoder->had_successful_decode = false;
 	decoder->consecutive_hw_failures = 0;
+
+#if defined(__APPLE__)
+	// Enable zero-copy by default on macOS when using HW decode
+	// This avoids GPU→CPU transfer by using CVPixelBuffer/IOSurface directly
+	decoder->use_zerocopy = decoder->using_hw;
+	if (decoder->use_zerocopy) {
+		blog(LOG_INFO, "[Daydream Decoder] Zero-copy decode enabled");
+	}
+#endif
 
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
 		blog(LOG_ERROR, "[Daydream Decoder] Failed to open codec");
@@ -274,6 +293,48 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	AVFrame *src_frame = decoder->frame;
 
 	if (decoder->using_hw && decoder->frame->format == decoder->hw_pix_fmt) {
+#if defined(__APPLE__)
+		// macOS zero-copy path: extract CVPixelBuffer directly from VideoToolbox frame
+		// This avoids the expensive GPU→CPU transfer via av_hwframe_transfer_data
+		if (decoder->use_zerocopy) {
+			CVPixelBufferRef pixbuf = (CVPixelBufferRef)decoder->frame->data[3];
+			if (pixbuf) {
+				IOSurfaceRef surface = CVPixelBufferGetIOSurface(pixbuf);
+				if (surface) {
+					// Successful decode - reset HW failure counter
+					decoder->consecutive_hw_failures = 0;
+					if (!decoder->had_successful_decode) {
+						decoder->had_successful_decode = true;
+						blog(LOG_INFO,
+						     "[Daydream Decoder] First frame decoded (hardware, zero-copy)");
+					}
+
+					// Retain CVPixelBuffer - caller must release via daydream_decoder_release_frame
+					CVPixelBufferRetain(pixbuf);
+
+					out_frame->cv_pixel_buffer = pixbuf;
+					out_frame->iosurface = surface;
+					out_frame->is_nv12 = true;
+					out_frame->y_data = NULL; // Not used in zero-copy mode
+					out_frame->uv_data = NULL;
+					out_frame->y_linesize = 0;
+					out_frame->uv_linesize = 0;
+					out_frame->bgra_data = NULL;
+					out_frame->bgra_linesize = 0;
+					out_frame->width = (uint32_t)CVPixelBufferGetWidth(pixbuf);
+					out_frame->height = (uint32_t)CVPixelBufferGetHeight(pixbuf);
+					out_frame->pts = decoder->frame->pts;
+
+					decoder->width = out_frame->width;
+					decoder->height = out_frame->height;
+
+					return true;
+				}
+			}
+			// Fall through to regular path if zero-copy extraction failed
+			blog(LOG_WARNING, "[Daydream Decoder] Zero-copy extraction failed, falling back");
+		}
+#endif
 		ret = av_hwframe_transfer_data(decoder->sw_frame, decoder->frame, 0);
 		if (ret < 0) {
 			// This IS a HW-specific failure (frame transfer from GPU to CPU)
@@ -365,5 +426,28 @@ bool daydream_decoder_decode(struct daydream_decoder *decoder, const uint8_t *h2
 	out_frame->height = frame_height;
 	out_frame->pts = decoder->frame->pts;
 
+#if defined(__APPLE__)
+	// Clear zero-copy fields for non-zerocopy path
+	out_frame->cv_pixel_buffer = NULL;
+	out_frame->iosurface = NULL;
+#endif
+
 	return true;
 }
+
+#if defined(__APPLE__)
+void daydream_decoder_release_frame(struct daydream_decoded_frame *frame)
+{
+	if (!frame || !frame->cv_pixel_buffer)
+		return;
+
+	CVPixelBufferRelease((CVPixelBufferRef)frame->cv_pixel_buffer);
+	frame->cv_pixel_buffer = NULL;
+	frame->iosurface = NULL;
+}
+
+bool daydream_decoder_is_zerocopy(struct daydream_decoder *decoder)
+{
+	return decoder && decoder->use_zerocopy;
+}
+#endif

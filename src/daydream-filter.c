@@ -18,6 +18,11 @@
 #include <util/threading.h>
 #include <util/platform.h>
 
+#if defined(__APPLE__)
+#include <CoreVideo/CoreVideo.h>
+#include <IOSurface/IOSurface.h>
+#endif
+
 #define PROP_LOGIN "login"
 #define PROP_LOGOUT "logout"
 #define PROP_LOGIN_STATUS "login_status"
@@ -182,6 +187,16 @@ struct daydream_filter {
 	gs_texture_t *nv12_tex_uv;
 	gs_effect_t *nv12_effect;
 	gs_texrender_t *nv12_texrender;
+
+#if defined(__APPLE__)
+	// Zero-copy decode: textures created from IOSurface
+	gs_texture_t *zerocopy_tex_y;
+	gs_texture_t *zerocopy_tex_uv;
+	void *pending_cv_pixel_buffer; // CVPixelBufferRef to release after render
+	bool zerocopy_frame_ready;
+	uint32_t zerocopy_width;
+	uint32_t zerocopy_height;
+#endif
 
 	// Blur background for letterboxing
 	gs_texrender_t *blur_texrender;
@@ -549,7 +564,31 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Write to buffer that render isn't reading
+#if defined(__APPLE__)
+	// Zero-copy path: CVPixelBuffer is available, skip memcpy
+	if (decoded.cv_pixel_buffer) {
+		// Release previous pending buffer if any
+		if (ctx->pending_cv_pixel_buffer) {
+			struct daydream_decoded_frame prev_frame = {0};
+			prev_frame.cv_pixel_buffer = ctx->pending_cv_pixel_buffer;
+			daydream_decoder_release_frame(&prev_frame);
+		}
+
+		// Store new buffer for render thread
+		ctx->pending_cv_pixel_buffer = decoded.cv_pixel_buffer;
+		ctx->zerocopy_width = decoded.width;
+		ctx->zerocopy_height = decoded.height;
+		ctx->zerocopy_frame_ready = true;
+
+		// Mark regular path as not ready (zero-copy takes precedence)
+		ctx->decoded_frame_ready = false;
+
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+#endif
+
+	// Regular path: copy to double buffer
 	int write_idx = (ctx->decode_consume_idx == 0) ? 1 : 0;
 
 	if (decoded.is_nv12) {
@@ -594,6 +633,10 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 	ctx->decoded_frame_height = decoded.height;
 	ctx->decode_produce_idx = write_idx;
 	ctx->decoded_frame_ready = true;
+
+#if defined(__APPLE__)
+	ctx->zerocopy_frame_ready = false; // Regular path, not zero-copy
+#endif
 
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -916,6 +959,7 @@ static void *encode_thread_func(void *data)
 		bool zerocopy = ctx->use_zerocopy;
 #else
 		bool zerocopy = false;
+		UNUSED_PARAMETER(zerocopy);
 #endif
 		uint8_t *frame_data = NULL;
 		uint32_t frame_linesize = 0;
@@ -1076,7 +1120,22 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->blur_texrender2);
 	if (ctx->blur_effect)
 		gs_effect_destroy(ctx->blur_effect);
+#if defined(__APPLE__)
+	if (ctx->zerocopy_tex_y)
+		gs_texture_destroy(ctx->zerocopy_tex_y);
+	if (ctx->zerocopy_tex_uv)
+		gs_texture_destroy(ctx->zerocopy_tex_uv);
+#endif
 	obs_leave_graphics();
+
+#if defined(__APPLE__)
+	// Release any pending CVPixelBuffer
+	if (ctx->pending_cv_pixel_buffer) {
+		struct daydream_decoded_frame frame = {0};
+		frame.cv_pixel_buffer = ctx->pending_cv_pixel_buffer;
+		daydream_decoder_release_frame(&frame);
+	}
+#endif
 
 	daydream_auth_destroy(ctx->auth);
 	daydream_frameskip_destroy(ctx->frameskip);
@@ -1297,6 +1356,21 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	// Render decoded frame with double-buffer
 	pthread_mutex_lock(&ctx->mutex);
 
+#if defined(__APPLE__)
+	// Zero-copy path: render from CVPixelBuffer directly
+	bool has_zerocopy_frame = ctx->zerocopy_frame_ready;
+	void *zerocopy_pixbuf = NULL;
+	uint32_t zerocopy_w = 0, zerocopy_h = 0;
+
+	if (has_zerocopy_frame) {
+		zerocopy_pixbuf = ctx->pending_cv_pixel_buffer;
+		zerocopy_w = ctx->zerocopy_width;
+		zerocopy_h = ctx->zerocopy_height;
+		ctx->pending_cv_pixel_buffer = NULL;
+		ctx->zerocopy_frame_ready = false;
+	}
+#endif
+
 	bool has_decoded_frame = ctx->decoded_frame_ready;
 	bool is_nv12 = ctx->decoded_frame_is_nv12;
 	uint32_t w = ctx->decoded_frame_width;
@@ -1311,6 +1385,115 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	}
 
 	pthread_mutex_unlock(&ctx->mutex);
+
+#if defined(__APPLE__)
+	// Process zero-copy frame (outside mutex)
+	if (has_zerocopy_frame && zerocopy_pixbuf) {
+		CVPixelBufferRef pixbuf = (CVPixelBufferRef)zerocopy_pixbuf;
+
+		// Lock pixel buffer for CPU access (read-only)
+		CVReturn lockResult = CVPixelBufferLockBaseAddress(pixbuf, kCVPixelBufferLock_ReadOnly);
+		if (lockResult == kCVReturnSuccess) {
+			// Get plane data
+			uint8_t *y_data = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 0);
+			uint8_t *uv_data = CVPixelBufferGetBaseAddressOfPlane(pixbuf, 1);
+			size_t y_linesize = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 0);
+			size_t uv_linesize = CVPixelBufferGetBytesPerRowOfPlane(pixbuf, 1);
+
+			if (y_data && uv_data) {
+				// Create/update Y texture
+				if (!ctx->zerocopy_tex_y || gs_texture_get_width(ctx->zerocopy_tex_y) != zerocopy_w ||
+				    gs_texture_get_height(ctx->zerocopy_tex_y) != zerocopy_h) {
+					if (ctx->zerocopy_tex_y)
+						gs_texture_destroy(ctx->zerocopy_tex_y);
+					ctx->zerocopy_tex_y =
+						gs_texture_create(zerocopy_w, zerocopy_h, GS_R8, 1, NULL, GS_DYNAMIC);
+				}
+
+				// Create/update UV texture
+				if (!ctx->zerocopy_tex_uv ||
+				    gs_texture_get_width(ctx->zerocopy_tex_uv) != zerocopy_w / 2 ||
+				    gs_texture_get_height(ctx->zerocopy_tex_uv) != zerocopy_h / 2) {
+					if (ctx->zerocopy_tex_uv)
+						gs_texture_destroy(ctx->zerocopy_tex_uv);
+					ctx->zerocopy_tex_uv = gs_texture_create(zerocopy_w / 2, zerocopy_h / 2,
+										 GS_R8G8, 1, NULL, GS_DYNAMIC);
+				}
+
+				// Upload plane data directly (skip intermediate buffer)
+				if (ctx->zerocopy_tex_y && ctx->zerocopy_tex_uv) {
+					gs_texture_set_image(ctx->zerocopy_tex_y, y_data, (uint32_t)y_linesize, false);
+					gs_texture_set_image(ctx->zerocopy_tex_uv, uv_data, (uint32_t)uv_linesize,
+							     false);
+
+					// Render NV12 to RGB using existing effect
+					if (!ctx->nv12_texrender)
+						ctx->nv12_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+
+					if (!ctx->nv12_effect) {
+						char *effect_path = obs_module_file("nv12_to_rgb.effect");
+						if (effect_path) {
+							ctx->nv12_effect =
+								gs_effect_create_from_file(effect_path, NULL);
+							bfree(effect_path);
+						}
+					}
+
+					if (ctx->nv12_effect && ctx->nv12_texrender) {
+						gs_texrender_reset(ctx->nv12_texrender);
+						if (gs_texrender_begin(ctx->nv12_texrender, zerocopy_w, zerocopy_h)) {
+							struct vec4 clear_color;
+							vec4_zero(&clear_color);
+							gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+							gs_ortho(0.0f, (float)zerocopy_w, 0.0f, (float)zerocopy_h,
+								 -100.0f, 100.0f);
+
+							gs_eparam_t *param_y =
+								gs_effect_get_param_by_name(ctx->nv12_effect, "image");
+							gs_eparam_t *param_uv = gs_effect_get_param_by_name(
+								ctx->nv12_effect, "image_uv");
+
+							if (param_y && param_uv) {
+								gs_effect_set_texture(param_y, ctx->zerocopy_tex_y);
+								gs_effect_set_texture(param_uv, ctx->zerocopy_tex_uv);
+
+								gs_technique_t *tech = gs_effect_get_technique(
+									ctx->nv12_effect, "Draw");
+								gs_technique_begin(tech);
+								gs_technique_begin_pass(tech, 0);
+								gs_draw_sprite(ctx->zerocopy_tex_y, 0, zerocopy_w,
+									       zerocopy_h);
+								gs_technique_end_pass(tech);
+								gs_technique_end(tech);
+
+								if (!ctx->first_frame_rendered) {
+									ctx->first_frame_rendered = true;
+									blog(LOG_INFO,
+									     "[Daydream] First frame rendered (zero-copy): %ux%u",
+									     zerocopy_w, zerocopy_h);
+								}
+							}
+
+							gs_texrender_end(ctx->nv12_texrender);
+						}
+
+						output = gs_texrender_get_texture(ctx->nv12_texrender);
+					}
+				}
+			}
+
+			CVPixelBufferUnlockBaseAddress(pixbuf, kCVPixelBufferLock_ReadOnly);
+		}
+
+		// Release the CVPixelBuffer
+		struct daydream_decoded_frame release_frame = {0};
+		release_frame.cv_pixel_buffer = zerocopy_pixbuf;
+		daydream_decoder_release_frame(&release_frame);
+
+		// Skip regular path since we handled zero-copy
+		has_decoded_frame = false;
+	}
+#endif
 
 	// Process outside mutex - WHEP can write to other buffer now
 	if (has_decoded_frame && read_idx >= 0) {
@@ -1525,15 +1708,18 @@ static void open_url(const char *url)
 #if defined(__APPLE__)
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
-	(void)system(cmd);
+	if (system(cmd)) { /* ignore error */
+	}
 #elif defined(_WIN32)
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
-	(void)system(cmd);
+	if (system(cmd)) { /* ignore error */
+	}
 #else
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
-	(void)system(cmd);
+	if (system(cmd)) { /* ignore error */
+	}
 #endif
 }
 
