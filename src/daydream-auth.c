@@ -368,11 +368,16 @@ bool daydream_auth_is_logged_in(struct daydream_auth *auth)
 	return result;
 }
 
-const char *daydream_auth_get_api_key(struct daydream_auth *auth)
+char *daydream_auth_get_api_key(struct daydream_auth *auth)
 {
 	if (!auth)
 		return NULL;
-	return auth->api_key;
+
+	pthread_mutex_lock(&auth->mutex);
+	char *copy = auth->api_key ? bstrdup(auth->api_key) : NULL;
+	pthread_mutex_unlock(&auth->mutex);
+
+	return copy;
 }
 
 static void cancel_pending_login(struct daydream_auth *auth)

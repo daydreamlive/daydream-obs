@@ -507,7 +507,7 @@ static void *update_thread_func(void *arg)
 		params.normalize_seed_weights = ctx->normalize_seed_weights;
 
 		char *stream_id = bstrdup(ctx->stream_id);
-		const char *api_key = daydream_auth_get_api_key(ctx->auth);
+		char *api_key = daydream_auth_get_api_key(ctx->auth);
 
 		pthread_mutex_unlock(&ctx->mutex);
 
@@ -520,6 +520,7 @@ static void *update_thread_func(void *arg)
 			}
 		}
 
+		bfree(api_key);
 		bfree(stream_id);
 	}
 
@@ -1450,8 +1451,7 @@ static void *start_streaming_thread_func(void *data)
 	const uint32_t STREAM_SIZE = 512;
 
 	pthread_mutex_lock(&ctx->mutex);
-	const char *api_key = daydream_auth_get_api_key(ctx->auth);
-	char *api_key_copy = api_key ? bstrdup(api_key) : NULL;
+	char *api_key_copy = daydream_auth_get_api_key(ctx->auth);
 
 	struct daydream_stream_params params = {
 		.model_id = ctx->model ? bstrdup(ctx->model) : NULL,
@@ -1672,11 +1672,13 @@ static bool on_start_clicked(obs_properties_t *props, obs_property_t *property, 
 		return false;
 	}
 
-	const char *api_key = daydream_auth_get_api_key(ctx->auth);
+	char *api_key = daydream_auth_get_api_key(ctx->auth);
 	if (!api_key || strlen(api_key) == 0) {
+		bfree(api_key);
 		pthread_mutex_unlock(&ctx->mutex);
 		return false;
 	}
+	bfree(api_key);
 
 	ctx->start_thread_running = true;
 	ctx->stopping = false;
