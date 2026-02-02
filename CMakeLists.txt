@@ -36,7 +36,12 @@ FetchContent_Declare(
   GIT_TAG v0.22.3
   EXCLUDE_FROM_ALL
 )
-FetchContent_MakeAvailable(libdatachannel)
+
+FetchContent_Declare(cjson GIT_REPOSITORY https://github.com/DaveGamble/cJSON.git GIT_TAG v1.7.18 EXCLUDE_FROM_ALL)
+set(ENABLE_CJSON_TEST OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(libdatachannel cjson)
 
 foreach(
   _target
@@ -91,7 +96,14 @@ find_package(FFmpeg REQUIRED COMPONENTS avcodec avutil swscale)
 
 target_link_libraries(
   ${CMAKE_PROJECT_NAME}
-  PRIVATE OBS::libobs CURL::libcurl LibDataChannel::LibDataChannelStatic FFmpeg::avcodec FFmpeg::avutil FFmpeg::swscale
+  PRIVATE
+    OBS::libobs
+    CURL::libcurl
+    LibDataChannel::LibDataChannelStatic
+    FFmpeg::avcodec
+    FFmpeg::avutil
+    FFmpeg::swscale
+    cjson
 )
 
 # macOS frameworks for zero-copy encoding
@@ -137,7 +149,10 @@ target_sources(
     src/daydream-whep.cpp
 )
 
-target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_include_directories(
+  ${CMAKE_PROJECT_NAME}
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${cjson_SOURCE_DIR} ${cjson_BINARY_DIR}
+)
 
 # Copy data files (shaders, etc.)
 file(GLOB data_files "${CMAKE_CURRENT_SOURCE_DIR}/data/*")

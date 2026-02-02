@@ -212,6 +212,9 @@ struct daydream_filter {
 
 	// Experimental: Blur background
 	int blur_size;
+
+	// Debug: track first render
+	bool first_frame_rendered;
 };
 
 // Forward declaration
@@ -1080,6 +1083,9 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 
 	// Process outside mutex - WHEP can write to other buffer now
 	if (has_decoded_frame && read_idx >= 0) {
+		if (is_nv12 && !ctx->nv12_y_data[read_idx]) {
+			blog(LOG_WARNING, "[Daydream] NV12 frame expected but y_data[%d] is NULL", read_idx);
+		}
 		if (is_nv12 && ctx->nv12_y_data[read_idx] && ctx->nv12_uv_data[read_idx]) {
 			// Create Y texture
 			if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
@@ -1119,6 +1125,12 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			}
 
 			// Render NV12 to RGB
+			if (!ctx->nv12_effect || !ctx->nv12_tex_y || !ctx->nv12_tex_uv || !ctx->nv12_texrender) {
+				blog(LOG_WARNING,
+				     "[Daydream] NV12 render prereq failed: effect=%p, tex_y=%p, tex_uv=%p, texrender=%p",
+				     (void *)ctx->nv12_effect, (void *)ctx->nv12_tex_y, (void *)ctx->nv12_tex_uv,
+				     (void *)ctx->nv12_texrender);
+			}
 			if (ctx->nv12_effect && ctx->nv12_tex_y && ctx->nv12_tex_uv && ctx->nv12_texrender) {
 				gs_texrender_reset(ctx->nv12_texrender);
 				if (gs_texrender_begin(ctx->nv12_texrender, w, h)) {
@@ -1142,6 +1154,17 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 						gs_draw_sprite(ctx->nv12_tex_y, 0, w, h);
 						gs_technique_end_pass(tech);
 						gs_technique_end(tech);
+
+						if (!ctx->first_frame_rendered) {
+							ctx->first_frame_rendered = true;
+							blog(LOG_INFO,
+							     "[Daydream] First frame rendered: %ux%u, y_linesize=%u, uv_linesize=%u",
+							     w, h, ctx->nv12_y_linesize, ctx->nv12_uv_linesize);
+						}
+					} else {
+						blog(LOG_WARNING,
+						     "[Daydream] NV12 render skipped: param_y=%p, param_uv=%p",
+						     (void *)param_y, (void *)param_uv);
 					}
 
 					gs_texrender_end(ctx->nv12_texrender);
@@ -1587,6 +1610,7 @@ static void *start_streaming_thread_func(void *data)
 	ctx->stopping = false;
 	ctx->frame_count = 0;
 	ctx->last_encode_time = os_gettime_ns();
+	ctx->first_frame_rendered = false;
 
 	// Reset frame skip stats
 	ctx->frames_received = 0;
