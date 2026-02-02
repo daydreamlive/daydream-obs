@@ -4,11 +4,13 @@
 #include "daydream-encoder.h"
 #include "daydream-decoder.h"
 #include "daydream-frameskip.h"
+#include "daydream-stream.h"
 #include "daydream-whip.h"
 #include "daydream-whep.h"
 #include "plugin-support.h"
 #include <obs-module.h>
 #include <limits.h>
+#include <string.h>
 #include <graphics/graphics.h>
 #include <util/threading.h>
 #include <util/platform.h>
@@ -206,6 +208,9 @@ struct daydream_filter {
 
 	// Frame skip filter (extracted module)
 	struct daydream_frameskip *frameskip;
+
+	// Stream orchestrator (extracted module)
+	struct daydream_stream *stream;
 
 	// Experimental: Blur background
 	int blur_size;
@@ -624,6 +629,278 @@ static void on_whip_state(bool connected, const char *error, void *userdata)
 	UNUSED_PARAMETER(connected);
 }
 
+// Stream adapter callbacks for daydream_stream module
+static void stream_api_create(const char *api_key, uint32_t width, uint32_t height, void *userdata,
+			      struct daydream_stream_api_result *result)
+{
+	struct daydream_filter *ctx = userdata;
+
+	// Build full params from filter context
+	pthread_mutex_lock(&ctx->mutex);
+
+	struct daydream_stream_params params = {
+		.model_id = ctx->model,
+		.negative_prompt = ctx->negative_prompt,
+		.guidance = ctx->guidance,
+		.delta = ctx->delta,
+		.num_inference_steps = ctx->num_inference_steps,
+		.width = (int)width,
+		.height = (int)height,
+		.do_add_noise = ctx->add_noise,
+		.ip_adapter =
+			{
+				.enabled = ctx->ip_adapter_enabled,
+				.scale = ctx->ip_adapter_scale,
+				.type = ctx->ip_adapter_type,
+				.style_image_url = ctx->style_image_url,
+			},
+		.prompt_interpolation_method = ctx->prompt_interpolation,
+		.normalize_prompt_weights = ctx->normalize_prompt_weights,
+		.seed_interpolation_method = ctx->seed_interpolation,
+		.normalize_seed_weights = ctx->normalize_seed_weights,
+		.controlnets =
+			{
+				.depth_scale = ctx->depth_scale,
+				.canny_scale = ctx->canny_scale,
+				.tile_scale = ctx->tile_scale,
+				.openpose_scale = ctx->openpose_scale,
+				.hed_scale = ctx->hed_scale,
+				.color_scale = ctx->color_scale,
+			},
+	};
+
+	// Copy schedules
+	params.prompt_schedule.count = ctx->prompt_count;
+	for (int i = 0; i < ctx->prompt_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.prompt_schedule.prompts[i] = ctx->prompts[i];
+		params.prompt_schedule.weights[i] = ctx->prompt_weights[i];
+	}
+
+	params.seed_schedule.count = ctx->seed_count;
+	for (int i = 0; i < ctx->seed_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.seed_schedule.seeds[i] = ctx->seeds[i];
+		params.seed_schedule.weights[i] = ctx->seed_weights[i];
+	}
+
+	params.step_schedule.count = ctx->step_count;
+	for (int i = 0; i < ctx->step_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
+		params.step_schedule.steps[i] = ctx->step_indices[i];
+	}
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	struct daydream_stream_result api_result = daydream_api_create_stream(api_key, &params);
+
+	if (api_result.error == DAYDREAM_OK) {
+		result->success = true;
+		result->stream_id = api_result.stream_id ? strdup(api_result.stream_id) : NULL;
+		result->whip_url = api_result.whip_url ? strdup(api_result.whip_url) : NULL;
+
+		// Store stream_id in filter for update API calls
+		pthread_mutex_lock(&ctx->mutex);
+		bfree(ctx->stream_id);
+		ctx->stream_id = bstrdup(api_result.stream_id);
+		bfree(ctx->whip_url);
+		ctx->whip_url = bstrdup(api_result.whip_url);
+		pthread_mutex_unlock(&ctx->mutex);
+	} else {
+		result->success = false;
+		result->error_message = strdup(api_result.error_detail ? api_result.error_detail
+								       : daydream_error_string(api_result.error));
+	}
+
+	daydream_api_free_result(&api_result);
+}
+
+static void *stream_encoder_create(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+
+	struct daydream_encoder_config config = {
+		.width = width,
+		.height = height,
+		.fps = fps,
+		.bitrate = bitrate,
+#if defined(__APPLE__)
+		.use_zerocopy = false,
+#endif
+	};
+
+	ctx->encoder = daydream_encoder_create(&config);
+
+#if defined(__APPLE__)
+	if (ctx->encoder && daydream_encoder_is_zerocopy(ctx->encoder)) {
+		ctx->use_zerocopy = true;
+	}
+#endif
+
+	return ctx->encoder;
+}
+
+static void stream_encoder_destroy(void *encoder, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+	UNUSED_PARAMETER(encoder);
+
+	if (ctx->encoder) {
+		daydream_encoder_destroy(ctx->encoder);
+		ctx->encoder = NULL;
+	}
+#if defined(__APPLE__)
+	ctx->use_zerocopy = false;
+#endif
+}
+
+static void *stream_decoder_create(uint32_t width, uint32_t height, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+
+	struct daydream_decoder_config config = {
+		.width = width,
+		.height = height,
+	};
+
+	ctx->decoder = daydream_decoder_create(&config);
+	return ctx->decoder;
+}
+
+static void stream_decoder_destroy(void *decoder, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+	UNUSED_PARAMETER(decoder);
+
+	if (ctx->decoder) {
+		daydream_decoder_destroy(ctx->decoder);
+		ctx->decoder = NULL;
+	}
+}
+
+static void *stream_whip_create(const char *url, const char *api_key, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+
+	struct daydream_whip_config config = {
+		.whip_url = url,
+		.api_key = api_key,
+		.width = 512,
+		.height = 512,
+		.fps = ctx->target_fps,
+		.on_state = on_whip_state,
+		.userdata = ctx,
+	};
+
+	ctx->whip = daydream_whip_create(&config);
+	return ctx->whip;
+}
+
+static bool stream_whip_connect(void *whip, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+	return daydream_whip_connect(whip);
+}
+
+static const char *stream_whip_get_whep_url(void *whip, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+	return daydream_whip_get_whep_url(whip);
+}
+
+static void stream_whip_disconnect(void *whip, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+	daydream_whip_disconnect(whip);
+}
+
+static void stream_whip_destroy(void *whip, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+	UNUSED_PARAMETER(whip);
+
+	if (ctx->whip) {
+		daydream_whip_destroy(ctx->whip);
+		ctx->whip = NULL;
+	}
+}
+
+static void *stream_whep_create(const char *url, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+
+	pthread_mutex_lock(&ctx->mutex);
+	bfree(ctx->whep_url);
+	ctx->whep_url = bstrdup(url);
+	pthread_mutex_unlock(&ctx->mutex);
+
+	struct daydream_whep_config config = {
+		.whep_url = url,
+		.api_key = NULL,
+		.on_frame = on_whep_frame,
+		.on_state = on_whep_state,
+		.userdata = ctx,
+	};
+
+	ctx->whep = daydream_whep_create(&config);
+	return ctx->whep;
+}
+
+static bool stream_whep_connect(void *whep, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+	return daydream_whep_connect(whep);
+}
+
+static void stream_whep_disconnect(void *whep, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+	daydream_whep_disconnect(whep);
+}
+
+static void stream_whep_destroy(void *whep, void *userdata)
+{
+	struct daydream_filter *ctx = userdata;
+	UNUSED_PARAMETER(whep);
+
+	if (ctx->whep) {
+		daydream_whep_destroy(ctx->whep);
+		ctx->whep = NULL;
+	}
+}
+
+static void stream_on_state_change(daydream_stream_state_t state, const char *error, void *userdata)
+{
+	UNUSED_PARAMETER(userdata);
+
+	if (state == DAYDREAM_STREAM_RUNNING) {
+		blog(LOG_INFO, "[Daydream] Stream started successfully");
+	} else if (state == DAYDREAM_STREAM_ERROR) {
+		blog(LOG_ERROR, "[Daydream] Stream error: %s", error ? error : "unknown");
+	} else if (state == DAYDREAM_STREAM_IDLE) {
+		blog(LOG_INFO, "[Daydream] Stream stopped");
+	}
+}
+
+static daydream_stream_ops_t create_stream_ops(struct daydream_filter *ctx)
+{
+	return (daydream_stream_ops_t){
+		.api_create_stream = stream_api_create,
+		.encoder_create = stream_encoder_create,
+		.encoder_destroy = stream_encoder_destroy,
+		.decoder_create = stream_decoder_create,
+		.decoder_destroy = stream_decoder_destroy,
+		.whip_create = stream_whip_create,
+		.whip_connect = stream_whip_connect,
+		.whip_get_whep_url = stream_whip_get_whep_url,
+		.whip_disconnect = stream_whip_disconnect,
+		.whip_destroy = stream_whip_destroy,
+		.whep_create = stream_whep_create,
+		.whep_connect = stream_whep_connect,
+		.whep_disconnect = stream_whep_disconnect,
+		.whep_destroy = stream_whep_destroy,
+		.on_state_change = stream_on_state_change,
+		.userdata = ctx,
+	};
+}
+
 static void *whep_connect_thread_func(void *data)
 {
 	struct daydream_filter *ctx = data;
@@ -758,37 +1035,27 @@ static void stop_streaming(struct daydream_filter *ctx)
 		ctx->start_thread_running = false;
 	}
 
-	if (ctx->whip) {
-		daydream_whip_disconnect(ctx->whip);
-		daydream_whip_destroy(ctx->whip);
-		ctx->whip = NULL;
-	}
-
+	// Handle WHEP cleanup separately (not managed by stream module)
 	if (ctx->whep) {
 		daydream_whep_disconnect(ctx->whep);
 		daydream_whep_destroy(ctx->whep);
 		ctx->whep = NULL;
 	}
 
+	// Use stream module for component cleanup (API, encoder, decoder, WHIP)
+	if (ctx->stream) {
+		daydream_stream_stop(ctx->stream);
+	}
+
 #if defined(__APPLE__)
+	// Handle macOS-specific resources not managed by stream module
 	if (ctx->iosurface_texture) {
 		obs_enter_graphics();
 		gs_texture_destroy(ctx->iosurface_texture);
 		obs_leave_graphics();
 		ctx->iosurface_texture = NULL;
 	}
-	ctx->use_zerocopy = false;
 #endif
-
-	if (ctx->encoder) {
-		daydream_encoder_destroy(ctx->encoder);
-		ctx->encoder = NULL;
-	}
-
-	if (ctx->decoder) {
-		daydream_decoder_destroy(ctx->decoder);
-		ctx->decoder = NULL;
-	}
 
 	ctx->streaming = false;
 	ctx->stopping = false;
@@ -837,6 +1104,7 @@ static void daydream_filter_destroy(void *data)
 
 	daydream_auth_destroy(ctx->auth);
 	daydream_frameskip_destroy(ctx->frameskip);
+	daydream_stream_destroy(ctx->stream);
 
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
@@ -1435,167 +1703,63 @@ static void *start_streaming_thread_func(void *data)
 	struct daydream_filter *ctx = data;
 	const uint32_t STREAM_SIZE = 512;
 
+	// Get API key
 	pthread_mutex_lock(&ctx->mutex);
-	char *api_key_copy = daydream_auth_get_api_key(ctx->auth);
-
-	struct daydream_stream_params params = {
-		.model_id = ctx->model ? bstrdup(ctx->model) : NULL,
-		.negative_prompt = ctx->negative_prompt ? bstrdup(ctx->negative_prompt) : NULL,
-		.guidance = ctx->guidance,
-		.delta = ctx->delta,
-		.num_inference_steps = ctx->num_inference_steps,
-		.width = (int)STREAM_SIZE,
-		.height = (int)STREAM_SIZE,
-		.do_add_noise = ctx->add_noise,
-		.ip_adapter =
-			{
-				.enabled = ctx->ip_adapter_enabled,
-				.scale = ctx->ip_adapter_scale,
-				.type = ctx->ip_adapter_type ? bstrdup(ctx->ip_adapter_type) : NULL,
-				.style_image_url = ctx->style_image_url ? bstrdup(ctx->style_image_url) : NULL,
-			},
-		.prompt_interpolation_method = ctx->prompt_interpolation ? bstrdup(ctx->prompt_interpolation) : NULL,
-		.normalize_prompt_weights = ctx->normalize_prompt_weights,
-		.seed_interpolation_method = ctx->seed_interpolation ? bstrdup(ctx->seed_interpolation) : NULL,
-		.normalize_seed_weights = ctx->normalize_seed_weights,
-		.controlnets =
-			{
-				.depth_scale = ctx->depth_scale,
-				.canny_scale = ctx->canny_scale,
-				.tile_scale = ctx->tile_scale,
-				.openpose_scale = ctx->openpose_scale,
-				.hed_scale = ctx->hed_scale,
-				.color_scale = ctx->color_scale,
-			},
-	};
-
-	// Copy prompt schedule
-	params.prompt_schedule.count = ctx->prompt_count;
-	for (int i = 0; i < ctx->prompt_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
-		params.prompt_schedule.prompts[i] = ctx->prompts[i] ? bstrdup(ctx->prompts[i]) : NULL;
-		params.prompt_schedule.weights[i] = ctx->prompt_weights[i];
-	}
-
-	// Copy seed schedule
-	params.seed_schedule.count = ctx->seed_count;
-	for (int i = 0; i < ctx->seed_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
-		params.seed_schedule.seeds[i] = ctx->seeds[i];
-		params.seed_schedule.weights[i] = ctx->seed_weights[i];
-	}
-
-	// Copy step schedule
-	params.step_schedule.count = ctx->step_count;
-	for (int i = 0; i < ctx->step_count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
-		params.step_schedule.steps[i] = ctx->step_indices[i];
-	}
-
+	char *api_key = daydream_auth_get_api_key(ctx->auth);
 	uint32_t target_fps = ctx->target_fps;
 	pthread_mutex_unlock(&ctx->mutex);
 
-	struct daydream_stream_result result = daydream_api_create_stream(api_key_copy, &params);
-
-	bfree((char *)params.model_id);
-	bfree((char *)params.negative_prompt);
-	for (int i = 0; i < params.prompt_schedule.count && i < DAYDREAM_MAX_SCHEDULE_SLOTS; i++) {
-		bfree((char *)params.prompt_schedule.prompts[i]);
-	}
-	bfree((char *)params.ip_adapter.type);
-	bfree((char *)params.ip_adapter.style_image_url);
-	bfree((char *)params.prompt_interpolation_method);
-	bfree((char *)params.seed_interpolation_method);
-
-	pthread_mutex_lock(&ctx->mutex);
-
-	if (ctx->stopping || result.error != DAYDREAM_OK) {
-		if (result.error != DAYDREAM_OK) {
-			blog(LOG_ERROR, "[Daydream] Stream creation failed: %s%s%s",
-			     daydream_error_string(result.error), result.error_detail ? " - " : "",
-			     result.error_detail ? result.error_detail : "");
-		}
-		bfree(api_key_copy);
-		daydream_api_free_result(&result);
+	if (!api_key) {
+		pthread_mutex_lock(&ctx->mutex);
 		ctx->start_thread_running = false;
 		pthread_mutex_unlock(&ctx->mutex);
 		return NULL;
 	}
 
-	bfree(ctx->stream_id);
-	bfree(ctx->whip_url);
-	bfree(ctx->whep_url);
+	// Create stream orchestrator with adapter callbacks
+	// Note: WHEP is handled separately to maintain async connection
+	daydream_stream_ops_t ops = create_stream_ops(ctx);
+	ops.whep_create = NULL; // Don't let stream module handle WHEP
+	ops.whep_connect = NULL;
+	ops.whep_disconnect = NULL;
+	ops.whep_destroy = NULL;
 
-	ctx->stream_id = bstrdup(result.stream_id);
-	ctx->whip_url = bstrdup(result.whip_url);
-	ctx->whep_url = NULL;
-
-	struct daydream_encoder_config enc_config = {
+	struct daydream_stream_config config = {
 		.width = STREAM_SIZE,
 		.height = STREAM_SIZE,
 		.fps = target_fps,
 		.bitrate = 500000,
-#if defined(__APPLE__)
-		// Zero-copy requires Metal backend (OBS 31+), disabled for now due to OpenGL render target issues
-		.use_zerocopy = false,
-#endif
 	};
-	ctx->encoder = daydream_encoder_create(&enc_config);
-	if (!ctx->encoder) {
-		bfree(api_key_copy);
-		daydream_api_free_result(&result);
-		ctx->start_thread_running = false;
-		pthread_mutex_unlock(&ctx->mutex);
-		return NULL;
+
+	// Destroy old stream if exists
+	if (ctx->stream) {
+		daydream_stream_destroy(ctx->stream);
 	}
+	ctx->stream = daydream_stream_create(&config, &ops);
 
-#if defined(__APPLE__)
-	// Mark that we want to use zero-copy, texture will be created in render thread
-	if (daydream_encoder_is_zerocopy(ctx->encoder)) {
-		ctx->use_zerocopy = true;
-		blog(LOG_INFO, "[Daydream] Zero-copy encoding requested, texture will be created in render thread");
-	}
-#endif
-
-	struct daydream_decoder_config dec_config = {
-		.width = STREAM_SIZE,
-		.height = STREAM_SIZE,
-	};
-	ctx->decoder = daydream_decoder_create(&dec_config);
-	if (!ctx->decoder) {
-		daydream_encoder_destroy(ctx->encoder);
-		ctx->encoder = NULL;
-		bfree(api_key_copy);
-		daydream_api_free_result(&result);
-		ctx->start_thread_running = false;
-		pthread_mutex_unlock(&ctx->mutex);
-		return NULL;
-	}
-
-	struct daydream_whip_config whip_config = {
-		.whip_url = ctx->whip_url,
-		.api_key = api_key_copy,
-		.width = STREAM_SIZE,
-		.height = STREAM_SIZE,
-		.fps = target_fps,
-		.on_state = on_whip_state,
-		.userdata = ctx,
-	};
-	ctx->whip = daydream_whip_create(&whip_config);
-	pthread_mutex_unlock(&ctx->mutex);
-
-	if (!daydream_whip_connect(ctx->whip)) {
+	if (!ctx->stream) {
+		blog(LOG_ERROR, "[Daydream] Failed to create stream orchestrator");
+		bfree(api_key);
 		pthread_mutex_lock(&ctx->mutex);
-		daydream_whip_destroy(ctx->whip);
-		ctx->whip = NULL;
-		daydream_encoder_destroy(ctx->encoder);
-		ctx->encoder = NULL;
-		daydream_decoder_destroy(ctx->decoder);
-		ctx->decoder = NULL;
-		bfree(api_key_copy);
-		daydream_api_free_result(&result);
 		ctx->start_thread_running = false;
 		pthread_mutex_unlock(&ctx->mutex);
 		return NULL;
 	}
 
+	// Start the stream (API call, encoder, decoder, WHIP)
+	bool success = daydream_stream_start(ctx->stream, api_key);
+	bfree(api_key);
+
+	if (!success || ctx->stopping) {
+		const char *error = daydream_stream_get_error(ctx->stream);
+		blog(LOG_ERROR, "[Daydream] Stream start failed: %s", error ? error : "unknown");
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->start_thread_running = false;
+		pthread_mutex_unlock(&ctx->mutex);
+		return NULL;
+	}
+
+	// Stream started successfully, now set up filter-specific state
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->streaming = true;
 	ctx->stopping = false;
@@ -1606,6 +1770,7 @@ static void *start_streaming_thread_func(void *data)
 	// Reset frame skip state
 	daydream_frameskip_reset(ctx->frameskip);
 
+	// Start encode thread
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
 
@@ -1613,8 +1778,10 @@ static void *start_streaming_thread_func(void *data)
 	ctx->update_thread_running = true;
 	pthread_create(&ctx->update_thread, NULL, update_thread_func, ctx);
 
+	// Handle WHEP separately (async connection)
 	const char *whep_url = daydream_whip_get_whep_url(ctx->whip);
 	if (whep_url) {
+		bfree(ctx->whep_url);
 		ctx->whep_url = bstrdup(whep_url);
 
 		struct daydream_whep_config whep_config = {
@@ -1630,8 +1797,6 @@ static void *start_streaming_thread_func(void *data)
 		pthread_create(&ctx->whep_thread, NULL, whep_connect_thread_func, ctx);
 	}
 
-	bfree(api_key_copy);
-	daydream_api_free_result(&result);
 	ctx->start_thread_running = false;
 	pthread_mutex_unlock(&ctx->mutex);
 

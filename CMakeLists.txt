@@ -158,6 +158,9 @@ target_sources(
     src/daydream-encoder.c
     src/daydream-decoder.c
     src/daydream-frameskip.c
+    src/daydream-framebuffer.c
+    src/daydream-debounce.c
+    src/daydream-stream.c
     src/daydream-whip.cpp
     src/daydream-whep.cpp
 )
