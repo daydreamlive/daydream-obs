@@ -153,6 +153,7 @@ target_sources(
     src/plugin-main.c
     src/daydream-filter.c
     src/daydream-api.c
+    src/daydream-http.c
     src/daydream-auth.c
     src/daydream-encoder.c
     src/daydream-decoder.c

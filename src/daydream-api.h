@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "daydream-error.h"
+#include "daydream-http.h"
 
 #define DAYDREAM_MAX_SCHEDULE_SLOTS 4
 
@@ -83,7 +84,14 @@ struct daydream_stream_result {
 	char *error_detail;     // Optional: detailed error message (e.g., server response)
 };
 
+// Initialize API module (creates default CURL HTTP client)
 void daydream_api_init(void);
+
+// Initialize API module with custom HTTP client (for testing)
+// Takes ownership of the client - will be destroyed on cleanup
+void daydream_api_init_with_http(daydream_http_client_t *http);
+
+// Cleanup API module
 void daydream_api_cleanup(void);
 
 struct daydream_stream_result daydream_api_create_stream(const char *api_key,

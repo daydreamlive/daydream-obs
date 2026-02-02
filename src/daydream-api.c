@@ -1,33 +1,15 @@
 #include "daydream-api.h"
 #include <obs-module.h>
-#include <curl/curl.h>
 #include <cJSON.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #define DAYDREAM_API_BASE "https://api.daydream.live/v1"
 
-struct response_buffer {
-	char *data;
-	size_t size;
-};
-
-static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp)
-{
-	size_t realsize = size * nmemb;
-	struct response_buffer *buf = (struct response_buffer *)userp;
-
-	char *ptr = realloc(buf->data, buf->size + realsize + 1);
-	if (!ptr)
-		return 0;
-
-	buf->data = ptr;
-	memcpy(&(buf->data[buf->size]), contents, realsize);
-	buf->size += realsize;
-	buf->data[buf->size] = 0;
-
-	return realsize;
-}
+// Global HTTP client (set during init)
+static daydream_http_client_t *g_http_client = NULL;
+static bool g_owns_http_client = false;
 
 // Helper to get string from JSON object (returns NULL if not found)
 static char *json_get_string(cJSON *json, const char *key)
@@ -195,37 +177,42 @@ static cJSON *build_ip_adapter_json(const struct daydream_ip_adapter_params *ip_
 
 void daydream_api_init(void)
 {
-	curl_global_init(CURL_GLOBAL_DEFAULT);
+	daydream_http_init();
+	g_http_client = daydream_http_client_curl_create();
+	g_owns_http_client = true;
+}
+
+void daydream_api_init_with_http(daydream_http_client_t *http)
+{
+	// Don't call daydream_http_init() - caller manages the HTTP subsystem
+	g_http_client = http;
+	g_owns_http_client = true; // We take ownership
 }
 
 void daydream_api_cleanup(void)
 {
-	curl_global_cleanup();
+	if (g_http_client && g_owns_http_client) {
+		g_http_client->destroy(g_http_client);
+	}
+	g_http_client = NULL;
+	g_owns_http_client = false;
+
+	daydream_http_cleanup();
 }
 
 struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 							 const struct daydream_stream_params *params)
 {
 	struct daydream_stream_result result = {0};
-	CURL *curl = NULL;
-	struct curl_slist *headers = NULL;
-	struct response_buffer response = {0};
 	char *json_body = NULL;
 	cJSON *root = NULL;
 	cJSON *response_json = NULL;
 
-	curl = curl_easy_init();
-	if (!curl) {
+	if (!g_http_client) {
 		result.error = DAYDREAM_ERR_CURL_INIT;
+		result.error_detail = strdup("API not initialized");
 		return result;
 	}
-
-	char auth_header[512];
-	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-
-	headers = curl_slist_append(headers, auth_header);
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-	headers = curl_slist_append(headers, "x-client-source: obs");
 
 	// Build JSON using cJSON
 	root = cJSON_CreateObject();
@@ -276,43 +263,39 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	char url[256];
 	snprintf(url, sizeof(url), "%s/streams", DAYDREAM_API_BASE);
 
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-
 	blog(LOG_INFO, "[Daydream] Creating stream with model: %s", model);
 	blog(LOG_INFO, "[Daydream] Prompt schedule count: %d", params->prompt_schedule.count);
 	if (params->prompt_schedule.count > 0 && params->prompt_schedule.prompts[0]) {
 		blog(LOG_INFO, "[Daydream] First prompt: %s", params->prompt_schedule.prompts[0]);
 	}
 
-	CURLcode res = curl_easy_perform(curl);
-	if (res != CURLE_OK) {
+	// Make HTTP request
+	daydream_http_response_t response = g_http_client->post(g_http_client, url, json_body, api_key, 30);
+
+	if (response.error_msg) {
 		result.error = DAYDREAM_ERR_CURL_PERFORM;
-		result.error_detail = strdup(curl_easy_strerror(res));
+		result.error_detail = strdup(response.error_msg);
 		blog(LOG_ERROR, "[Daydream] API request failed: %s", result.error_detail);
+		daydream_http_response_free(&response);
 		goto cleanup;
 	}
 
-	long http_code = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-	if (http_code != 200 && http_code != 201) {
-		result.error = daydream_error_from_http(http_code);
-		if (response.data)
-			result.error_detail = strdup(response.data);
-		blog(LOG_ERROR, "[Daydream] API error (HTTP %ld): %s", http_code,
+	if (response.status_code != 200 && response.status_code != 201) {
+		result.error = daydream_error_from_http(response.status_code);
+		if (response.body)
+			result.error_detail = strdup(response.body);
+		blog(LOG_ERROR, "[Daydream] API error (HTTP %ld): %s", response.status_code,
 		     result.error_detail ? result.error_detail : "No response");
+		daydream_http_response_free(&response);
 		goto cleanup;
 	}
 
-	blog(LOG_INFO, "[Daydream] API response: %s", response.data);
+	blog(LOG_INFO, "[Daydream] API response: %s", response.body);
 
 	// Parse response using cJSON
-	response_json = cJSON_Parse(response.data);
+	response_json = cJSON_Parse(response.body);
+	daydream_http_response_free(&response);
+
 	if (!response_json) {
 		result.error = DAYDREAM_ERR_JSON_PARSE;
 		blog(LOG_ERROR, "[Daydream] Failed to parse JSON response");
@@ -332,18 +315,12 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 	}
 
 cleanup:
-	if (curl)
-		curl_easy_cleanup(curl);
-	if (headers)
-		curl_slist_free_all(headers);
 	if (root)
 		cJSON_Delete(root);
 	if (json_body)
 		cJSON_free(json_body);
 	if (response_json)
 		cJSON_Delete(response_json);
-	if (response.data)
-		free(response.data);
 
 	return result;
 }
@@ -354,25 +331,14 @@ daydream_error_t daydream_api_update_stream(const char *api_key, const char *str
 	if (!api_key || !stream_id || !params || update_flags == 0)
 		return DAYDREAM_ERR_NULL_PARAM;
 
-	CURL *curl = NULL;
-	struct curl_slist *headers = NULL;
-	struct response_buffer response = {0};
-	char *json_body = NULL;
-	cJSON *root = NULL;
-	daydream_error_t result = DAYDREAM_ERR_UNKNOWN;
-
-	curl = curl_easy_init();
-	if (!curl) {
-		blog(LOG_ERROR, "[Daydream] Failed to initialize curl for update");
+	if (!g_http_client) {
+		blog(LOG_ERROR, "[Daydream] API not initialized");
 		return DAYDREAM_ERR_CURL_INIT;
 	}
 
-	char auth_header[512];
-	snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", api_key);
-
-	headers = curl_slist_append(headers, auth_header);
-	headers = curl_slist_append(headers, "Content-Type: application/json");
-	headers = curl_slist_append(headers, "x-client-source: obs");
+	char *json_body = NULL;
+	cJSON *root = NULL;
+	daydream_error_t result = DAYDREAM_ERR_UNKNOWN;
 
 	// Build JSON using cJSON
 	root = cJSON_CreateObject();
@@ -456,48 +422,36 @@ daydream_error_t daydream_api_update_stream(const char *api_key, const char *str
 	char url[512];
 	snprintf(url, sizeof(url), "%s/streams/%s", DAYDREAM_API_BASE, stream_id);
 
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-
 	blog(LOG_INFO, "[Daydream] Updating stream %s with flags 0x%llx", stream_id, (unsigned long long)update_flags);
 	blog(LOG_DEBUG, "[Daydream] Update JSON: %s", json_body);
 
-	CURLcode res = curl_easy_perform(curl);
-	if (res != CURLE_OK) {
-		blog(LOG_ERROR, "[Daydream] Update request failed: %s", curl_easy_strerror(res));
+	// Make HTTP request
+	daydream_http_response_t response = g_http_client->patch(g_http_client, url, json_body, api_key, 10);
+
+	if (response.error_msg) {
+		blog(LOG_ERROR, "[Daydream] Update request failed: %s", response.error_msg);
 		result = DAYDREAM_ERR_CURL_PERFORM;
+		daydream_http_response_free(&response);
 		goto cleanup;
 	}
 
-	long http_code = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-	if (http_code != 200 && http_code != 204) {
-		blog(LOG_ERROR, "[Daydream] Update failed with HTTP %ld: %s", http_code,
-		     response.data ? response.data : "No response");
-		result = daydream_error_from_http(http_code);
+	if (response.status_code != 200 && response.status_code != 204) {
+		blog(LOG_ERROR, "[Daydream] Update failed with HTTP %ld: %s", response.status_code,
+		     response.body ? response.body : "No response");
+		result = daydream_error_from_http(response.status_code);
+		daydream_http_response_free(&response);
 		goto cleanup;
 	}
 
 	blog(LOG_INFO, "[Daydream] Stream parameters updated successfully");
 	result = DAYDREAM_OK;
+	daydream_http_response_free(&response);
 
 cleanup:
-	if (curl)
-		curl_easy_cleanup(curl);
-	if (headers)
-		curl_slist_free_all(headers);
 	if (root)
 		cJSON_Delete(root);
 	if (json_body)
 		cJSON_free(json_body);
-	if (response.data)
-		free(response.data);
 
 	return result;
 }
