@@ -169,17 +169,10 @@ struct daydream_filter {
 	// Encode buffer (extracted module)
 	struct daydream_framebuffer *encode_buffer;
 
-	// Double buffer for decode output
-	uint8_t *decoded_frame[2]; // BGRA fallback
-	uint8_t *nv12_y_data[2];   // NV12 Y plane
-	uint8_t *nv12_uv_data[2];  // NV12 UV plane
-	uint32_t decoded_frame_width;
-	uint32_t decoded_frame_height;
-	uint32_t nv12_y_linesize;
-	uint32_t nv12_uv_linesize;
-	int decode_produce_idx; // Buffer index with ready data
-	int decode_consume_idx; // Buffer index render is reading (-1 if idle)
-	bool decoded_frame_ready;
+	// Decode buffers (extracted modules)
+	struct daydream_framebuffer *decode_buffer_bgra;    // BGRA fallback
+	struct daydream_framebuffer *decode_buffer_nv12_y;  // NV12 Y plane
+	struct daydream_framebuffer *decode_buffer_nv12_uv; // NV12 UV plane
 	bool decoded_frame_is_nv12;
 
 	// NV12 GPU conversion
@@ -580,59 +573,78 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		ctx->zerocopy_height = decoded.height;
 		ctx->zerocopy_frame_ready = true;
 
-		// Mark regular path as not ready (zero-copy takes precedence)
-		ctx->decoded_frame_ready = false;
+		// Zero-copy takes precedence, framebuffers will just be empty
 
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 #endif
 
-	// Regular path: copy to double buffer
-	int write_idx = (ctx->decode_consume_idx == 0) ? 1 : 0;
-
+	// Regular path: copy to framebuffers
 	if (decoded.is_nv12) {
-		size_t y_size = decoded.y_linesize * decoded.height;
-		size_t uv_size = decoded.uv_linesize * (decoded.height / 2);
+		// Configure Y plane buffer (1 byte per pixel)
+		daydream_framebuffer_configure(ctx->decode_buffer_nv12_y, decoded.width, decoded.height, 1);
+		// Configure UV plane buffer (2 bytes per pixel, half height)
+		daydream_framebuffer_configure(ctx->decode_buffer_nv12_uv, decoded.width / 2, decoded.height / 2, 2);
 
-		// Allocate double buffers if needed
-		if (!ctx->nv12_y_data[0] || ctx->decoded_frame_width != decoded.width ||
-		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->nv12_y_data[0]);
-			bfree(ctx->nv12_y_data[1]);
-			bfree(ctx->nv12_uv_data[0]);
-			bfree(ctx->nv12_uv_data[1]);
-			ctx->nv12_y_data[0] = bmalloc(y_size);
-			ctx->nv12_y_data[1] = bmalloc(y_size);
-			ctx->nv12_uv_data[0] = bmalloc(uv_size);
-			ctx->nv12_uv_data[1] = bmalloc(uv_size);
+		// Write Y plane
+		uint32_t y_linesize;
+		uint8_t *y_buf = daydream_framebuffer_begin_write(ctx->decode_buffer_nv12_y, &y_linesize);
+		if (y_buf) {
+			// Copy row by row if linesizes differ
+			if (y_linesize == decoded.y_linesize) {
+				memcpy(y_buf, decoded.y_data, decoded.y_linesize * decoded.height);
+			} else {
+				uint32_t copy_width = decoded.width < y_linesize ? decoded.width : y_linesize;
+				for (uint32_t row = 0; row < decoded.height; row++) {
+					memcpy(y_buf + row * y_linesize, decoded.y_data + row * decoded.y_linesize,
+					       copy_width);
+				}
+			}
+			daydream_framebuffer_end_write(ctx->decode_buffer_nv12_y);
 		}
 
-		memcpy(ctx->nv12_y_data[write_idx], decoded.y_data, y_size);
-		memcpy(ctx->nv12_uv_data[write_idx], decoded.uv_data, uv_size);
-		ctx->nv12_y_linesize = decoded.y_linesize;
-		ctx->nv12_uv_linesize = decoded.uv_linesize;
+		// Write UV plane
+		uint32_t uv_linesize;
+		uint8_t *uv_buf = daydream_framebuffer_begin_write(ctx->decode_buffer_nv12_uv, &uv_linesize);
+		if (uv_buf) {
+			uint32_t uv_height = decoded.height / 2;
+			if (uv_linesize == decoded.uv_linesize) {
+				memcpy(uv_buf, decoded.uv_data, decoded.uv_linesize * uv_height);
+			} else {
+				uint32_t copy_width = decoded.width < uv_linesize ? decoded.width : uv_linesize;
+				for (uint32_t row = 0; row < uv_height; row++) {
+					memcpy(uv_buf + row * uv_linesize, decoded.uv_data + row * decoded.uv_linesize,
+					       copy_width);
+				}
+			}
+			daydream_framebuffer_end_write(ctx->decode_buffer_nv12_uv);
+		}
+
 		ctx->decoded_frame_is_nv12 = true;
 	} else {
-		size_t frame_size = decoded.bgra_linesize * decoded.height;
+		// Configure BGRA buffer (4 bytes per pixel)
+		daydream_framebuffer_configure(ctx->decode_buffer_bgra, decoded.width, decoded.height, 4);
 
-		// Allocate double buffers if needed
-		if (!ctx->decoded_frame[0] || ctx->decoded_frame_width != decoded.width ||
-		    ctx->decoded_frame_height != decoded.height) {
-			bfree(ctx->decoded_frame[0]);
-			bfree(ctx->decoded_frame[1]);
-			ctx->decoded_frame[0] = bmalloc(frame_size);
-			ctx->decoded_frame[1] = bmalloc(frame_size);
+		uint32_t linesize;
+		uint8_t *buf = daydream_framebuffer_begin_write(ctx->decode_buffer_bgra, &linesize);
+		if (buf) {
+			if (linesize == decoded.bgra_linesize) {
+				memcpy(buf, decoded.bgra_data, decoded.bgra_linesize * decoded.height);
+			} else {
+				uint32_t copy_width = decoded.width * 4;
+				if (copy_width > linesize)
+					copy_width = linesize;
+				for (uint32_t row = 0; row < decoded.height; row++) {
+					memcpy(buf + row * linesize, decoded.bgra_data + row * decoded.bgra_linesize,
+					       copy_width);
+				}
+			}
+			daydream_framebuffer_end_write(ctx->decode_buffer_bgra);
 		}
 
-		memcpy(ctx->decoded_frame[write_idx], decoded.bgra_data, frame_size);
 		ctx->decoded_frame_is_nv12 = false;
 	}
-
-	ctx->decoded_frame_width = decoded.width;
-	ctx->decoded_frame_height = decoded.height;
-	ctx->decode_produce_idx = write_idx;
-	ctx->decoded_frame_ready = true;
 
 #if defined(__APPLE__)
 	ctx->zerocopy_frame_ready = false; // Regular path, not zero-copy
@@ -1015,7 +1027,6 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->stopping = false;
 	ctx->target_fps = 30;
 	ctx->frame_count = 0;
-	ctx->decode_consume_idx = -1;
 
 	pthread_mutex_init(&ctx->mutex, NULL);
 	pthread_cond_init(&ctx->update_cond, NULL);
@@ -1024,6 +1035,9 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	ctx->frameskip = daydream_frameskip_create(false); // Disabled by default
 	ctx->debounce = daydream_debounce_create(PARAMS_UPDATE_DELAY_NS, NULL);
 	ctx->encode_buffer = daydream_framebuffer_create();
+	ctx->decode_buffer_bgra = daydream_framebuffer_create();
+	ctx->decode_buffer_nv12_y = daydream_framebuffer_create();
+	ctx->decode_buffer_nv12_uv = daydream_framebuffer_create();
 	daydream_filter_update(ctx, settings);
 
 	return ctx;
@@ -1080,7 +1094,11 @@ static void stop_streaming(struct daydream_filter *ctx)
 
 	ctx->streaming = false;
 	ctx->stopping = false;
-	ctx->decoded_frame_ready = false;
+
+	// Reset decode framebuffers
+	daydream_framebuffer_reset(ctx->decode_buffer_bgra);
+	daydream_framebuffer_reset(ctx->decode_buffer_nv12_y);
+	daydream_framebuffer_reset(ctx->decode_buffer_nv12_uv);
 
 	// Clear pending updates using debounce module
 	daydream_debounce_reset(ctx->debounce);
@@ -1154,14 +1172,11 @@ static void daydream_filter_destroy(void *data)
 	bfree(ctx->stream_id);
 	bfree(ctx->whip_url);
 	bfree(ctx->whep_url);
-	bfree(ctx->decoded_frame[0]);
-	bfree(ctx->decoded_frame[1]);
-	bfree(ctx->nv12_y_data[0]);
-	bfree(ctx->nv12_y_data[1]);
-	bfree(ctx->nv12_uv_data[0]);
-	bfree(ctx->nv12_uv_data[1]);
 
 	daydream_framebuffer_destroy(ctx->encode_buffer);
+	daydream_framebuffer_destroy(ctx->decode_buffer_bgra);
+	daydream_framebuffer_destroy(ctx->decode_buffer_nv12_y);
+	daydream_framebuffer_destroy(ctx->decode_buffer_nv12_uv);
 	pthread_cond_destroy(&ctx->update_cond);
 	pthread_mutex_destroy(&ctx->mutex);
 
@@ -1371,17 +1386,22 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	}
 #endif
 
-	bool has_decoded_frame = ctx->decoded_frame_ready;
 	bool is_nv12 = ctx->decoded_frame_is_nv12;
-	uint32_t w = ctx->decoded_frame_width;
-	uint32_t h = ctx->decoded_frame_height;
-	int read_idx = -1;
+	bool has_decoded_frame = false;
+	uint32_t w = 0, h = 0;
 
-	if (has_decoded_frame) {
-		// Take ownership of the buffer
-		ctx->decode_consume_idx = ctx->decode_produce_idx;
-		read_idx = ctx->decode_consume_idx;
-		ctx->decoded_frame_ready = false;
+	// Check which framebuffer has data
+	if (is_nv12) {
+		has_decoded_frame = daydream_framebuffer_has_frame(ctx->decode_buffer_nv12_y) &&
+				    daydream_framebuffer_has_frame(ctx->decode_buffer_nv12_uv);
+		if (has_decoded_frame) {
+			daydream_framebuffer_get_dimensions(ctx->decode_buffer_nv12_y, &w, &h);
+		}
+	} else {
+		has_decoded_frame = daydream_framebuffer_has_frame(ctx->decode_buffer_bgra);
+		if (has_decoded_frame) {
+			daydream_framebuffer_get_dimensions(ctx->decode_buffer_bgra, &w, &h);
+		}
 	}
 
 	pthread_mutex_unlock(&ctx->mutex);
@@ -1495,12 +1515,18 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 	}
 #endif
 
-	// Process outside mutex - WHEP can write to other buffer now
-	if (has_decoded_frame && read_idx >= 0) {
-		if (is_nv12 && !ctx->nv12_y_data[read_idx]) {
-			blog(LOG_WARNING, "[Daydream] NV12 frame expected but y_data[%d] is NULL", read_idx);
-		}
-		if (is_nv12 && ctx->nv12_y_data[read_idx] && ctx->nv12_uv_data[read_idx]) {
+	// Process decoded frame from framebuffers
+	if (has_decoded_frame && is_nv12) {
+		uint8_t *y_data = NULL, *uv_data = NULL;
+		uint32_t y_w, y_h, y_linesize;
+		uint32_t uv_w, uv_h, uv_linesize;
+
+		bool have_y =
+			daydream_framebuffer_begin_read(ctx->decode_buffer_nv12_y, &y_data, &y_w, &y_h, &y_linesize);
+		bool have_uv = daydream_framebuffer_begin_read(ctx->decode_buffer_nv12_uv, &uv_data, &uv_w, &uv_h,
+							       &uv_linesize);
+
+		if (have_y && have_uv && y_data && uv_data) {
 			// Create Y texture
 			if (!ctx->nv12_tex_y || gs_texture_get_width(ctx->nv12_tex_y) != w ||
 			    gs_texture_get_height(ctx->nv12_tex_y) != h) {
@@ -1530,12 +1556,10 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 				}
 			}
 
-			// Upload textures from double-buffer
+			// Upload textures from framebuffers
 			if (ctx->nv12_tex_y && ctx->nv12_tex_uv) {
-				gs_texture_set_image(ctx->nv12_tex_y, ctx->nv12_y_data[read_idx], ctx->nv12_y_linesize,
-						     false);
-				gs_texture_set_image(ctx->nv12_tex_uv, ctx->nv12_uv_data[read_idx],
-						     ctx->nv12_uv_linesize, false);
+				gs_texture_set_image(ctx->nv12_tex_y, y_data, y_linesize, false);
+				gs_texture_set_image(ctx->nv12_tex_uv, uv_data, uv_linesize, false);
 			}
 
 			// Render NV12 to RGB
@@ -1573,7 +1597,7 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 							ctx->first_frame_rendered = true;
 							blog(LOG_INFO,
 							     "[Daydream] First frame rendered: %ux%u, y_linesize=%u, uv_linesize=%u",
-							     w, h, ctx->nv12_y_linesize, ctx->nv12_uv_linesize);
+							     w, h, y_linesize, uv_linesize);
 						}
 					} else {
 						blog(LOG_WARNING,
@@ -1584,23 +1608,33 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					gs_texrender_end(ctx->nv12_texrender);
 				}
 			}
-		} else if (ctx->decoded_frame[read_idx]) {
-			if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != w ||
-			    gs_texture_get_height(ctx->output_texture) != h) {
-				if (ctx->output_texture)
-					gs_texture_destroy(ctx->output_texture);
-				ctx->output_texture = gs_texture_create(w, h, GS_BGRA, 1, NULL, GS_DYNAMIC);
-			}
-
-			if (ctx->output_texture) {
-				gs_texture_set_image(ctx->output_texture, ctx->decoded_frame[read_idx], w * 4, false);
-			}
 		}
 
-		// Release buffer ownership
-		pthread_mutex_lock(&ctx->mutex);
-		ctx->decode_consume_idx = -1;
-		pthread_mutex_unlock(&ctx->mutex);
+		// Release framebuffers
+		if (have_y)
+			daydream_framebuffer_end_read(ctx->decode_buffer_nv12_y);
+		if (have_uv)
+			daydream_framebuffer_end_read(ctx->decode_buffer_nv12_uv);
+	} else if (has_decoded_frame && !is_nv12) {
+		uint8_t *bgra_data = NULL;
+		uint32_t bgra_w, bgra_h, bgra_linesize;
+
+		if (daydream_framebuffer_begin_read(ctx->decode_buffer_bgra, &bgra_data, &bgra_w, &bgra_h,
+						    &bgra_linesize)) {
+			if (bgra_data) {
+				if (!ctx->output_texture || gs_texture_get_width(ctx->output_texture) != w ||
+				    gs_texture_get_height(ctx->output_texture) != h) {
+					if (ctx->output_texture)
+						gs_texture_destroy(ctx->output_texture);
+					ctx->output_texture = gs_texture_create(w, h, GS_BGRA, 1, NULL, GS_DYNAMIC);
+				}
+
+				if (ctx->output_texture) {
+					gs_texture_set_image(ctx->output_texture, bgra_data, bgra_linesize, false);
+				}
+			}
+			daydream_framebuffer_end_read(ctx->decode_buffer_bgra);
+		}
 	}
 
 	// Use cached decoded texture if streaming (regardless of new frame)
