@@ -1,6 +1,7 @@
 #include "daydream-filter.h"
 #include "daydream-api.h"
 #include "daydream-auth.h"
+#include "daydream-debounce.h"
 #include "daydream-encoder.h"
 #include "daydream-decoder.h"
 #include "daydream-frameskip.h"
@@ -198,13 +199,11 @@ struct daydream_filter {
 	uint64_t last_encode_time;
 	uint32_t target_fps;
 
-	// Parameter update tracking
-	uint64_t pending_update_flags;
-	uint64_t last_update_time_ns;
+	// Parameter update tracking (uses extracted debounce module)
+	struct daydream_debounce *debounce;
 	pthread_t update_thread;
 	pthread_cond_t update_cond;
 	bool update_thread_running;
-	bool update_pending;
 
 	// Frame skip filter (extracted module)
 	struct daydream_frameskip *frameskip;
@@ -228,15 +227,7 @@ static const char *daydream_filter_get_name(void *unused)
 	return "Daydream";
 }
 
-// Helper to safely compare strings (handles NULL)
-static bool str_changed(const char *old_str, const char *new_str)
-{
-	if (!old_str && !new_str)
-		return false;
-	if (!old_str || !new_str)
-		return true;
-	return strcmp(old_str, new_str) != 0;
-}
+// Use daydream_str_changed from debounce module for string comparison
 
 static void daydream_filter_update(void *data, obs_data_t *settings)
 {
@@ -317,12 +308,12 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 		if (new_prompt_count != ctx->prompt_count)
 			update_flags |= UPDATE_FLAG_PROMPT;
 		for (int i = 0; i < DAYDREAM_MAX_SCHEDULE_SLOTS && !(update_flags & UPDATE_FLAG_PROMPT); i++) {
-			if (str_changed(ctx->prompts[i], new_prompts[i]) ||
+			if (daydream_str_changed(ctx->prompts[i], new_prompts[i]) ||
 			    ctx->prompt_weights[i] != new_prompt_weights[i])
 				update_flags |= UPDATE_FLAG_PROMPT;
 		}
 
-		if (str_changed(ctx->negative_prompt, new_negative_prompt))
+		if (daydream_str_changed(ctx->negative_prompt, new_negative_prompt))
 			update_flags |= UPDATE_FLAG_NEGATIVE_PROMPT;
 
 		// Seed changes
@@ -353,13 +344,13 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 
 		// IP Adapter changes
 		if (ctx->ip_adapter_enabled != new_ip_enabled || ctx->ip_adapter_scale != new_ip_scale ||
-		    str_changed(ctx->style_image_url, new_style_url))
+		    daydream_str_changed(ctx->style_image_url, new_style_url))
 			update_flags |= UPDATE_FLAG_IP_ADAPTER;
 
 		// Interpolation changes
-		if (str_changed(ctx->prompt_interpolation, new_prompt_interp) ||
+		if (daydream_str_changed(ctx->prompt_interpolation, new_prompt_interp) ||
 		    ctx->normalize_prompt_weights != new_normalize_prompt ||
-		    str_changed(ctx->seed_interpolation, new_seed_interp) ||
+		    daydream_str_changed(ctx->seed_interpolation, new_seed_interp) ||
 		    ctx->normalize_seed_weights != new_normalize_seed)
 			update_flags |= UPDATE_FLAG_INTERP;
 	}
@@ -427,6 +418,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 }
 
 #define PARAMS_UPDATE_DELAY_NS (100 * 1000000ULL) // 100ms debounce
+#define PARAMS_UPDATE_POLL_MS 10                  // Poll interval while waiting for debounce
 
 static void *update_thread_func(void *arg)
 {
@@ -435,8 +427,8 @@ static void *update_thread_func(void *arg)
 	while (ctx->update_thread_running) {
 		pthread_mutex_lock(&ctx->mutex);
 
-		// Wait for update signal
-		while (ctx->update_thread_running && !ctx->update_pending) {
+		// Wait for update signal (debounce module has pending flags)
+		while (ctx->update_thread_running && !daydream_debounce_has_pending(ctx->debounce)) {
 			pthread_cond_wait(&ctx->update_cond, &ctx->mutex);
 		}
 
@@ -445,28 +437,27 @@ static void *update_thread_func(void *arg)
 			break;
 		}
 
-		// Debounce: wait for 100ms after last change
-		uint64_t target_time = ctx->last_update_time_ns + PARAMS_UPDATE_DELAY_NS;
-		uint64_t now = os_gettime_ns();
-
-		if (now < target_time) {
+		// Wait for debounce delay to pass (poll with sleep)
+		while (!daydream_debounce_ready(ctx->debounce) && ctx->update_thread_running) {
 			pthread_mutex_unlock(&ctx->mutex);
-			os_sleep_ms((uint32_t)((target_time - now) / 1000000ULL));
+			os_sleep_ms(PARAMS_UPDATE_POLL_MS);
 			pthread_mutex_lock(&ctx->mutex);
 		}
 
-		// Check if still pending and no new changes came in
-		if (!ctx->update_pending || !ctx->streaming) {
+		// Check if still valid to send
+		if (!ctx->update_thread_running || !ctx->streaming) {
 			pthread_mutex_unlock(&ctx->mutex);
 			continue;
 		}
 
-		// Collect current state
-		uint64_t flags = ctx->pending_update_flags;
-		ctx->pending_update_flags = 0;
-		ctx->update_pending = false;
+		// Consume flags from debounce module
+		uint64_t flags = daydream_debounce_consume(ctx->debounce);
+		if (flags == 0) {
+			pthread_mutex_unlock(&ctx->mutex);
+			continue;
+		}
 
-		// Build params struct
+		// Build params struct from current state
 		struct daydream_stream_params params = {0};
 		params.model_id = ctx->model;
 		params.negative_prompt = ctx->negative_prompt;
@@ -532,9 +523,7 @@ static void *update_thread_func(void *arg)
 static void schedule_params_update(struct daydream_filter *ctx, uint64_t flags)
 {
 	pthread_mutex_lock(&ctx->mutex);
-	ctx->pending_update_flags |= flags;
-	ctx->update_pending = true;
-	ctx->last_update_time_ns = os_gettime_ns();
+	daydream_debounce_schedule(ctx->debounce, flags);
 	pthread_cond_signal(&ctx->update_cond);
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -1003,6 +992,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	ctx->auth = daydream_auth_create();
 	ctx->frameskip = daydream_frameskip_create(false); // Disabled by default
+	ctx->debounce = daydream_debounce_create(PARAMS_UPDATE_DELAY_NS, NULL);
 	daydream_filter_update(ctx, settings);
 
 	return ctx;
@@ -1061,9 +1051,8 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->stopping = false;
 	ctx->decoded_frame_ready = false;
 
-	// Clear pending updates
-	ctx->pending_update_flags = 0;
-	ctx->update_pending = false;
+	// Clear pending updates using debounce module
+	daydream_debounce_reset(ctx->debounce);
 
 	// Trigger UI refresh to re-enable cold parameters
 	obs_source_update_properties(ctx->source);
@@ -1104,6 +1093,7 @@ static void daydream_filter_destroy(void *data)
 
 	daydream_auth_destroy(ctx->auth);
 	daydream_frameskip_destroy(ctx->frameskip);
+	daydream_debounce_destroy(ctx->debounce);
 	daydream_stream_destroy(ctx->stream);
 
 	bfree(ctx->negative_prompt);
