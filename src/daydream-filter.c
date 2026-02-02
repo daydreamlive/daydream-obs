@@ -12,6 +12,7 @@
 #include "plugin-support.h"
 #include <obs-module.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <string.h>
 #include <graphics/graphics.h>
 #include <util/threading.h>
@@ -535,7 +536,8 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 		struct daydream_frameskip_stats stats;
 		daydream_frameskip_get_stats(ctx->frameskip, &stats);
 		if (stats.frames_skipped % 100 == 1) {
-			blog(LOG_INFO, "[Daydream] Skipped out-of-order frame: rtp=%u, last=%u, skipped %llu/%llu",
+			blog(LOG_INFO,
+			     "[Daydream] Skipped out-of-order frame: rtp=%u, last=%u, skipped %" PRIu64 "/%" PRIu64,
 			     rtp_timestamp, stats.last_rtp_timestamp, stats.frames_skipped, stats.frames_received);
 		}
 		return;
@@ -1523,15 +1525,15 @@ static void open_url(const char *url)
 #if defined(__APPLE__)
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "open \"%s\"", url);
-	system(cmd);
+	(void)system(cmd);
 #elif defined(_WIN32)
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", url);
-	system(cmd);
+	(void)system(cmd);
 #else
 	char cmd[512];
 	snprintf(cmd, sizeof(cmd), "xdg-open \"%s\"", url);
-	system(cmd);
+	(void)system(cmd);
 #endif
 }
 

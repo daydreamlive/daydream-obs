@@ -3,7 +3,13 @@
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <sys/timeb.h>
+#else
 #include <sys/time.h>
+#endif
 
 struct daydream_framebuffer {
 	// Double buffer storage
@@ -227,11 +233,17 @@ bool daydream_framebuffer_wait(struct daydream_framebuffer *fb, uint32_t timeout
 
 	// Calculate absolute timeout
 	struct timespec ts;
+#ifdef _WIN32
+	struct _timeb tb;
+	_ftime64_s(&tb);
+	ts.tv_sec = (time_t)(tb.time + timeout_ms / 1000);
+	ts.tv_nsec = (long)(tb.millitm * 1000000 + (timeout_ms % 1000) * 1000000);
+#else
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
-
 	ts.tv_sec = tv.tv_sec + timeout_ms / 1000;
 	ts.tv_nsec = tv.tv_usec * 1000 + (timeout_ms % 1000) * 1000000;
+#endif
 	if (ts.tv_nsec >= 1000000000) {
 		ts.tv_sec++;
 		ts.tv_nsec -= 1000000000;

@@ -1,14 +1,26 @@
 #include "daydream-debounce.h"
 #include <stdlib.h>
 #include <string.h>
-#include <sys/time.h>
 
-// Default time provider using gettimeofday
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/time.h>
+#endif
+
+// Default time provider
 static uint64_t default_time_fn(void)
 {
+#ifdef _WIN32
+	LARGE_INTEGER freq, counter;
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&counter);
+	return (uint64_t)(counter.QuadPart * 1000000000ULL / freq.QuadPart);
+#else
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	return (uint64_t)tv.tv_sec * 1000000000ULL + (uint64_t)tv.tv_usec * 1000ULL;
+#endif
 }
 
 struct daydream_debounce {
