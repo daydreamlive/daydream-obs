@@ -157,6 +157,7 @@ target_sources(
     src/daydream-auth.c
     src/daydream-encoder.c
     src/daydream-decoder.c
+    src/daydream-frameskip.c
     src/daydream-whip.cpp
     src/daydream-whep.cpp
 )

@@ -3,6 +3,7 @@
 #include "daydream-auth.h"
 #include "daydream-encoder.h"
 #include "daydream-decoder.h"
+#include "daydream-frameskip.h"
 #include "daydream-whip.h"
 #include "daydream-whep.h"
 #include "plugin-support.h"
@@ -203,12 +204,8 @@ struct daydream_filter {
 	bool update_thread_running;
 	bool update_pending;
 
-	// Experimental: Frame skip
-	bool frame_skip_enabled;
-	uint32_t last_displayed_rtp_ts;
-	bool rtp_sync_established;
-	uint64_t frames_received;
-	uint64_t frames_skipped;
+	// Frame skip filter (extracted module)
+	struct daydream_frameskip *frameskip;
 
 	// Experimental: Blur background
 	int blur_size;
@@ -413,7 +410,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	ctx->hed_scale = new_hed;
 	ctx->color_scale = new_color;
 
-	ctx->frame_skip_enabled = new_frame_skip;
+	daydream_frameskip_set_enabled(ctx->frameskip, new_frame_skip);
 	ctx->blur_size = new_blur_size;
 
 	pthread_mutex_unlock(&ctx->mutex);
@@ -545,29 +542,15 @@ static void on_whep_frame(const uint8_t *data, size_t size, uint32_t rtp_timesta
 	if (!ctx || !ctx->decoder || ctx->stopping)
 		return;
 
-	ctx->frames_received++;
-
-	// Frame skip: drop out-of-order frames
-	if (ctx->frame_skip_enabled) {
-		if (!ctx->rtp_sync_established) {
-			ctx->last_displayed_rtp_ts = rtp_timestamp;
-			ctx->rtp_sync_established = true;
-		} else {
-			// Skip if frame is out of order (older than last displayed)
-			// Handle RTP timestamp wraparound with 0x80000000 check
-			if (rtp_timestamp <= ctx->last_displayed_rtp_ts &&
-			    ctx->last_displayed_rtp_ts - rtp_timestamp < 0x80000000) {
-				ctx->frames_skipped++;
-				if (ctx->frames_skipped % 100 == 1) {
-					blog(LOG_INFO,
-					     "[Daydream] Skipped out-of-order frame: rtp=%u, last=%u, skipped %llu/%llu",
-					     rtp_timestamp, ctx->last_displayed_rtp_ts, ctx->frames_skipped,
-					     ctx->frames_received);
-				}
-				return;
-			}
-			ctx->last_displayed_rtp_ts = rtp_timestamp;
+	// Frame skip: drop out-of-order frames using extracted module
+	if (!daydream_frameskip_should_display(ctx->frameskip, rtp_timestamp)) {
+		struct daydream_frameskip_stats stats;
+		daydream_frameskip_get_stats(ctx->frameskip, &stats);
+		if (stats.frames_skipped % 100 == 1) {
+			blog(LOG_INFO, "[Daydream] Skipped out-of-order frame: rtp=%u, last=%u, skipped %llu/%llu",
+			     rtp_timestamp, stats.last_rtp_timestamp, stats.frames_skipped, stats.frames_received);
 		}
+		return;
 	}
 
 	struct daydream_decoded_frame decoded;
@@ -742,6 +725,7 @@ static void *daydream_filter_create(obs_data_t *settings, obs_source_t *source)
 	pthread_cond_init(&ctx->update_cond, NULL);
 
 	ctx->auth = daydream_auth_create();
+	ctx->frameskip = daydream_frameskip_create(false); // Disabled by default
 	daydream_filter_update(ctx, settings);
 
 	return ctx;
@@ -852,6 +836,7 @@ static void daydream_filter_destroy(void *data)
 	obs_leave_graphics();
 
 	daydream_auth_destroy(ctx->auth);
+	daydream_frameskip_destroy(ctx->frameskip);
 
 	bfree(ctx->negative_prompt);
 	bfree(ctx->model);
@@ -1618,10 +1603,8 @@ static void *start_streaming_thread_func(void *data)
 	ctx->last_encode_time = os_gettime_ns();
 	ctx->first_frame_rendered = false;
 
-	// Reset frame skip stats
-	ctx->frames_received = 0;
-	ctx->frames_skipped = 0;
-	ctx->rtp_sync_established = false;
+	// Reset frame skip state
+	daydream_frameskip_reset(ctx->frameskip);
 
 	ctx->encode_thread_running = true;
 	pthread_create(&ctx->encode_thread, NULL, encode_thread_func, ctx);
