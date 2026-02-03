@@ -68,8 +68,6 @@ runs:
         MACOS_KEYCHAIN_PASSWORD: ${{ inputs.keychainPassword }}
       run: |
         : macOS Code Signing ✍️
-        if (( ${+RUNNER_DEBUG} )) setopt XTRACE
-
         : "${MACOS_SIGNING_IDENTITY_INSTALLER:="${MACOS_SIGNING_IDENTITY/Application/Installer}"}"
 
         if [[ ${MACOS_SIGNING_IDENTITY} && ${MACOS_SIGNING_IDENTITY_INSTALLER} && ${MACOS_SIGNING_CERT} ]] {
@@ -97,11 +95,6 @@ runs:
           security list-keychain -d user -s ${keychain_path} 'login-keychain'
           print '::endgroup::'
 
-          print '::group::Available signing identities'
-          security find-identity -v -p codesigning ${keychain_path}
-          security find-identity -v ${keychain_path}
-          print '::endgroup::'
-
           local -r team_id="${${MACOS_SIGNING_IDENTITY##* }//(\(|\))/}"
 
           print "codesignIdent=${MACOS_SIGNING_IDENTITY}" >> $GITHUB_OUTPUT
@@ -119,11 +112,9 @@ runs:
       id: provisioning
       if: ${{ fromJSON(steps.codesign.outputs.haveCodesignIdent) }}
       env:
-          MACOS_SIGNING_PROVISIONING_PROFILE: ${{ inputs.provisioningProfile }}
+        MACOS_SIGNING_PROVISIONING_PROFILE: ${{ inputs.provisioningProfile }}
       run: |
         : Provisioning Profile 👤
-        if (( ${+RUNNER_DEBUG} )) setopt XTRACE
-
         if [[ "${MACOS_SIGNING_PROVISIONING_PROFILE}" ]] {
           print 'haveProvisioningProfile=true' >> $GITHUB_OUTPUT
 
@@ -153,12 +144,10 @@ runs:
       if: fromJSON(steps.codesign.outputs.haveCodesignIdent)
       shell: zsh --no-rcs --errexit --pipefail {0}
       env:
-          MACOS_NOTARIZATION_USERNAME: ${{ inputs.notarizationUser }}
-          MACOS_NOTARIZATION_PASSWORD: ${{ inputs.notarizationPassword }}
+        MACOS_NOTARIZATION_USERNAME: ${{ inputs.notarizationUser }}
+        MACOS_NOTARIZATION_PASSWORD: ${{ inputs.notarizationPassword }}
       run: |
         : Notarization 🧑‍💼
-        if (( ${+RUNNER_DEBUG} )) setopt XTRACE
-
         if [[ ${MACOS_NOTARIZATION_USERNAME} && ${MACOS_NOTARIZATION_PASSWORD} ]] {
           print 'haveNotarizationUser=true' >> $GITHUB_OUTPUT
         } else {
