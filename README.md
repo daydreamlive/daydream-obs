@@ -1,5 +1,7 @@
 # Daydream for OBS
 
+![Daydream for OBS](assets/thumbnail.png)
+
 A real-time AI video processing plugin for OBS Studio. Apply live generative AI effects to your streams using diffusion models powered by [Daydream](https://daydream.live).
 
 ## Features
