@@ -97,6 +97,11 @@ runs:
           security list-keychain -d user -s ${keychain_path} 'login-keychain'
           print '::endgroup::'
 
+          print '::group::Available signing identities'
+          security find-identity -v -p codesigning ${keychain_path}
+          security find-identity -v ${keychain_path}
+          print '::endgroup::'
+
           local -r team_id="${${MACOS_SIGNING_IDENTITY##* }//(\(|\))/}"
 
           print "codesignIdent=${MACOS_SIGNING_IDENTITY}" >> $GITHUB_OUTPUT
