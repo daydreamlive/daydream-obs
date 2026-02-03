@@ -70,6 +70,8 @@ runs:
         : macOS Code Signing ✍️
         if (( ${+RUNNER_DEBUG} )) setopt XTRACE
 
+        : "${MACOS_SIGNING_IDENTITY_INSTALLER:="${MACOS_SIGNING_IDENTITY/Application/Installer}"}"
+
         if [[ ${MACOS_SIGNING_IDENTITY} && ${MACOS_SIGNING_IDENTITY_INSTALLER} && ${MACOS_SIGNING_CERT} ]] {
           print 'haveCodesignIdent=true' >> $GITHUB_OUTPUT
 

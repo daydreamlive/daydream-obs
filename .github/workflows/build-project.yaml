@@ -125,14 +125,11 @@ jobs:
         if: fromJSON(needs.check-event.outputs.codesign)
         id: codesign
         with:
-          codesignIdentity: ${{ secrets.MACOS_SIGNING_APPLICATION_IDENTITY }}
-          installerIdentity: ${{ secrets.MACOS_SIGNING_INSTALLER_IDENTITY }}
-          codesignCertificate: ${{ secrets.MACOS_SIGNING_CERT }}
-          certificatePassword: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
-          keychainPassword: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-          provisioningProfile: ${{ secrets.MACOS_SIGNING_PROVISIONING_PROFILE }}
-          notarizationUser: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
-          notarizationPassword: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          codesignIdentity: ${{ secrets.CI_MACOS_CERTIFICATE_ID }}
+          codesignCertificate: ${{ secrets.CI_MACOS_CERTIFICATE_BASE64 }}
+          certificatePassword: ${{ secrets.CI_MACOS_CERTIFICATE_PASSWORD }}
+          notarizationUser: ${{ secrets.CI_MACOS_NOTARIZATION_USER }}
+          notarizationPassword: ${{ secrets.CI_MACOS_NOTARIZATION_PASSWORD }}
 
       - name: Build Plugin 🧱
         uses: ./.github/actions/build-plugin
@@ -153,8 +150,8 @@ jobs:
           installerIdent: ${{ steps.codesign.outputs.installerIdent }}
           codesignTeam: ${{ steps.codesign.outputs.codesignTeam }}
           notarize: ${{ fromJSON(needs.check-event.outputs.notarize) && fromJSON(steps.codesign.outputs.haveNotarizationUser) }}
-          codesignUser: ${{ secrets.MACOS_NOTARIZATION_USERNAME }}
-          codesignPass: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
+          codesignUser: ${{ secrets.CI_MACOS_NOTARIZATION_USER }}
+          codesignPass: ${{ secrets.CI_MACOS_NOTARIZATION_PASSWORD }}
 
       - name: Upload Artifacts 📡
         uses: actions/upload-artifact@v4
