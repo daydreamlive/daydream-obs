@@ -25,7 +25,7 @@ Download the latest release from the [Releases](https://github.com/livepeer/dayd
 ## Usage
 
 1. Open OBS and add a video source (camera, window capture, etc.)
-2. Right-click the source → **Filters** → **+** → **Daydream**
+2. Right-click the source → **Filters** → Effect Filters **+** → **Daydream**
 3. Click **Login** to authenticate with your Daydream account
 4. Enter a prompt describing your desired effect
 5. Toggle the filter on to start streaming
