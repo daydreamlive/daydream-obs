@@ -85,6 +85,7 @@
 // Experimental
 #define PROP_FRAME_SKIP_ENABLED "frame_skip_enabled"
 #define PROP_BLUR_SIZE "blur_size"
+#define PROP_BLUR_SMOOTHING "blur_smoothing"
 
 struct daydream_filter {
 	obs_source_t *source;
@@ -187,7 +188,7 @@ struct daydream_filter {
 	// Blur background for letterboxing
 	gs_texrender_t *blur_texrender;
 	gs_texrender_t *blur_texrender2;
-	gs_effect_t *blur_effect;
+	gs_effect_t *blend_effect;
 
 	pthread_mutex_t mutex;
 
@@ -209,6 +210,7 @@ struct daydream_filter {
 
 	// Experimental: Blur background
 	int blur_size;
+	float blur_smoothing;
 
 	// Debug: track first render
 	bool first_frame_rendered;
@@ -297,6 +299,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 	// Experimental
 	bool new_frame_skip = obs_data_get_bool(settings, PROP_FRAME_SKIP_ENABLED);
 	int new_blur_size = (int)obs_data_get_int(settings, PROP_BLUR_SIZE);
+	float new_blur_smoothing = (float)obs_data_get_double(settings, PROP_BLUR_SMOOTHING);
 
 	// Detect changes if streaming
 	if (is_streaming) {
@@ -404,6 +407,7 @@ static void daydream_filter_update(void *data, obs_data_t *settings)
 
 	daydream_frameskip_set_enabled(ctx->frameskip, new_frame_skip);
 	ctx->blur_size = new_blur_size;
+	ctx->blur_smoothing = new_blur_smoothing;
 
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -1091,8 +1095,8 @@ static void daydream_filter_destroy(void *data)
 		gs_texrender_destroy(ctx->blur_texrender);
 	if (ctx->blur_texrender2)
 		gs_texrender_destroy(ctx->blur_texrender2);
-	if (ctx->blur_effect)
-		gs_effect_destroy(ctx->blur_effect);
+	if (ctx->blend_effect)
+		gs_effect_destroy(ctx->blend_effect);
 #if defined(__APPLE__)
 	if (ctx->zerocopy_tex_y)
 		gs_texture_destroy(ctx->zerocopy_tex_y);
@@ -1555,13 +1559,19 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float render_x = (ctx->width - render_size) / 2.0f;
 		float render_y = (ctx->height - render_size) / 2.0f;
 
-		// Simple color blur: downsample then upscale (bilinear filtering does the rest)
+		// Blur with temporal smoothing (EMA)
 		gs_texture_t *blur_tex = NULL;
 		int blur_size = ctx->blur_size;
+		float blur_smoothing = ctx->blur_smoothing;
 		if (blur_size > 0) {
+			// Create texrenders if needed
 			if (!ctx->blur_texrender)
 				ctx->blur_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+			if (!ctx->blur_texrender2)
+				ctx->blur_texrender2 = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
 
+			// Step 1: Downsample current frame to blur_texrender
+			gs_texture_t *current_blur = NULL;
 			if (ctx->blur_texrender) {
 				gs_texrender_reset(ctx->blur_texrender);
 				if (gs_texrender_begin(ctx->blur_texrender, blur_size, blur_size)) {
@@ -1579,8 +1589,78 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 					gs_technique_end(tech);
 
 					gs_texrender_end(ctx->blur_texrender);
-					blur_tex = gs_texrender_get_texture(ctx->blur_texrender);
+					current_blur = gs_texrender_get_texture(ctx->blur_texrender);
 				}
+			}
+
+			// Step 2: Apply temporal smoothing (EMA) if enabled
+			gs_texture_t *accumulated = gs_texrender_get_texture(ctx->blur_texrender2);
+			if (current_blur && blur_smoothing < 1.0f && accumulated) {
+				// Load blend effect if needed
+				if (!ctx->blend_effect) {
+					char *effect_path = obs_module_file("blend.effect");
+					if (effect_path) {
+						ctx->blend_effect = gs_effect_create_from_file(effect_path, NULL);
+						bfree(effect_path);
+					}
+				}
+
+				if (ctx->blend_effect) {
+					// Swap texrenders for ping-pong
+					gs_texrender_t *temp = ctx->blur_texrender;
+					ctx->blur_texrender = ctx->blur_texrender2;
+					ctx->blur_texrender2 = temp;
+
+					// Blend: result = lerp(accumulated, current, smoothing)
+					gs_texrender_reset(ctx->blur_texrender2);
+					if (gs_texrender_begin(ctx->blur_texrender2, blur_size, blur_size)) {
+						gs_ortho(0.0f, (float)blur_size, 0.0f, (float)blur_size, -100.0f,
+							 100.0f);
+
+						gs_effect_set_texture(gs_effect_get_param_by_name(ctx->blend_effect,
+												  "current_image"),
+								      current_blur);
+						gs_effect_set_texture(gs_effect_get_param_by_name(ctx->blend_effect,
+												  "accumulated_image"),
+								      accumulated);
+						gs_effect_set_float(gs_effect_get_param_by_name(ctx->blend_effect,
+												"blend_factor"),
+								    blur_smoothing);
+
+						gs_technique_t *blend_tech =
+							gs_effect_get_technique(ctx->blend_effect, "Draw");
+						gs_technique_begin(blend_tech);
+						gs_technique_begin_pass(blend_tech, 0);
+						gs_draw_sprite(current_blur, 0, blur_size, blur_size);
+						gs_technique_end_pass(blend_tech);
+						gs_technique_end(blend_tech);
+
+						gs_texrender_end(ctx->blur_texrender2);
+					}
+					blur_tex = gs_texrender_get_texture(ctx->blur_texrender2);
+				} else {
+					blur_tex = current_blur;
+				}
+			} else if (current_blur) {
+				// No temporal smoothing or first frame: copy current to accumulated
+				gs_texrender_reset(ctx->blur_texrender2);
+				if (gs_texrender_begin(ctx->blur_texrender2, blur_size, blur_size)) {
+					struct vec4 clear_color;
+					vec4_zero(&clear_color);
+					gs_clear(GS_CLEAR_COLOR, &clear_color, 0.0f, 0);
+					gs_ortho(0.0f, (float)blur_size, 0.0f, (float)blur_size, -100.0f, 100.0f);
+
+					gs_effect_set_texture(gs_effect_get_param_by_name(default_effect, "image"),
+							      current_blur);
+					gs_technique_begin(tech);
+					gs_technique_begin_pass(tech, 0);
+					gs_draw_sprite(current_blur, 0, blur_size, blur_size);
+					gs_technique_end_pass(tech);
+					gs_technique_end(tech);
+
+					gs_texrender_end(ctx->blur_texrender2);
+				}
+				blur_tex = current_blur;
 			}
 		}
 
@@ -2200,6 +2280,10 @@ static obs_properties_t *daydream_filter_get_properties(void *data)
 		obs_properties_add_int_slider(props, PROP_BLUR_SIZE, "Background Blur (0=off)", 0, 64, 4);
 	obs_property_set_enabled(blur_size, logged_in);
 
+	obs_property_t *blur_smoothing = obs_properties_add_float_slider(
+		props, PROP_BLUR_SMOOTHING, "Blur Smoothing (0=stable, 1=responsive)", 0.0, 1.0, 0.01);
+	obs_property_set_enabled(blur_smoothing, logged_in);
+
 	// --- About ---
 	obs_properties_add_text(props, "about_header", "\n\n【 About 】", OBS_TEXT_INFO);
 
@@ -2272,6 +2356,7 @@ static void daydream_filter_get_defaults(obs_data_t *settings)
 	// Experimental defaults
 	obs_data_set_default_bool(settings, PROP_FRAME_SKIP_ENABLED, true);
 	obs_data_set_default_int(settings, PROP_BLUR_SIZE, 2);
+	obs_data_set_default_double(settings, PROP_BLUR_SMOOTHING, 0.02);
 }
 
 static struct obs_source_info daydream_filter_info = {

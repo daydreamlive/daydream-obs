@@ -1,0 +1,42 @@
+// Temporal blend shader for EMA (Exponential Moving Average)
+// Blends current frame with accumulated frame for smooth transitions
+
+uniform float4x4 ViewProj;
+uniform texture2d current_image;
+uniform texture2d accumulated_image;
+uniform float blend_factor;  // alpha for EMA: result = lerp(accumulated, current, blend_factor)
+
+sampler_state def_sampler {
+    Filter   = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+    VertData vert_out;
+    vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    vert_out.uv = v_in.uv;
+    return vert_out;
+}
+
+float4 PSBlend(VertData v_in) : TARGET
+{
+    float4 current = current_image.Sample(def_sampler, v_in.uv);
+    float4 accumulated = accumulated_image.Sample(def_sampler, v_in.uv);
+    return lerp(accumulated, current, blend_factor);
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSBlend(v_in);
+    }
+}
