@@ -20,7 +20,7 @@ A real-time AI video processing plugin for OBS Studio. Apply live generative AI 
 
 ## Installation
 
-Download the latest release from the [Releases](https://github.com/livepeer/daydream-obs/releases) page. Restart OBS after installing.
+Download the latest release from the [Releases](https://github.com/daydreamlive/daydream-obs/releases) page. Restart OBS after installing.
 
 ## Usage
 
