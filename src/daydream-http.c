@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <obs-module.h>
 
 // Internal response buffer for CURL callbacks
 struct response_buffer {
@@ -54,19 +55,28 @@ static daydream_http_response_t perform_request(const char *method, const char *
 	struct curl_slist *headers = NULL;
 	struct response_buffer buffer = {0};
 
+	blog(LOG_INFO, "[Daydream HTTP] perform_request: method=%s, url=%s", method, url);
+	blog(LOG_INFO, "[Daydream HTTP] auth_token present: %s, body_len: %zu", auth_token ? "yes" : "no",
+	     json_body ? strlen(json_body) : 0);
+
 	curl = curl_easy_init();
 	if (!curl) {
+		blog(LOG_ERROR, "[Daydream HTTP] curl_easy_init() returned NULL");
 		response.error_msg = strdup("Failed to initialize CURL");
 		return response;
 	}
+	blog(LOG_INFO, "[Daydream HTTP] curl_easy_init() succeeded: %p", (void *)curl);
 
 	headers = build_headers(auth_token);
 	if (!headers) {
+		blog(LOG_ERROR, "[Daydream HTTP] build_headers() returned NULL");
 		response.error_msg = strdup("Failed to build headers");
 		curl_easy_cleanup(curl);
 		return response;
 	}
+	blog(LOG_INFO, "[Daydream HTTP] build_headers() succeeded");
 
+	blog(LOG_INFO, "[Daydream HTTP] Setting CURL options...");
 	curl_easy_setopt(curl, CURLOPT_URL, url);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -86,23 +96,30 @@ static daydream_http_response_t perform_request(const char *method, const char *
 	}
 	// POST is the default when POSTFIELDS is set
 
+	blog(LOG_INFO, "[Daydream HTTP] Calling curl_easy_perform()...");
 	CURLcode res = curl_easy_perform(curl);
+	blog(LOG_INFO, "[Daydream HTTP] curl_easy_perform() returned: %d (%s)", res, curl_easy_strerror(res));
 
 	if (res != CURLE_OK) {
+		blog(LOG_ERROR, "[Daydream HTTP] Request failed: %s", curl_easy_strerror(res));
 		response.error_msg = strdup(curl_easy_strerror(res));
 		response.status_code = 0;
 	} else {
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status_code);
+		blog(LOG_INFO, "[Daydream HTTP] Request succeeded, status_code=%ld, body_size=%zu",
+		     response.status_code, buffer.size);
 		response.body = buffer.data;
 		response.body_size = buffer.size;
 		buffer.data = NULL; // Ownership transferred to response
 	}
 
 	// Cleanup
+	blog(LOG_INFO, "[Daydream HTTP] Cleaning up CURL resources");
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	free(buffer.data); // Only frees if ownership wasn't transferred
 
+	blog(LOG_INFO, "[Daydream HTTP] perform_request completed");
 	return response;
 }
 

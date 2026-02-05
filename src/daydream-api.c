@@ -269,8 +269,23 @@ struct daydream_stream_result daydream_api_create_stream(const char *api_key,
 		blog(LOG_INFO, "[Daydream] First prompt: %s", params->prompt_schedule.prompts[0]);
 	}
 
+	blog(LOG_INFO, "[Daydream] JSON body size: %zu bytes", strlen(json_body));
+	blog(LOG_INFO, "[Daydream] API URL: %s", url);
+	blog(LOG_INFO, "[Daydream] HTTP client: %p", (void *)g_http_client);
+
+	if (!g_http_client) {
+		blog(LOG_ERROR, "[Daydream] HTTP client is NULL!");
+		result.error = DAYDREAM_ERR_CURL_INIT;
+		result.error_detail = strdup("HTTP client not initialized");
+		goto cleanup;
+	}
+
+	blog(LOG_INFO, "[Daydream] Making HTTP POST request...");
+
 	// Make HTTP request
 	daydream_http_response_t response = g_http_client->post(g_http_client, url, json_body, api_key, 30);
+
+	blog(LOG_INFO, "[Daydream] HTTP POST completed, checking response...");
 
 	if (response.error_msg) {
 		result.error = DAYDREAM_ERR_CURL_PERFORM;
