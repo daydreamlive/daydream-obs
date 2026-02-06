@@ -46,6 +46,38 @@ static struct curl_slist *build_headers(const char *auth_token)
 	return headers;
 }
 
+static int daydream_curl_debug_cb(CURL *handle, curl_infotype type, char *data, size_t size, void *userptr)
+{
+	(void)handle;
+	(void)userptr;
+
+	const char *prefix;
+	switch (type) {
+	case CURLINFO_TEXT:
+		prefix = "* ";
+		break;
+	case CURLINFO_HEADER_OUT:
+		prefix = "> ";
+		break;
+	case CURLINFO_HEADER_IN:
+		prefix = "< ";
+		break;
+	default:
+		return 0; // skip data payloads
+	}
+
+	char buf[512];
+	size_t len = size < sizeof(buf) - 1 ? size : sizeof(buf) - 1;
+	memcpy(buf, data, len);
+	buf[len] = '\0';
+
+	while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+		buf[--len] = '\0';
+
+	blog(LOG_DEBUG, "[Daydream HTTP] %s%s", prefix, buf);
+	return 0;
+}
+
 // Perform HTTP request (shared implementation for POST/PATCH)
 static daydream_http_response_t perform_request(const char *method, const char *url, const char *json_body,
 						const char *auth_token, long timeout_secs)
@@ -81,6 +113,10 @@ static daydream_http_response_t perform_request(const char *method, const char *
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+	curl_easy_setopt(curl, CURLOPT_DEBUGFUNCTION, daydream_curl_debug_cb);
 
 	if (timeout_secs > 0) {
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout_secs);
