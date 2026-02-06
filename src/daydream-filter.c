@@ -97,7 +97,9 @@ struct daydream_filter {
 	uint32_t height;
 
 	gs_texrender_t *crop_texrender;
-	gs_stagesurf_t *crop_stagesurface;
+	gs_stagesurf_t *crop_stagesurface[2]; // Double-buffered for async readback
+	int crop_stage_idx;                   // Current staging buffer index (0 or 1)
+	bool crop_stage_pending;              // Previous staging has data ready to read
 
 	struct daydream_auth *auth;
 
@@ -1054,6 +1056,10 @@ static void stop_streaming(struct daydream_filter *ctx)
 	ctx->streaming = false;
 	ctx->stopping = false;
 
+	// Reset encode staging state
+	ctx->crop_stage_pending = false;
+	ctx->crop_stage_idx = 0;
+
 	// Reset decode framebuffers
 	daydream_framebuffer_reset(ctx->decode_buffer_bgra);
 	daydream_framebuffer_reset(ctx->decode_buffer_nv12_y);
@@ -1081,8 +1087,10 @@ static void daydream_filter_destroy(void *data)
 		gs_texture_destroy(ctx->output_texture);
 	if (ctx->crop_texrender)
 		gs_texrender_destroy(ctx->crop_texrender);
-	if (ctx->crop_stagesurface)
-		gs_stagesurface_destroy(ctx->crop_stagesurface);
+	if (ctx->crop_stagesurface[0])
+		gs_stagesurface_destroy(ctx->crop_stagesurface[0]);
+	if (ctx->crop_stagesurface[1])
+		gs_stagesurface_destroy(ctx->crop_stagesurface[1]);
 	if (ctx->nv12_tex_y)
 		gs_texture_destroy(ctx->nv12_tex_y);
 	if (ctx->nv12_tex_uv)
@@ -1206,11 +1214,9 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 		float offset_x = (scaled_width - STREAM_SIZE) / 2.0f;
 		float offset_y = (scaled_height - STREAM_SIZE) / 2.0f;
 
-		// Copy to CPU buffer for encoding
+		// Copy to CPU buffer for encoding (double-buffered async readback)
 		if (!ctx->crop_texrender)
 			ctx->crop_texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
-		if (!ctx->crop_stagesurface)
-			ctx->crop_stagesurface = gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
 
 		gs_texrender_reset(ctx->crop_texrender);
 		if (gs_texrender_begin(ctx->crop_texrender, STREAM_SIZE, STREAM_SIZE)) {
@@ -1233,36 +1239,49 @@ static void daydream_filter_video_render(void *data, gs_effect_t *effect)
 			gs_texrender_end(ctx->crop_texrender);
 		}
 
-		gs_texture_t *crop_tex = gs_texrender_get_texture(ctx->crop_texrender);
-		if (crop_tex) {
-			gs_stage_texture(ctx->crop_stagesurface, crop_tex);
-
+		// Read back PREVIOUS frame (GPU has had a full frame interval to complete)
+		if (ctx->crop_stage_pending) {
+			int read_idx = 1 - ctx->crop_stage_idx;
 			uint8_t *video_data = NULL;
 			uint32_t video_linesize = 0;
 
-			if (gs_stagesurface_map(ctx->crop_stagesurface, &video_data, &video_linesize)) {
-				// Configure framebuffer if dimensions changed
+			if (gs_stagesurface_map(ctx->crop_stagesurface[read_idx], &video_data, &video_linesize)) {
 				uint32_t fb_w, fb_h;
 				daydream_framebuffer_get_dimensions(ctx->encode_buffer, &fb_w, &fb_h);
 				if (fb_w != STREAM_SIZE || fb_h != STREAM_SIZE) {
 					daydream_framebuffer_configure(ctx->encode_buffer, STREAM_SIZE, STREAM_SIZE, 4);
 				}
 
-				// Write frame to encode buffer
 				uint32_t fb_linesize;
 				uint8_t *write_buf = daydream_framebuffer_begin_write(ctx->encode_buffer, &fb_linesize);
 				if (write_buf) {
-					// Copy row by row to handle linesize differences
 					uint32_t copy_size = STREAM_SIZE * 4; // BGRA
-					for (uint32_t row = 0; row < STREAM_SIZE; row++) {
-						memcpy(write_buf + row * fb_linesize, video_data + row * video_linesize,
-						       copy_size);
+					if (fb_linesize == video_linesize) {
+						memcpy(write_buf, video_data, copy_size * STREAM_SIZE);
+					} else {
+						for (uint32_t row = 0; row < STREAM_SIZE; row++) {
+							memcpy(write_buf + row * fb_linesize,
+							       video_data + row * video_linesize, copy_size);
+						}
 					}
 					daydream_framebuffer_end_write(ctx->encode_buffer);
 				}
 
-				gs_stagesurface_unmap(ctx->crop_stagesurface);
+				gs_stagesurface_unmap(ctx->crop_stagesurface[read_idx]);
 			}
+		}
+
+		// Stage CURRENT frame to the other surface (async, returns immediately)
+		gs_texture_t *crop_tex = gs_texrender_get_texture(ctx->crop_texrender);
+		if (crop_tex) {
+			int stage_idx = ctx->crop_stage_idx;
+			if (!ctx->crop_stagesurface[stage_idx])
+				ctx->crop_stagesurface[stage_idx] =
+					gs_stagesurface_create(STREAM_SIZE, STREAM_SIZE, GS_BGRA);
+
+			gs_stage_texture(ctx->crop_stagesurface[stage_idx], crop_tex);
+			ctx->crop_stage_idx = 1 - stage_idx;
+			ctx->crop_stage_pending = true;
 		}
 	}
 
